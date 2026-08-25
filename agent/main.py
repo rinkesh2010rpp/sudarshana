@@ -3,10 +3,10 @@ Sudarshana — step 1: message-triggered agent, no cron, no Netlify.
 
 Telegram sends your message to a Modal webhook. The webhook checks that it's
 really you, then hands your message to a LangChain "deep agent" — a model
-with a planning tool (write_todos), a virtual scratch filesystem, and
-subagent delegation, on top of a personality system prompt and short-term
-memory of the conversation. Still no repo access, no self-modification —
-those come later.
+with a planning tool (write_todos), a real persistent filesystem backed by a
+Modal Volume, and subagent delegation, on top of a personality system prompt
+and conversation history stored in a Modal Dict. Still no repo access, no
+self-modification — those come later.
 
 Run locally against a temporary URL:
     modal serve agent/main.py
@@ -38,6 +38,12 @@ memory = modal.Dict.from_name("sudarshana-memory", create_if_missing=True)
 # Keep the last N messages (user + assistant turns combined) per chat, so
 # context doesn't grow without bound on cost or token count.
 MAX_HISTORY_MESSAGES = 20
+
+# A real mounted disk, separate from the Dict above — this is where the deep
+# agent's file tools (read_file/write_file/ls) actually persist, instead of
+# vanishing at the end of each invocation like the default in-state backend.
+volume = modal.Volume.from_name("sudarshana-files", create_if_missing=True)
+VOLUME_PATH = "/data"
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
@@ -78,13 +84,22 @@ def _send_message(token: str, chat_id: int, text: str) -> None:
 
 def _build_agent(api_key: str, model: str):
     from deepagents import create_deep_agent
+    from deepagents.backends import FilesystemBackend
     from langchain_openai import ChatOpenAI
 
     llm = ChatOpenAI(model=model, base_url="https://openrouter.ai/api/v1", api_key=api_key)
-    return create_deep_agent(model=llm, instructions=SYSTEM_PROMPT)
+    return create_deep_agent(
+        model=llm,
+        system_prompt=SYSTEM_PROMPT,
+        backend=FilesystemBackend(root_dir=VOLUME_PATH),
+    )
 
 
-@app.function(image=image, secrets=[modal.Secret.from_dotenv()])
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_dotenv()],
+    volumes={VOLUME_PATH: volume},
+)
 @modal.fastapi_endpoint(method="POST")
 def telegram_webhook(payload: dict):
     message = payload.get("message")
@@ -116,6 +131,11 @@ def telegram_webhook(payload: dict):
 
     history.append({"role": "assistant", "content": reply})
     memory[history_key] = history[-MAX_HISTORY_MESSAGES:]
+
+    # Background commits happen automatically every few seconds, but this
+    # container may be torn down right after responding, so commit explicitly
+    # rather than trust the background timer to catch this write in time.
+    volume.commit()
 
     _send_message(bot_token, chat_id, reply)
     return {"ok": True}
