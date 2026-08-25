@@ -1,0 +1,5 @@
+modal
+requests
+python-dotenv
+deepagents
+langchain-openai
