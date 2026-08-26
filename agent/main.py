@@ -2,7 +2,10 @@
 Sudarshana — message-triggered agent with shell + git access to its own repo.
 
 Telegram sends your message to a Modal webhook. The webhook checks that it's
-really you, then hands your message to a LangChain "deep agent" — a model
+really you, then hands the work off to a spawned method and returns
+immediately — Telegram retries delivery if it doesn't get a fast response,
+and waiting for the actual agent call here was causing duplicate invocations.
+That spawned call runs your message through a LangChain "deep agent" — a model
 with a planning tool (write_todos), a LangGraph checkpointer (SqliteSaver, a
 file on the same persistent Modal Volume) giving it one real continuous
 session across every invocation, and a LocalShellBackend rooted at that same
@@ -184,15 +187,25 @@ class Sudarshana:
             # allowlist NFR.
             return {"ok": True}
 
+        # .spawn(), not .remote() or a direct call: this returns immediately
+        # without waiting for process_message to finish, so Telegram gets its
+        # ack fast regardless of how long the agent actually takes. Awaiting
+        # the real work here is what caused Telegram to retry delivery and
+        # double-invoke the agent on slow tasks.
+        self.process_message.spawn(message["text"])
+        return {"ok": True}
+
+    @modal.method()
+    def process_message(self, text: str):
         # Only the new message is passed in — the checkpointer loads prior
         # state for THREAD_ID automatically and merges this on top of it.
         self.agent.invoke(
-            {"messages": [{"role": "user", "content": message["text"]}]},
+            {"messages": [{"role": "user", "content": text}]},
             config={"configurable": {"thread_id": THREAD_ID}},
         )
 
         # Background commits happen automatically every few seconds, but this
-        # container may be torn down right after responding, so commit
+        # container may be torn down right after finishing, so commit
         # explicitly rather than trust the background timer to catch this
         # write in time — the checkpointer's sqlite file lives on this same
         # Volume, so this covers session state too, not just agent files.
@@ -200,10 +213,7 @@ class Sudarshana:
 
         # No Python-side send here on purpose — the agent sends its own
         # reply via the send_rinkesh_message tool (see SYSTEM_PROMPT), the
-        # same way hourly_checkin's agent does. This return value is just
-        # the webhook's HTTP ack to Telegram, not what you actually see in
-        # the chat.
-        return {"ok": True}
+        # same way hourly_checkin's agent does.
 
     @modal.method()
     def hourly_checkin(self):
