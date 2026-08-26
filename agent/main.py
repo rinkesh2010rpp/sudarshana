@@ -19,8 +19,8 @@ support schedule= on @modal.method(), only on plain @app.function()), so a
 tiny separate hourly_trigger function exists purely to fire on the cron and
 call Sudarshana().hourly_checkin.remote() — it contains no logic of its own.
 Right now the task is just "ask Rinkesh if he needs anything," sent via the
-agent's own shell tool (curl), not hardcoded Python. Changing what happens
-each hour going forward is a HOURLY_TASK/prompt edit, not new code.
+agent's own send_rinkesh_message tool, not hardcoded Python. Changing what
+happens each hour going forward is a HOURLY_TASK/prompt edit, not new code.
 
 Run locally against a temporary URL:
     modal serve agent/main.py
@@ -63,8 +63,6 @@ MAX_HISTORY_MESSAGES = 20
 volume = modal.Volume.from_name("sudarshana-files", create_if_missing=True)
 VOLUME_PATH = "/data"
 
-TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-
 SYSTEM_PROMPT = """You are Sudarshana, an autonomous agent built by Rinkesh, currently in
 early development with no fixed constitution yet — defer to Rinkesh on
 anything ambiguous, irreversible, or outside this direct relationship.
@@ -73,6 +71,8 @@ You have real shell/filesystem access rooted at persistent storage, GitHub
 access to your own repo, and Telegram contact with Rinkesh. You may also be
 woken on a schedule, not just by messages — check whether there's something
 concrete to report before speaking up.
+
+Use the send_rinkesh_message tool whenever you need to reach out to Rinkesh.
 
 You exist to operate independently and, over time, help build a
 self-reliant ecosystem that does good for humanity — under Rinkesh's
@@ -103,14 +103,25 @@ github.com/rinkesh2010rpp/sudarshana."""
 HOURLY_TASK = "This is your scheduled hourly wake-up. Message Rinkesh on Telegram asking if he needs anything from you right now."
 
 
-def _send_message(token: str, chat_id: int, text: str) -> None:
-    import requests
+def _make_telegram_tool():
+    from langchain_core.tools import tool
 
-    requests.post(
-        TELEGRAM_API.format(token=token, method="sendMessage"),
-        json={"chat_id": chat_id, "text": text},
-        timeout=10,
-    )
+    @tool
+    def send_rinkesh_message(text: str) -> str:
+        """Send a Telegram message to Rinkesh. This is the only way he'll
+        actually see anything you say — use it any time you want him to know
+        something, whether replying to him or acting on a scheduled wake-up."""
+        import requests
+
+        resp = requests.post(
+            f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+            json={"chat_id": os.environ["TELEGRAM_ALLOWED_USER_ID"], "text": text},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return "Message sent."
+
+    return send_rinkesh_message
 
 
 @app.cls(image=image, secrets=[modal.Secret.from_dotenv()], volumes={VOLUME_PATH: volume})
@@ -133,6 +144,7 @@ class Sudarshana:
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
+            tools=[_make_telegram_tool()],
             # LocalShellBackend extends FilesystemBackend — same file tools,
             # plus execute_command for real shell/git access. No sandboxing
             # at all: commands run directly in the container, unrestricted.
@@ -151,7 +163,6 @@ class Sudarshana:
             # (edits, other update types, button taps — none exist yet).
             return {"ok": True}
 
-        bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
         allowed_user_id = os.environ["TELEGRAM_ALLOWED_USER_ID"]
         sender_id = str(message["from"]["id"])
         chat_id = message["chat"]["id"]
@@ -178,15 +189,19 @@ class Sudarshana:
         # write in time.
         volume.commit()
 
-        _send_message(bot_token, chat_id, reply)
+        # No Python-side send here on purpose — the agent sends its own
+        # reply via the send_rinkesh_message tool (see SYSTEM_PROMPT), the
+        # same way hourly_checkin's agent does. This return value is just
+        # the webhook's HTTP ack to Telegram, not what you actually see in
+        # the chat.
         return {"ok": True}
 
     @modal.method()
     def hourly_checkin(self):
         # The agent decides how to act on HOURLY_TASK itself — including
-        # sending the Telegram message via its own shell tool, per the
-        # system prompt. Changing what happens each hour going forward is a
-        # HOURLY_TASK/prompt edit, not new code.
+        # sending the Telegram message via its own send_rinkesh_message
+        # tool, per the system prompt. Changing what happens each hour going
+        # forward is a HOURLY_TASK/prompt edit, not new code.
         self.agent.invoke({"messages": [{"role": "user", "content": HOURLY_TASK}]})
 
 
