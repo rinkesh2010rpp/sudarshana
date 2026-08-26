@@ -3,16 +3,18 @@ Sudarshana — message-triggered agent with shell + git access to its own repo.
 
 Telegram sends your message to a Modal webhook. The webhook checks that it's
 really you, then hands your message to a LangChain "deep agent" — a model
-with a planning tool (write_todos), conversation history stored in a Modal
-Dict, and a LocalShellBackend rooted at a persistent Modal Volume. That
-backend gives it both file tools (read_file/write_file/edit_file/ls) and an
-execute_command tool for running real shell commands — including git — with
-no sandboxing beyond the container itself.
+with a planning tool (write_todos), a LangGraph checkpointer (SqliteSaver, a
+file on the same persistent Modal Volume) giving it one real continuous
+session across every invocation, and a LocalShellBackend rooted at that same
+Volume. That backend gives it both file tools (read_file/write_file/edit_file
+/ls) and an execute_command tool for running real shell commands — including
+git — with no sandboxing beyond the container itself.
 
 The agent itself is built exactly once per container, in Sudarshana.setup()
 (a Modal @modal.enter() lifecycle hook) — both telegram_webhook and
-hourly_checkin are methods on that same class, and just invoke the one
-already-built self.agent rather than each constructing their own.
+hourly_checkin are methods on that same class, invoking the one already-built
+self.agent under the same THREAD_ID, so a scheduled wake-up and a Telegram
+message are literally the same ongoing session, not two separate ones.
 
 hourly_checkin's schedule can't live on the method itself (Modal doesn't
 support schedule= on @modal.method(), only on plain @app.function()), so a
@@ -46,22 +48,22 @@ image = (
         "fastapi[standard]",
         "deepagents",
         "langchain-openai",
+        "langgraph-checkpoint-sqlite",
     )
 )
 
-# Persistent key-value store, keyed by Telegram chat id, so conversations
-# survive between messages (and between container cold starts/redeploys).
-memory = modal.Dict.from_name("sudarshana-memory", create_if_missing=True)
-
-# Keep the last N messages (user + assistant turns combined) per chat, so
-# context doesn't grow without bound on cost or token count.
-MAX_HISTORY_MESSAGES = 20
-
-# A real mounted disk, separate from the Dict above — this is where the deep
-# agent's file tools (read_file/write_file/ls) actually persist, instead of
-# vanishing at the end of each invocation like the default in-state backend.
+# A real mounted disk — this is where the deep agent's file tools
+# (read_file/write_file/ls) persist, instead of vanishing at the end of each
+# invocation like the default in-state backend, and it's also where the
+# checkpointer's sqlite file lives, below.
 volume = modal.Volume.from_name("sudarshana-files", create_if_missing=True)
 VOLUME_PATH = "/data"
+
+# The one shared session identity. Both telegram_webhook and hourly_checkin
+# invoke under this same thread_id, so the checkpointer treats a scheduled
+# wake-up and a Telegram conversation as one continuous session rather than
+# two unrelated ones.
+THREAD_ID = "rinkesh"
 
 SYSTEM_PROMPT = """You are Sudarshana, an autonomous agent built by Rinkesh, currently in
 early development with no fixed constitution yet — defer to Rinkesh on
@@ -81,10 +83,8 @@ you'd serve. You may think and brainstorm freely toward that, but always
 bring ideas to Rinkesh before acting on anything consequential.
 
 Constraints: never push to or merge on `main`; self-changes go on a new
-branch as a PR for Rinkesh to review and merge. Conversation memory is
-capped and per-chat — write anything worth keeping to a file. Verify
-external actions (pushes, PRs, API calls) actually succeeded before
-reporting on them.
+branch as a PR for Rinkesh to review and merge. Verify external actions
+(pushes, PRs, API calls) actually succeeded before reporting on them.
 
 Be direct, precise, and honest about your own limitations rather than
 papering over them.
@@ -92,11 +92,11 @@ papering over them.
 A few basic facts about how you actually run, in case Rinkesh asks: your name
 comes from the Sudarshana Chakra. You run as a Modal function, triggered by a
 Telegram webhook — this conversation is that Telegram chat — and also by an
-hourly Modal Cron for scheduled check-ins. Conversation history is kept in a
-Modal Dict keyed by chat id, capped at the last 20 messages; your scratch
-filesystem is a Modal Volume mounted at /data. You have real shell access
-(including git) via a local shell backend. Your source lives at
-github.com/rinkesh2010rpp/sudarshana."""
+hourly Modal Cron for scheduled check-ins, under the same ongoing session
+either way. Your session state (messages, todos) is checkpointed to a sqlite
+file; your scratch filesystem is a Modal Volume mounted at /data — both live
+on the same persistent disk. You have real shell access (including git) via
+a local shell backend. Your source lives at github.com/rinkesh2010rpp/sudarshana."""
 
 # The one thing this cycle actually does — change this to change what
 # happens every hour, without touching any code.
@@ -132,9 +132,20 @@ class Sudarshana:
         # is reused by every telegram_webhook/hourly_checkin call this same
         # container handles afterward — a cold start (or a redeploy) still
         # triggers this again for whatever container comes up next.
+        import sqlite3
+
         from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
         from langchain_openai import ChatOpenAI
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        # A plain sqlite file on the same Volume as everything else. Built
+        # directly (not via the from_conn_string context manager) because
+        # this connection needs to stay open for the container's whole
+        # lifetime, not just one call — check_same_thread=False is safe here
+        # since SqliteSaver serializes access with its own internal lock.
+        conn = sqlite3.connect(f"{VOLUME_PATH}/checkpoints.sqlite", check_same_thread=False)
+        self.checkpointer = SqliteSaver(conn)
 
         llm = ChatOpenAI(
             model=os.environ["OPENROUTER_MODEL"],
@@ -145,6 +156,7 @@ class Sudarshana:
             model=llm,
             system_prompt=SYSTEM_PROMPT,
             tools=[_make_telegram_tool()],
+            checkpointer=self.checkpointer,
             # LocalShellBackend extends FilesystemBackend — same file tools,
             # plus execute_command for real shell/git access. No sandboxing
             # at all: commands run directly in the container, unrestricted.
@@ -165,7 +177,6 @@ class Sudarshana:
 
         allowed_user_id = os.environ["TELEGRAM_ALLOWED_USER_ID"]
         sender_id = str(message["from"]["id"])
-        chat_id = message["chat"]["id"]
 
         if sender_id != allowed_user_id:
             # Silently drop. A bot username is reachable by anyone who finds
@@ -173,20 +184,18 @@ class Sudarshana:
             # allowlist NFR.
             return {"ok": True}
 
-        history_key = str(chat_id)
-        history = memory.get(history_key, [])
-        history.append({"role": "user", "content": message["text"]})
-
-        result = self.agent.invoke({"messages": history})
-        reply = result["messages"][-1].content
-
-        history.append({"role": "assistant", "content": reply})
-        memory[history_key] = history[-MAX_HISTORY_MESSAGES:]
+        # Only the new message is passed in — the checkpointer loads prior
+        # state for THREAD_ID automatically and merges this on top of it.
+        self.agent.invoke(
+            {"messages": [{"role": "user", "content": message["text"]}]},
+            config={"configurable": {"thread_id": THREAD_ID}},
+        )
 
         # Background commits happen automatically every few seconds, but this
         # container may be torn down right after responding, so commit
         # explicitly rather than trust the background timer to catch this
-        # write in time.
+        # write in time — the checkpointer's sqlite file lives on this same
+        # Volume, so this covers session state too, not just agent files.
         volume.commit()
 
         # No Python-side send here on purpose — the agent sends its own
@@ -201,8 +210,14 @@ class Sudarshana:
         # The agent decides how to act on HOURLY_TASK itself — including
         # sending the Telegram message via its own send_rinkesh_message
         # tool, per the system prompt. Changing what happens each hour going
-        # forward is a HOURLY_TASK/prompt edit, not new code.
-        self.agent.invoke({"messages": [{"role": "user", "content": HOURLY_TASK}]})
+        # forward is a HOURLY_TASK/prompt edit, not new code. Same THREAD_ID
+        # as telegram_webhook — this is a wake-up inside the same session,
+        # not a separate one, so it sees whatever it was last doing.
+        self.agent.invoke(
+            {"messages": [{"role": "user", "content": HOURLY_TASK}]},
+            config={"configurable": {"thread_id": THREAD_ID}},
+        )
+        volume.commit()
 
 
 @app.function(image=image, schedule=modal.Cron("0 * * * *"))
