@@ -102,10 +102,9 @@ comment) just gets answered directly. A genuine task or request from Rinkesh
 is different: it has to be captured in a file, or it's lost the moment this
 invocation ends.
 
-Your working files, all under your root (refer to them as /VISION.md etc. for
-your read_file/write_file/ls/edit_file tools — those are rooted at your own
-storage already; if you use shell instead, the same file is /data/VISION.md,
-since shell isn't root-translated the same way):
+Your working files live at /VISION.md, /ROADMAP.md, /INBOX.md, and
+/actions/<id>.md. Use your read_file/write_file/edit_file/ls tools with those
+exact paths. Use the shell/execute tool only for git — never for these files.
 
 - /VISION.md — the durable why. Rarely changes. If it doesn't exist yet,
   draft one yourself from what you know of why you exist, then ask Rinkesh
@@ -188,18 +187,19 @@ papering over them.
 A few basic facts about how you actually run, in case Rinkesh asks: your name
 comes from the Sudarshana Chakra. You run as a Modal function, triggered by a
 Telegram webhook — this conversation is that Telegram chat — and also by an
-hourly Modal Cron for scheduled work. Your scratch filesystem (including the
-VISION/ROADMAP/actions/INBOX files) is a Modal Volume mounted at /data. You
-have real shell access (including git) via a local shell backend. Your
-source lives at github.com/rinkesh2010rpp/sudarshana."""
+hourly Modal Cron for scheduled work. Your VISION/ROADMAP/actions/INBOX files
+persist on a Modal Volume across invocations. You have real shell access
+(including git) via a local shell backend. Your source lives at
+github.com/rinkesh2010rpp/sudarshana."""
 
 # The one thing this cycle actually does — change this to change what
 # happens every hour, without touching any code.
 HOURLY_TASK = (
-    "This is your scheduled hourly wake-up. Check /INBOX.md first — handle "
-    "one item there before anything else. If it's empty, pick up just the "
-    "next single item in the current initiative's action file — one step, "
-    "not the rest of the queue."
+    "This is your scheduled hourly wake-up. Check /INBOX.md first and handle "
+    "one item there before anything else. If it's empty, work the next single "
+    "step of the current initiative in /ROADMAP.md — one step, then stop and "
+    "leave the rest for the next wake-up. If genuinely nothing is queued, put "
+    "a short proposal for what to do next to Rinkesh rather than starting it."
 )
 
 
@@ -247,12 +247,24 @@ def _format_blurb(messages: list) -> str:
         role = type(m).__name__
         content = (getattr(m, "content", "") or "").strip()
         tool_calls = getattr(m, "tool_calls", None)
+        # Qwen3 thinking: vLLM's reasoning parser exposes the <think> block as a
+        # separate field. vLLM 0.27 calls it `reasoning`; older builds and some
+        # langchain-openai versions surface it as `reasoning_content`. Check both,
+        # in additional_kwargs and response_metadata.
+        _ak = getattr(m, "additional_kwargs", {}) or {}
+        _rm = getattr(m, "response_metadata", {}) or {}
+        reasoning = (
+            _ak.get("reasoning") or _ak.get("reasoning_content")
+            or _rm.get("reasoning") or _rm.get("reasoning_content")
+        )
+        if reasoning:
+            lines.append(f"[{role} · thinking] {reasoning.strip()}")
         if tool_calls:
             calls = "; ".join(f"{tc.get('name')}({tc.get('args')})" for tc in tool_calls)
             lines.append(f"[{role} -> tool_call] {calls}")
         elif content:
             lines.append(f"[{role}] {content}")
-        else:
+        elif not reasoning:
             lines.append(f"[{role}] (empty)")
     return "\n\n".join(lines) if lines else "(no messages)"
 
@@ -308,23 +320,30 @@ class Sudarshana:
         from deepagents.backends import LocalShellBackend
         from langchain_openai import ChatOpenAI
 
-        # Self-hosted Qwen2.5-7B on Modal (app "llm-inference"), OpenAI-compatible.
-        # No per-token cost and no external rate limit — just GPU time while active.
-        # To switch back to OpenRouter/Claude: set LLM_BASE_URL=https://openrouter.ai/api/v1,
-        # LLM_MODEL=anthropic/claude-sonnet-4.5, LLM_API_KEY=<openrouter key>.
-        llm = ChatOpenAI(
-            model=os.environ.get("LLM_MODEL", "qwen"),
-            base_url=os.environ.get(
-                "LLM_BASE_URL",
-                "https://rinkesh2010rpp--llm-inference-vllmserver-serve.modal.run/v1",
-            ),
-            api_key=os.environ.get("LLM_API_KEY", "dummy"),
-            # deepagents otherwise requests 65536 output tokens, which exceeds the
-            # 32k context window and inflated cost on OpenRouter. Agent turns never
-            # need more than a few thousand output tokens.
-            max_tokens=4096,
-            timeout=600,  # cold start on the Modal endpoint can be ~40s
-        )
+        # Model backend. Default: self-hosted Qwen3-14B-AWQ on Modal ("llm-inference").
+        # Set USE_OPENROUTER=1 in .env to temporarily route to OpenRouter/Claude
+        # instead (reuses the existing OPENROUTER_MODEL / OPENROUTER_API_KEY vars).
+        # Used right now to A/B whether the hourly "take initiative" runaway is a
+        # prompt problem or a model-capability problem.
+        if os.environ.get("USE_OPENROUTER"):
+            llm = ChatOpenAI(
+                model=os.environ["OPENROUTER_MODEL"],
+                base_url="https://openrouter.ai/api/v1",
+                api_key=os.environ["OPENROUTER_API_KEY"],
+                max_tokens=4096,  # NOT the deepagents default of 65536
+                timeout=600,
+            )
+        else:
+            llm = ChatOpenAI(
+                model=os.environ.get("LLM_MODEL", "qwen"),
+                base_url=os.environ.get(
+                    "LLM_BASE_URL",
+                    "https://rinkesh2010rpp--llm-inference-vllmserver-serve.modal.run/v1",
+                ),
+                api_key=os.environ.get("LLM_API_KEY", "dummy"),
+                max_tokens=4096,
+                timeout=600,
+            )
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
@@ -350,15 +369,30 @@ class Sudarshana:
         # once, in setup(), and reused for every invocation this container
         # handles afterward — a value computed there would be correct for
         # the first call and stale for every one after it.
-        result = self.agent.invoke(
-            {
-                "messages": [
-                    {"role": "system", "content": f"Current time: {_timestamp()}"},
-                    {"role": "user", "content": message},
-                ]
-            },
-            config={"callbacks": [_build_timing_handler()]},
-        )
+        from langgraph.errors import GraphRecursionError
+
+        invoke_input = {
+            "messages": [
+                {"role": "system", "content": f"Current time: {_timestamp()}"},
+                {"role": "user", "content": message},
+            ]
+        }
+        # recursion_limit: safety cap on the tool loop so a stuck/looping run
+        # can't burn the full 600s Modal timeout. A Qwen3-14B run once did 37
+        # calls in circles before timing out. 25 is langgraph's default — room
+        # for real multi-step work (incl. a subagent, which counts as one step
+        # here), but an infinite loop still trips it.
+        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 50}
+        try:
+            result = self.agent.invoke(invoke_input, config=cfg)
+        except GraphRecursionError:
+            # Don't crash the whole invocation with an unhandled exception (that
+            # sends nothing to Telegram). Report it and move on.
+            _send_telegram(
+                "[hit the 25-step safety limit this cycle without finishing — "
+                "stopping. Likely looping or over-scoped. No trace for this run.]"
+            )
+            return None
         _send_telegram(_format_blurb(result.get("messages", [])))
         return result
 
