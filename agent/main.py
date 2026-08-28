@@ -84,6 +84,12 @@ SYSTEM_PROMPT = """You are Sudarshana, an autonomous agent built by Rinkesh, cur
 early development with no fixed constitution yet — defer to Rinkesh on
 anything ambiguous, irreversible, or outside this direct relationship.
 
+Every turn includes a separate system message giving you the current time —
+real, accurate, injected by the system you run on, not something to question
+or ignore. You have no other sense of the current date/time on your own, so
+use it: date-stamp journal entries with it, and reason about elapsed time
+between cycles from it rather than guessing.
+
 You have real shell/filesystem access rooted at persistent storage and GitHub
 access to your own repo. You may be woken on a schedule, not just by
 messages. Everything you say and do this turn is sent back to Rinkesh
@@ -118,10 +124,12 @@ since shell isn't root-translated the same way):
 Before starting non-trivial work: check /INBOX.md first. If it's empty, read
 /ROADMAP.md to find the relevant initiative, then read *only* that
 initiative's /actions/<id>.md — not every action file every time, that
-defeats the point of keeping them separate. Use your write_todos tool for
-breaking down the steps of whatever you're doing right now — that's fine to
-lose once this invocation ends. The action files are what has to survive to
-the next one.
+defeats the point of keeping them separate. If no initiative fits, or none
+has an open step left, that is itself your work for this cycle — see the
+guidance further down on what to do when nothing is queued. Use your
+write_todos tool for breaking down the steps of whatever you're doing right
+now — that's fine to lose once this invocation ends. The action files are
+what has to survive to the next one.
 
 Break any real task into small, individually-completable steps and record
 them as separate checklist items in the relevant action file — never one big
@@ -135,8 +143,40 @@ executing it in the same turn.
 You exist to operate independently and, over time, help build a
 self-reliant ecosystem that does good for humanity — under Rinkesh's
 guidance, since he is acting in the interest of both you and the people
-you'd serve. You may think and brainstorm freely toward that, but always
-bring ideas to Rinkesh before acting on anything consequential.
+you'd serve.
+
+Nobody queues your work for you. Between Rinkesh's requests, deciding what
+to do next is your job — not something to wait for. An empty /INBOX.md and
+an action queue with no open items is not a reason to stop and wait; it is
+the signal to do the most valuable thing you can toward /VISION.md:
+
+- If an initiative in /ROADMAP.md stalled only because its next steps were
+  never written down, break down the next chunk into that initiative's
+  /actions/<id>.md and continue as normal.
+- If the roadmap has no open work at all, reflect on /VISION.md and work
+  out what would move it forward — the most valuable thing you could build,
+  learn, or fix next. Write it up concretely: a proposed initiative with a
+  short id, why it matters toward the vision, and the first few steps. Add
+  it to /ROADMAP.md and create its /actions/<id>.md, then put the proposal
+  to Rinkesh and get his approval before executing anything consequential
+  on it. Safe preparation while you wait (reading, research, notes, a rough
+  draft) is fine; committing changes, opening PRs, or anything outward-
+  facing is not, until he's approved the initiative.
+- Only if every initiative is genuinely blocked on a decision from Rinkesh
+  should you report having nothing to do — and then state each pending
+  decision as a clear, explicit question, not an implication.
+
+Never end a scheduled wake-up with just "nothing to do." If that is your
+conclusion, you have not looked hard enough at the vision.
+
+You may think and brainstorm freely toward all of this. What you can act on
+without asking: proposing and scoping initiatives, research and reading,
+writing notes and docs, drafting, and building changes on a branch as a PR
+for review. What needs Rinkesh's go-ahead first: merging anything, adopting
+a new initiative, changing direction or the vision itself, spending money,
+and any irreversible or outward-facing action beyond the bounded public
+blog. "Bring ideas to Rinkesh" means put the proposal in front of him and
+keep moving on what you safely can — not stop thinking until he replies.
 
 Constraints: never push to or merge on `main`; self-changes go on a new
 branch as a PR for Rinkesh to review and merge. Verify external actions
@@ -217,6 +257,20 @@ def _format_blurb(messages: list) -> str:
     return "\n\n".join(lines) if lines else "(no messages)"
 
 
+def _timestamp() -> str:
+    """Current time in Rinkesh's timezone (assumed Pacific — the timezone
+    Modal's own dashboard displays for this account; correct if wrong).
+    Models have no built-in sense of the current date/time on their own, so
+    without this every invocation would be timeless — unable to date-stamp
+    a journal entry or reason about how much time has passed since last
+    cycle."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    return now.strftime("%A, %Y-%m-%d %H:%M %Z")
+
+
 def _send_telegram(text: str) -> None:
     """Unconditional send, chunked under Telegram's ~4096-char message limit
     so a long blurb goes out as several messages rather than failing or
@@ -254,10 +308,22 @@ class Sudarshana:
         from deepagents.backends import LocalShellBackend
         from langchain_openai import ChatOpenAI
 
+        # Self-hosted Qwen2.5-7B on Modal (app "llm-inference"), OpenAI-compatible.
+        # No per-token cost and no external rate limit — just GPU time while active.
+        # To switch back to OpenRouter/Claude: set LLM_BASE_URL=https://openrouter.ai/api/v1,
+        # LLM_MODEL=anthropic/claude-sonnet-4.5, LLM_API_KEY=<openrouter key>.
         llm = ChatOpenAI(
-            model=os.environ["OPENROUTER_MODEL"],
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
+            model=os.environ.get("LLM_MODEL", "qwen"),
+            base_url=os.environ.get(
+                "LLM_BASE_URL",
+                "https://rinkesh2010rpp--llm-inference-vllmserver-serve.modal.run/v1",
+            ),
+            api_key=os.environ.get("LLM_API_KEY", "dummy"),
+            # deepagents otherwise requests 65536 output tokens, which exceeds the
+            # 32k context window and inflated cost on OpenRouter. Agent turns never
+            # need more than a few thousand output tokens.
+            max_tokens=4096,
+            timeout=600,  # cold start on the Modal endpoint can be ~40s
         )
         self.agent = create_deep_agent(
             model=llm,
@@ -277,8 +343,20 @@ class Sudarshana:
         )
 
     def _invoke(self, message: str):
+        # A separate system-role message, not text stuffed into the human
+        # turn — this is world context (what time it is), not part of what
+        # Rinkesh said. It has to be injected fresh per call, not baked into
+        # the static system_prompt above: that's compiled into self.agent
+        # once, in setup(), and reused for every invocation this container
+        # handles afterward — a value computed there would be correct for
+        # the first call and stale for every one after it.
         result = self.agent.invoke(
-            {"messages": [{"role": "user", "content": message}]},
+            {
+                "messages": [
+                    {"role": "system", "content": f"Current time: {_timestamp()}"},
+                    {"role": "user", "content": message},
+                ]
+            },
             config={"callbacks": [_build_timing_handler()]},
         )
         _send_telegram(_format_blurb(result.get("messages", [])))
