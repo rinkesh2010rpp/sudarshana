@@ -13,9 +13,9 @@ No cross-invocation memory (no checkpointer) — replaying the trace cost
 on the Volume: VISION.md, ROADMAP.md, actions/<id>.md, INBOX.md,
 logs/<date>.md.
 
-Telegram delivery is unconditional: Python renders and sends the whole
-message trace every invocation, rather than relying on the model to call
-a send tool (which it sometimes didn't).
+Telegram delivery is handled by Python, not a model tool call (which the
+model sometimes forgot): the agent's final message is sent to Telegram
+unconditionally, and the full message trace is printed to the modal logs.
 
 The agent is built once per container in Sudarshana.setup(); both
 telegram_webhook and hourly_checkin reuse that instance. hourly_trigger
@@ -332,9 +332,23 @@ def _build_timing_handler():
     return _TimingHandler()
 
 
+def _final_message(messages: list) -> str:
+    """The agent's last spoken message — the final AIMessage with real
+    content. Falls back to a marker so a silent turn still sends something
+    to Telegram rather than nothing (the full trace is in the modal logs)."""
+    for m in reversed(messages):
+        if type(m).__name__ != "AIMessage":
+            continue
+        content = (getattr(m, "content", "") or "").strip()
+        if content:
+            return content
+    return "[cycle ended with no final message — see modal app logs for the trace]"
+
+
 def _format_blurb(messages: list) -> str:
     """Render the full message trace (every model turn and tool call/result)
-    as plain text for Telegram — deliberately the whole thing, not a summary."""
+    as plain text for the modal logs — the full record behind the one-line
+    Telegram message."""
     lines = []
     for m in messages:
         role = type(m).__name__
@@ -474,11 +488,14 @@ class Sudarshana:
             # Don't let this crash the invocation — that sends nothing to
             # Telegram. Report and move on.
             _send_telegram(
-                "[hit the 25-step safety limit this cycle without finishing — "
+                "[hit the 50-step safety limit this cycle without finishing — "
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
             )
             return None
-        _send_telegram(_format_blurb(result.get("messages", [])))
+        # Full trace to the modal logs for debugging; only the agent's final
+        # message goes to Telegram.
+        print(_format_blurb(result.get("messages", [])))
+        _send_telegram(_final_message(result.get("messages", [])))
         return result
 
     @modal.fastapi_endpoint(method="POST")
