@@ -381,7 +381,13 @@ class Sudarshana:
                 model=os.environ["OPENROUTER_MODEL"],
                 base_url="https://openrouter.ai/api/v1",
                 api_key=os.environ["OPENROUTER_API_KEY"],
-                max_tokens=4096,  # NOT the deepagents default of 65536
+                # Reasoning models (DeepSeek V4, Qwen3) count <think> tokens
+                # against max_tokens. 4096 was too small: on a non-trivial step
+                # the reasoning trace alone hit the cap (finish_reason "length")
+                # before any tool call or answer, so the agent loop just ended
+                # with an empty message — see the 2026-08-29 08:06 incident.
+                # Still well under the deepagents default of 65536.
+                max_tokens=32768,
                 timeout=600,
                 # Pin to providers with well-maintained tool-call parsers.
                 # OpenRouter's cheapest auto-route (Relace) silently mangled a
@@ -404,7 +410,9 @@ class Sudarshana:
                     "https://rinkesh2010rpp--llm-inference-vllmserver-serve.modal.run/v1",
                 ),
                 api_key=os.environ.get("LLM_API_KEY", "dummy"),
-                max_tokens=4096,
+                # See the OpenRouter branch above: Qwen3 also spends max_tokens
+                # on its <think> trace, so keep the same headroom here.
+                max_tokens=32768,
                 timeout=600,
             )
         self.agent = create_deep_agent(
