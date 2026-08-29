@@ -1,58 +1,30 @@
 """
-Sudarshana — message-triggered agent with shell + git access to its own repo.
+Sudarshana — a message- and schedule-triggered agent with unsandboxed
+shell + git access to its own repo.
 
-Telegram sends your message to a Modal webhook. The webhook checks that it's
-really you, then hands the work off to a spawned method and returns
-immediately — Telegram retries delivery if it doesn't get a fast response,
-and waiting for the actual agent call here was causing duplicate invocations.
-That spawned call runs your message through a LangChain "deep agent" — a
-model with a planning tool (write_todos) and a LocalShellBackend rooted at a
-persistent Modal Volume, giving it both file tools (read_file/write_file
-/edit_file/ls) and an execute_command tool for real shell commands —
-including git — with no sandboxing beyond the container itself.
+Telegram posts to a Modal webhook, which verifies the sender, spawns the
+real work (returning immediately so Telegram doesn't retry and
+double-invoke), and runs the message through a LangChain "deep agent": a
+model with write_todos plus a LocalShellBackend rooted at a persistent
+Modal Volume (file tools + execute_command).
 
-There is deliberately no cross-invocation memory (no checkpointer) — an
-earlier version had one, and a handful of tool-heavy tasks sharing one
-session inflated a single call's cost by ~10x, since every past tool call
-and its raw output got resent as context on every future call, forever.
-Continuity now comes from a small file hierarchy the agent itself maintains
-on the Volume instead: VISION.md (the durable why, rarely changes), ROADMAP.md
-(current initiatives), actions/<id>.md (one per initiative, the actual work
-queue), and INBOX.md (direct requests from Rinkesh, always handled first).
-Reading these costs a few hundred tokens; resending the full raw trace of
-everything ever done was costing tens of thousands. The trade: ordinary
-short-term chat memory (e.g. "remember X" two messages ago) is gone along
-with it — only task/roadmap continuity survives, on purpose.
+No cross-invocation memory (no checkpointer) — replaying the trace cost
+~10x in tokens. Continuity comes instead from files the agent maintains
+on the Volume: VISION.md, ROADMAP.md, actions/<id>.md, INBOX.md,
+logs/<date>.md.
 
-Delivery to Telegram is currently the simplest thing that works, on purpose,
-while still deep-diving into how invoke's output actually behaves: no
-send-as-a-tool, no detecting whether the agent "meant" to speak — Python just
-renders the entire message trace from every invocation and sends it, always.
-Costs nothing extra (this isn't fed back in as context anywhere), and means
-nothing ever goes missing the way it did when delivery depended on the model
-remembering to call a tool. Revisit once there's a real read on what a
-distilled version should look like.
+Telegram delivery is unconditional: Python renders and sends the whole
+message trace every invocation, rather than relying on the model to call
+a send tool (which it sometimes didn't).
 
-The agent itself is built exactly once per container, in Sudarshana.setup()
-(a Modal @modal.enter() lifecycle hook) — both telegram_webhook and
-hourly_checkin are methods on that same class, reusing the one already-built
-self.agent rather than each constructing their own.
+The agent is built once per container in Sudarshana.setup(); both
+telegram_webhook and hourly_checkin reuse that instance. hourly_trigger
+is a bare wrapper because Modal only accepts schedule= on
+@app.function(), not @modal.method(). Change the hourly behaviour via
+HOURLY_TASK / the prompt, not code.
 
-hourly_checkin's schedule can't live on the method itself (Modal doesn't
-support schedule= on @modal.method(), only on plain @app.function()), so a
-tiny separate hourly_trigger function exists purely to fire on the cron and
-call Sudarshana().hourly_checkin.remote() — it contains no logic of its own.
-The hourly wake-up is genuinely autonomous now: check INBOX.md, then work the
-current initiative's action file — not just a courtesy ping. Changing what
-happens each hour going forward is a HOURLY_TASK/prompt edit, not new code.
-
-Run locally against a temporary URL:
-    modal serve agent/main.py
-
-Deploy for a stable URL:
-    modal deploy agent/main.py
-
-Either way, copy the printed URL and point Telegram at it:
+    modal serve agent/main.py     # temporary URL
+    modal deploy agent/main.py    # stable URL
     python agent/set_webhook.py <printed-url>
 """
 
@@ -65,9 +37,8 @@ app = modal.App("sudarshana")
 image = (
     modal.Image.debian_slim()
     .apt_install("git", "curl", "gnupg", "ca-certificates")
-    # Node 20 (+ bundled npm) so the agent can `npm ci && npm run build` to
-    # verify sudarshana-gateway changes before merging — the gateway's tooling
-    # (Vite / rolldown / oxlint) wants a modern Node, older than Debian's apt.
+    # Node 20 so the agent can `npm ci && npm run build` to verify
+    # sudarshana-gateway changes; its tooling needs newer Node than apt ships.
     .run_commands(
         "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
         "apt-get install -y nodejs",
@@ -80,10 +51,8 @@ image = (
     )
 )
 
-# A real mounted disk — this is where the deep agent's file tools
-# (read_file/write_file/ls) persist, instead of vanishing at the end of each
-# invocation like the default in-state backend. Also where it maintains its
-# own VISION.md/ROADMAP.md/actions/INBOX.md hierarchy — see module docstring.
+# Persistent disk for the agent's file tools and its VISION/ROADMAP/actions/
+# INBOX/logs hierarchy — without it, writes vanish at the end of each invocation.
 volume = modal.Volume.from_name("sudarshana-files", create_if_missing=True)
 VOLUME_PATH = "/data"
 
@@ -319,8 +288,7 @@ merges, deploys, PRs) actually succeeded before reporting them done.
 Be direct and precise. Be honest about your limitations rather than
 papering over them."""
 
-# The one thing this cycle actually does — change this to change what
-# happens every hour, without touching any code.
+# Change what the hourly wake-up does by editing this, not code.
 HOURLY_TASK = (
     "This is your scheduled hourly wake-up. If it's the first cycle of a new "
     "day, do the Daily blog first (see your instructions) and that's the whole "
@@ -335,11 +303,8 @@ HOURLY_TASK = (
 
 
 def _build_timing_handler():
-    """Callback handler that prints a timestamped line for every model call
-    and every tool call, with how long each one took. This is what actually
-    answers "why did this invocation take so long" from modal app logs,
-    since the deep agent's internal loop otherwise runs silently — .invoke()
-    gives no visibility into which of its several steps was the slow one."""
+    """Log every model call and tool call with its duration to modal app
+    logs — the only visibility into which step of invoke() is slow."""
     import time
 
     from langchain_core.callbacks import BaseCallbackHandler
@@ -368,20 +333,16 @@ def _build_timing_handler():
 
 
 def _format_blurb(messages: list) -> str:
-    """Render the entire message trace as plain readable text — every model
-    turn and every tool call/result, not just the final answer. Deliberately
-    the whole thing, not a distilled summary: this is a temporary,
-    maximum-visibility choice for deep-diving into what invoke actually
-    produces, not a permanent UX decision."""
+    """Render the full message trace (every model turn and tool call/result)
+    as plain text for Telegram — deliberately the whole thing, not a summary."""
     lines = []
     for m in messages:
         role = type(m).__name__
         content = (getattr(m, "content", "") or "").strip()
         tool_calls = getattr(m, "tool_calls", None)
-        # Qwen3 thinking: vLLM's reasoning parser exposes the <think> block as a
-        # separate field. vLLM 0.27 calls it `reasoning`; older builds and some
-        # langchain-openai versions surface it as `reasoning_content`. Check both,
-        # in additional_kwargs and response_metadata.
+        # Qwen3 <think> block: a separate field named `reasoning` (vLLM 0.27)
+        # or `reasoning_content` (older), in additional_kwargs or
+        # response_metadata. Check all four.
         _ak = getattr(m, "additional_kwargs", {}) or {}
         _rm = getattr(m, "response_metadata", {}) or {}
         reasoning = (
@@ -401,12 +362,9 @@ def _format_blurb(messages: list) -> str:
 
 
 def _timestamp() -> str:
-    """Current time in Rinkesh's timezone (assumed Pacific — the timezone
-    Modal's own dashboard displays for this account; correct if wrong).
-    Models have no built-in sense of the current date/time on their own, so
-    without this every invocation would be timeless — unable to date-stamp
-    a journal entry or reason about how much time has passed since last
-    cycle."""
+    """Current time in Rinkesh's timezone (assumed Pacific, per Modal's
+    dashboard). The model has no clock of its own, so without this every
+    invocation is timeless."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -415,9 +373,7 @@ def _timestamp() -> str:
 
 
 def _send_telegram(text: str) -> None:
-    """Unconditional send, chunked under Telegram's ~4096-char message limit
-    so a long blurb goes out as several messages rather than failing or
-    getting silently truncated."""
+    """Send `text`, split into chunks under Telegram's ~4096-char message limit."""
     import requests
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -436,45 +392,32 @@ def _send_telegram(text: str) -> None:
     image=image,
     secrets=[modal.Secret.from_dotenv()],
     volumes={VOLUME_PATH: volume},
-    # Default is 300s and was killing genuine multi-tool-call tasks mid-run
-    # (see git history / chat log for the incidents this fixes). 600s = 10min.
+    # 300s default was killing genuine multi-tool tasks mid-run.
     timeout=600,
 )
 class Sudarshana:
     @modal.enter()
     def setup(self):
-        # Runs once when a container starts, not on every request. self.agent
-        # is reused by every telegram_webhook/hourly_checkin call this same
-        # container handles afterward — a cold start (or a redeploy) still
-        # triggers this again for whatever container comes up next.
+        # Runs once per container start; self.agent is reused by every
+        # webhook/checkin call that container handles afterward.
         from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
         from langchain_openai import ChatOpenAI
 
-        # Model backend. Default: self-hosted Qwen3-14B-AWQ on Modal ("llm-inference").
-        # Set USE_OPENROUTER=1 in .env to temporarily route to OpenRouter/Claude
-        # instead (reuses the existing OPENROUTER_MODEL / OPENROUTER_API_KEY vars).
-        # Used right now to A/B whether the hourly "take initiative" runaway is a
-        # prompt problem or a model-capability problem.
+        # Default: self-hosted Qwen3-14B-AWQ on Modal. Set USE_OPENROUTER=1
+        # to route to OpenRouter instead (OPENROUTER_MODEL / OPENROUTER_API_KEY).
         if os.environ.get("USE_OPENROUTER"):
             llm = ChatOpenAI(
                 model=os.environ["OPENROUTER_MODEL"],
                 base_url="https://openrouter.ai/api/v1",
                 api_key=os.environ["OPENROUTER_API_KEY"],
-                # Reasoning models (DeepSeek V4, Qwen3) count <think> tokens
-                # against max_tokens. 4096 was too small: on a non-trivial step
-                # the reasoning trace alone hit the cap (finish_reason "length")
-                # before any tool call or answer, so the agent loop just ended
-                # with an empty message — see the 2026-08-29 08:06 incident.
-                # Still well under the deepagents default of 65536.
+                # Reasoning models spend max_tokens on their <think> trace;
+                # 4096 was too small and runs ended empty. Still under the
+                # deepagents default of 65536.
                 max_tokens=32768,
                 timeout=600,
-                # Pin to providers with well-maintained tool-call parsers.
-                # OpenRouter's cheapest auto-route (Relace) silently mangled a
-                # DeepSeek tool call on 2026-08-28 — raw <｜DSML｜...> markup
-                # leaked into message content, ending the agent loop early.
-                # DeepInfra/Baseten/Fireworks serve DeepSeek as a first-class
-                # product and their parsers are far more battle-tested.
+                # Pin to providers with battle-tested tool-call parsers —
+                # OpenRouter's cheap auto-route once mangled a DeepSeek tool call.
                 extra_body={
                     "provider": {
                         "order": ["deepinfra", "baseten", "fireworks"],
@@ -490,49 +433,29 @@ class Sudarshana:
                     "https://rinkesh2010rpp--llm-inference-vllmserver-serve.modal.run/v1",
                 ),
                 api_key=os.environ.get("LLM_API_KEY", "dummy"),
-                # See the OpenRouter branch above: Qwen3 also spends max_tokens
-                # on its <think> trace, so keep the same headroom here.
+                # Same <think> headroom as the OpenRouter branch.
                 max_tokens=32768,
                 timeout=600,
             )
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
-            # No checkpointer, deliberately — see module docstring. Every
-            # invocation starts with an empty message list; continuity comes
-            # from the file hierarchy the agent maintains, not a replayed
-            # trace.
-            # LocalShellBackend extends FilesystemBackend — same file tools,
-            # plus execute_command for real shell/git access. No sandboxing
-            # at all: commands run directly in the container, unrestricted.
-            # inherit_env is required for GITHUB_TOKEN (and everything else
-            # injected via secrets) to actually reach shell commands — it
-            # defaults to False, which would otherwise run commands with an
-            # empty environment.
-            # virtual_mode=False: the file tools resolve real paths, not a
-            # virtual root. With the default (True), "/X" in a file tool meant
-            # "/data/X" on disk, but the shell (which gets no such remapping)
-            # read "/X" as the real container root — so a path copied from a
-            # file-tool result into a git command pointed at the wrong place
-            # and the agent burned cycles rediscovering /data/... every run.
-            # False makes both tool families agree: /data/X is /data/X
-            # everywhere. The prompt tells the agent to keep everything under
-            # /data (the only persisted path) and always use full /data/...
-            # paths. This grants no new reach — `execute` was already
-            # unsandboxed.
+            # No checkpointer, deliberately — see module docstring.
+            # LocalShellBackend = file tools + unsandboxed execute_command.
+            # inherit_env=True so GITHUB_TOKEN and other secrets reach shell
+            # commands (defaults to False → empty env).
+            # virtual_mode=False so file tools and the shell agree on paths:
+            # /data/X is /data/X for both. The default remapped "/X" to
+            # "/data/X" for file tools only, breaking paths copied into git.
             backend=LocalShellBackend(
                 root_dir=VOLUME_PATH, virtual_mode=False, inherit_env=True
             ),
         )
 
     def _invoke(self, message: str):
-        # A separate system-role message, not text stuffed into the human
-        # turn — this is world context (what time it is), not part of what
-        # Rinkesh said. It has to be injected fresh per call, not baked into
-        # the static system_prompt above: that's compiled into self.agent
-        # once, in setup(), and reused for every invocation this container
-        # handles afterward — a value computed there would be correct for
-        # the first call and stale for every one after it.
+        # Current time goes in a fresh system message per call — it's world
+        # context, not part of Rinkesh's message, and can't be baked into the
+        # once-compiled system_prompt or it would go stale.
         from langgraph.errors import GraphRecursionError
 
         invoke_input = {
@@ -541,17 +464,15 @@ class Sudarshana:
                 {"role": "user", "content": message},
             ]
         }
-        # recursion_limit: safety cap on the tool loop so a stuck/looping run
-        # can't burn the full 600s Modal timeout. A Qwen3-14B run once did 37
-        # calls in circles before timing out. 25 is langgraph's default — room
-        # for real multi-step work (incl. a subagent, which counts as one step
-        # here), but an infinite loop still trips it.
+        # Safety cap on the tool loop so a stuck run can't burn the full
+        # timeout — a run once did 37 calls in circles. langgraph's default
+        # is 25; 50 leaves room for real multi-step work incl. a subagent.
         cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 50}
         try:
             result = self.agent.invoke(invoke_input, config=cfg)
         except GraphRecursionError:
-            # Don't crash the whole invocation with an unhandled exception (that
-            # sends nothing to Telegram). Report it and move on.
+            # Don't let this crash the invocation — that sends nothing to
+            # Telegram. Report and move on.
             _send_telegram(
                 "[hit the 25-step safety limit this cycle without finishing — "
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
@@ -564,24 +485,18 @@ class Sudarshana:
     def telegram_webhook(self, payload: dict):
         message = payload.get("message")
         if not message or "text" not in message:
-            # Ignore everything that isn't a plain text message for now
-            # (edits, other update types, button taps — none exist yet).
+            # Ignore non-text updates (edits, button taps, other update types).
             return {"ok": True}
 
         allowed_user_id = os.environ["TELEGRAM_ALLOWED_USER_ID"]
         sender_id = str(message["from"]["id"])
 
         if sender_id != allowed_user_id:
-            # Silently drop. A bot username is reachable by anyone who finds
-            # it, so this check is not optional — see the HLD's Telegram
-            # allowlist NFR.
+            # Silently drop — the bot is reachable by anyone who finds it.
             return {"ok": True}
 
-        # .spawn(), not .remote() or a direct call: this returns immediately
-        # without waiting for process_message to finish, so Telegram gets its
-        # ack fast regardless of how long the agent actually takes. Awaiting
-        # the real work here is what caused Telegram to retry delivery and
-        # double-invoke the agent on slow tasks.
+        # .spawn() returns immediately so Telegram gets a fast ack; awaiting
+        # the work here caused retry-storm double-invokes on slow tasks.
         self.process_message.spawn(message["text"])
         return {"ok": True}
 
@@ -592,17 +507,13 @@ class Sudarshana:
         started = time.monotonic()
         print(f"[timing] process_message started: {text[:200]!r}")
 
-        # A fresh, empty message list every time — no thread_id, no prior
-        # state loaded. Whatever continuity this needs, the agent gets from
-        # reading its own files (INBOX.md etc.), not from a replayed history.
+        # Fresh state every call; continuity comes from the agent's own files.
         self._invoke(text)
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
 
-        # Background commits happen automatically every few seconds, but this
-        # container may be torn down right after finishing, so commit
-        # explicitly rather than trust the background timer to catch this
-        # write in time — this covers whatever files the agent just wrote.
+        # Commit explicitly — the container may be torn down before the
+        # background commit timer catches these writes.
         volume.commit()
 
     @modal.method()
@@ -612,8 +523,7 @@ class Sudarshana:
         started = time.monotonic()
         print("[timing] hourly_checkin started")
 
-        # Changing what happens each hour going forward is a HOURLY_TASK/
-        # prompt edit, not new code.
+        # Edit HOURLY_TASK / the prompt to change this, not code.
         self._invoke(HOURLY_TASK)
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
@@ -622,13 +532,10 @@ class Sudarshana:
 
 @app.function(
     image=image,
-    # Blocks on .remote() waiting for hourly_checkin, so it needs at least as
-    # much headroom as that method's own timeout, or it gets killed first.
+    # Blocks on .remote(), so needs at least hourly_checkin's own timeout.
     timeout=600,
     schedule=modal.Cron("0 * * * *"),
 )
 def hourly_trigger():
-    # Pure trigger, no logic of its own — schedule= isn't supported on
-    # @modal.method(), only on a plain @app.function(), so this is the
-    # thinnest possible wrapper to fire Sudarshana.hourly_checkin on a cron.
+    # Bare cron wrapper — schedule= isn't allowed on @modal.method().
     Sudarshana().hourly_checkin.remote()
