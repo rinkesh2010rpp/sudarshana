@@ -406,8 +406,9 @@ def _send_telegram(text: str) -> None:
     image=image,
     secrets=[modal.Secret.from_dotenv()],
     volumes={VOLUME_PATH: volume},
-    # 300s default was killing genuine multi-tool tasks mid-run.
-    timeout=600,
+    # 300s default was killing genuine multi-tool tasks mid-run; 600s then
+    # wasn't enough when the self-hosted model is slow (90-180s/call).
+    timeout=1000,
 )
 class Sudarshana:
     @modal.enter()
@@ -480,15 +481,15 @@ class Sudarshana:
         }
         # Safety cap on the tool loop so a stuck run can't burn the full
         # timeout — a run once did 37 calls in circles. langgraph's default
-        # is 25; 50 leaves room for real multi-step work incl. a subagent.
-        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 50}
+        # is 25; 100 leaves room for real multi-step work incl. a subagent.
+        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 100}
         try:
             result = self.agent.invoke(invoke_input, config=cfg)
         except GraphRecursionError:
             # Don't let this crash the invocation — that sends nothing to
             # Telegram. Report and move on.
             _send_telegram(
-                "[hit the 50-step safety limit this cycle without finishing — "
+                "[hit the 100-step safety limit this cycle without finishing — "
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
             )
             return None
@@ -550,7 +551,7 @@ class Sudarshana:
 @app.function(
     image=image,
     # Blocks on .remote(), so needs at least hourly_checkin's own timeout.
-    timeout=600,
+    timeout=1000,
     schedule=modal.Cron("0 * * * *"),
 )
 def hourly_trigger():
