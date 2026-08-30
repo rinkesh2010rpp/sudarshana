@@ -48,6 +48,11 @@ image = (
         "fastapi[standard]",
         "deepagents",
         "langchain-openai",
+        # DuckDuckGo web search tool (free, no API key) — required inside the
+        # Modal container image, not just in requirements.txt, because the
+        # image is built from this pip_install list. Keep in sync with
+        # requirements.txt.
+        "ddgs",
     )
 )
 
@@ -429,17 +434,30 @@ class Sudarshana:
         def search_web(query: str) -> str:
             """Search the public web (DuckDuckGo). Use when you need current
             or external information that isn't in your files: news, docs,
-            prices, facts. Free, no API key. Returns a few top result
-            titles/snippets as plain text."""
+            prices, facts. Free, no API key. Returns a few top results as
+            plain text: title, URL, and a short snippet."""
             from ddgs import DDGS
+            from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
+
+            try:
+                with DDGS() as ddgs:
+                    raw = ddgs.text(query, max_results=5) or []
+            except RatelimitException:
+                return "(no results: DuckDuckGo rate-limited this search — try again shortly)"
+            except TimeoutException:
+                return "(no results: DuckDuckGo search timed out — try again shortly)"
+            except DDGSException as e:
+                return f"(search failed: {e})"
 
             results = []
-            with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=5) or []:
-                    title = r.get("title", "")
-                    body = r.get("body", "")
-                    if title or body:
-                        results.append(f"- {title}\n  {body}".strip())
+            for r in raw:
+                title = r.get("title", "").strip()
+                url = r.get("href", "").strip()
+                body = r.get("body", "").strip()
+                if title or url:
+                    results.append(f"- {title}\n  {url}")
+                    if body:
+                        results[-1] += f"\n  {body}"
             return "\n\n".join(results) if results else "(no results)"
 
         search_tools = [search_web]
