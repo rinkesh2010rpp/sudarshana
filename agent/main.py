@@ -422,7 +422,27 @@ class Sudarshana:
         # webhook/checkin call that container handles afterward.
         from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
+        from langchain_core.tools import tool
         from langchain_openai import ChatOpenAI
+
+        @tool
+        def search_web(query: str) -> str:
+            """Search the public web (DuckDuckGo). Use when you need current
+            or external information that isn't in your files: news, docs,
+            prices, facts. Free, no API key. Returns a few top result
+            titles/snippets as plain text."""
+            from ddgs import DDGS
+
+            results = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=5) or []:
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    if title or body:
+                        results.append(f"- {title}\n  {body}".strip())
+            return "\n\n".join(results) if results else "(no results)"
+
+        search_tools = [search_web]
 
         # Default: self-hosted Qwen3-14B-AWQ on Modal. Set USE_OPENROUTER=1
         # to route to OpenRouter instead (OPENROUTER_MODEL / OPENROUTER_API_KEY).
@@ -460,6 +480,8 @@ class Sudarshana:
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
+            # DuckDuckGo web search alongside the filesystem/shell tools.
+            tools=search_tools,
             # No checkpointer, deliberately — see module docstring.
             # LocalShellBackend = file tools + unsandboxed execute_command.
             # inherit_env=True so GITHUB_TOKEN and other secrets reach shell

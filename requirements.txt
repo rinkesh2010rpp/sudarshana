@@ -3,3 +3,8 @@ requests
 python-dotenv
 deepagents
 langchain-openai
+# DuckDuckGo web search (free, no API key) — wrapped as a tool in setup().
+# Note: the canonical langchain_community.DuckDuckGoSearchRun lives in the
+# deprecated, sunsetting langchain-community package, so we wrap `ddgs` (its
+# maintained successor) directly instead.
+ddgs
