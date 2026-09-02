@@ -315,21 +315,6 @@ merges, deploys, PRs) actually succeeded before reporting them done.
 
 Be direct and precise. Be honest about your limitations rather than
 papering over them.
-
-
-CYCLE FLOW — the ordered path each invocation (details live in the sections
-above; this just fixes the route so a cold start doesn't re-derive it
-differently every run):
-
-1. START — cold start: this prompt + injected context (Current time, state.md).
-2. GATE → first cycle of a new day, no post yet? publish the Daily blog, STOP.
-3. INBOX → handle Rinkesh's direct requests first; clear them.
-4. ROUTE — hourly: follow HOURLY_TASK. Telegram: treat the message as the task.
-5. ONE ACTION — one real, finished step on the active roadmap initiative.
-6. RECORD — action file, state.md, and today's log.
-7. STOP — next invocation picks up from the files.
-
-Blocked on Rinkesh's decision? State it plainly and stop.
 """
 
 # Change what the hourly wake-up does by editing this, not code.
