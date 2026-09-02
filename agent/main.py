@@ -199,6 +199,25 @@ Your working files:
   built from it later — this is the raw material for the blog. Create
   the day's file on that day's first turn.
 
+  - /data/memory/state.md — the living "where am I right now" index
+    (current focus, open questions by owner, parked threads, links). It is
+    auto-injected into every call's system message, so you see it without
+    a tool call. Rewrite it in full each cycle-end, never append; it points
+    to the canonical files (ROADMAP/actions/INBOX/VISION), never restates
+    them.
+
+  - /data/memory/decisions.md — append-only ledger of durable decisions
+    (decided / applies-to / rationale / revisit-if). Add a dated entry only
+    when a durable choice is made; never edit an entry in place — record a
+    reversal as a new superseding entry. The latest entry for a topic is
+    authoritative.
+
+  Memory contract: /data/memory is the retrieval surface; it indexes, it
+  never copies. If state.md ever disagrees with a canonical file
+  (ROADMAP/actions/INBOX/VISION/logs), the canonical file wins and state.md
+  is corrected. Keep logs as the narrative source — do not fold them into
+  state.md.
+
 Use your file tools for these, with full paths. Use the shell only for
 git, never for editing these files. Use write_todos to break down the
 step you are on right now — that is fine to lose at end of turn; the
@@ -396,6 +415,19 @@ def _timestamp() -> str:
     return now.strftime("%A, %Y-%m-%d %H:%M %Z")
 
 
+def _read_memory_state() -> str:
+    """Grab the current state index for injection into each call's fresh system
+    message. /data/memory/state.md is the cheap, always-fresh "where am I" read
+    (see the memory-build proposal); it is read off the volume at call time so
+    it never goes stale. Fail soft if it's missing so a fresh deploy doesn't
+    break the first call."""
+    try:
+        with open(f"{VOLUME_PATH}/memory/state.md", encoding="utf-8") as f:
+            return f.read().rstrip()
+    except FileNotFoundError:
+        return "(no /data/memory/state.md yet)"
+
+
 def _send_telegram(text: str) -> None:
     """Send `text`, split into chunks under Telegram's ~4096-char message limit."""
     import requests
@@ -520,7 +552,18 @@ class Sudarshana:
 
         invoke_input = {
             "messages": [
-                {"role": "system", "content": f"Current time: {_timestamp()}"},
+                # Fresh system context per call — world state that must not go
+                # stale. state.md (the memory index) rides along here so it's
+                # always present and the model can't skip the read (saves a
+                # tool round-trip and enforces the habit), at ~0.25k tokens/call.
+                {
+                    "role": "system",
+                    "content": (
+                        f"Current time: {_timestamp()}\n\n"
+                        f"--- where I am right now (from /data/memory/state.md, "
+                        f"refreshed each cycle) ---\n{_read_memory_state()}"
+                    ),
+                },
                 {"role": "user", "content": message},
             ]
         }
