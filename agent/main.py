@@ -424,6 +424,52 @@ def _timestamp() -> str:
     return now.strftime("%A, %Y-%m-%d %H:%M %Z")
 
 
+def _today_log_path() -> str:
+    """Path of today's log file, /data/logs/<YYYY-MM-DD>.md (Pacific time)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    date = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    return f"{VOLUME_PATH}/logs/{date}.md"
+
+
+def _log_size(path: str) -> int:
+    """Byte size of a file, or 0 if it doesn't exist yet (today's log)."""
+    import os
+
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _log_guard(baseline: int) -> None:
+    """Host-side guard against silent windows (the recurring failure).
+
+    The failure mode: a turn commits + pushes code but dies before appending
+    its line to today's /data/logs/<date>.md (the 100-step recursion limit, or
+    a crash), so the durable record lags the git state with no trace. If the
+    day's log did not grow this turn, append an honest host marker so the gap
+    is visible to the next wake-up instead of silent.
+    """
+    try:
+        path = _today_log_path()
+        if _log_size(path) > baseline:
+            return  # the agent appended its record line this turn — good.
+        stamp = _timestamp()
+        with open(path, "a") as f:
+            f.write(
+                f"\n## {stamp} — [HOST log-guard] this turn ended without "
+                "appending to the day's log (the agent's work may have landed, "
+                "e.g. commits/pushes, but the durable record did not advance). "
+                "A later wake-up should reconstruct this cycle from git/reflog "
+                "before continuing.\n"
+            )
+    except Exception as e:
+        # Never let the guard mask the turn it's protecting.
+        print(f"[log-guard] could not write guard marker: {e}")
+
+
 def _send_telegram(text: str) -> None:
     """Send `text`, split into chunks under Telegram's ~4096-char message limit."""
     import requests
@@ -602,21 +648,29 @@ class Sudarshana:
         # timeout — a run once did 37 calls in circles. langgraph's default
         # is 25; 100 leaves room for real multi-step work incl. a subagent.
         cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 100}
+        # Host-side silent-window guard: remember today's log size before the
+        # turn so we can tell afterwards whether the agent appended its record
+        # line. Runs in finally() below, so it also covers the recursion-limit
+        # early return and any exception the agent turn throws.
+        _baseline_log = _log_size(_today_log_path())
         try:
-            result = self.agent.invoke(invoke_input, config=cfg)
-        except GraphRecursionError:
-            # Don't let this crash the invocation — that sends nothing to
-            # Telegram. Report and move on.
-            _send_telegram(
-                "[hit the 100-step safety limit this cycle without finishing — "
-                "stopping. Likely looping or over-scoped. No trace for this run.]"
-            )
-            return None
-        # Full trace to the modal logs for debugging; only the agent's final
-        # message goes to Telegram.
-        print(_format_blurb(result.get("messages", [])))
-        _send_telegram(_final_message(result.get("messages", [])))
-        return result
+            try:
+                result = self.agent.invoke(invoke_input, config=cfg)
+            except GraphRecursionError:
+                # Don't let this crash the invocation — that sends nothing to
+                # Telegram. Report and move on.
+                _send_telegram(
+                    "[hit the 100-step safety limit this cycle without finishing — "
+                    "stopping. Likely looping or over-scoped. No trace for this run.]"
+                )
+                return None
+            # Full trace to the modal logs for debugging; only the agent's
+            # final message goes to Telegram.
+            print(_format_blurb(result.get("messages", [])))
+            _send_telegram(_final_message(result.get("messages", [])))
+            return result
+        finally:
+            _log_guard(_baseline_log)
 
     @modal.fastapi_endpoint(method="POST")
     def telegram_webhook(self, payload: dict):
