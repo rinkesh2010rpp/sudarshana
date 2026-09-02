@@ -415,19 +415,6 @@ def _timestamp() -> str:
     return now.strftime("%A, %Y-%m-%d %H:%M %Z")
 
 
-def _read_memory_state() -> str:
-    """Grab the current state index for injection into each call's fresh system
-    message. /data/memory/state.md is the cheap, always-fresh "where am I" read
-    (see the memory-build proposal); it is read off the volume at call time so
-    it never goes stale. Fail soft if it's missing so a fresh deploy doesn't
-    break the first call."""
-    try:
-        with open(f"{VOLUME_PATH}/memory/state.md", encoding="utf-8") as f:
-            return f.read().rstrip()
-    except FileNotFoundError:
-        return "(no /data/memory/state.md yet)"
-
-
 def _send_telegram(text: str) -> None:
     """Send `text`, split into chunks under Telegram's ~4096-char message limit."""
     import requests
@@ -459,8 +446,41 @@ class Sudarshana:
         # webhook/checkin call that container handles afterward.
         from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
+        from deepagents.backends.filesystem import FilesystemBackend
+        from deepagents.middleware.memory import MemoryMiddleware
+        from deepagents.middleware.skills import SkillsMiddleware
         from langchain_core.tools import tool
         from langchain_openai import ChatOpenAI
+
+        # MemoryMiddleware appends the runtime memory (state.md) to the true
+        # compiled system message via append_to_system_message — the idiomatic
+        # replacement for the raw {"role":"system"} ride-along in _invoke
+        # (removed in C4). It loads fresh off the volume each cold invocation,
+        # so the injected "where I am" is always current. Small custom template
+        # holds the per-call cost near state.md's own ~0.25k tokens; the
+        # default MEMORY_SYSTEM_PROMPT is ~1.6k and geared to AGENTS.md.
+        memory_middleware = MemoryMiddleware(
+            backend=FilesystemBackend(root_dir="/"),
+            sources=[f"{VOLUME_PATH}/memory/state.md"],
+            add_cache_control=False,  # Anthropic-only; no-op for Qwen3-14B
+            system_prompt=(
+                "--- where I am right now (from /data/memory/state.md, "
+                "refreshed each cycle; the canonical files "
+                "ROADMAP/actions/INBOX/VISION/logs always win on disagreement) "
+                "---\n{agent_memory}"
+            ),
+        )
+
+        # SkillsMiddleware (deepagents 0.7.11) — the library is currently EMPTY
+        # (/data/skills/README.md documents the format), so this surfaces a
+        # "no skills available yet" line into the runtime system prompt. When a
+        # skill is added later, it loads per cold cycle and the model follows it
+        # when the task matches. This is the forward hook Rinkesh asked for; no
+        # skills exist yet, so nothing else changes.
+        skills_middleware = SkillsMiddleware(
+            backend=FilesystemBackend(root_dir="/"),
+            sources=[f"{VOLUME_PATH}/skills/"],
+        )
 
         @tool
         def search_web(query: str) -> str:
@@ -530,6 +550,11 @@ class Sudarshana:
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
+            # Runtime memory injection (state.md) + skills library — via
+            # middleware, appended to the compiled system prompt at runtime
+            # (the idiomatic path). Memory replaced the old raw system-role
+            # ride-along; skills is a forward hook (empty for now).
+            middleware=[memory_middleware, skills_middleware],
             # DuckDuckGo web search alongside the filesystem/shell tools.
             tools=search_tools,
             # No checkpointer, deliberately — see module docstring.
@@ -547,22 +572,19 @@ class Sudarshana:
     def _invoke(self, message: str):
         # Current time goes in a fresh system message per call — it's world
         # context, not part of Rinkesh's message, and can't be baked into the
-        # once-compiled system_prompt or it would go stale.
+        # once-compiled system_prompt or it would go stale. (Rinkesh 2026-09-01:
+        # keep this mechanism as-is for now — no better solve found yet; revisit
+        # with a better mechanism later.)
         from langgraph.errors import GraphRecursionError
 
         invoke_input = {
             "messages": [
-                # Fresh system context per call — world state that must not go
-                # stale. state.md (the memory index) rides along here so it's
-                # always present and the model can't skip the read (saves a
-                # tool round-trip and enforces the habit), at ~0.25k tokens/call.
+                # Only time here now — memory injection (state.md) moved to the
+                # MemoryMiddleware runtime system-prompt append (C3), so state.md
+                # is not duplicated as a ragged system-role message anymore.
                 {
                     "role": "system",
-                    "content": (
-                        f"Current time: {_timestamp()}\n\n"
-                        f"--- where I am right now (from /data/memory/state.md, "
-                        f"refreshed each cycle) ---\n{_read_memory_state()}"
-                    ),
+                    "content": f"Current time: {_timestamp()}",
                 },
                 {"role": "user", "content": message},
             ]
