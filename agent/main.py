@@ -347,13 +347,6 @@ def _build_timing_handler():
         def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
             self.starts[run_id] = time.monotonic()
             print(f"[timing] model call started ({len(messages[0])} messages in context)")
-            # TEMP DEBUG (remove after Rinkesh reviews): dump the full message
-            # list as actually sent to the LLM so we can see the compiled
-            # prompt (SYSTEM_PROMPT + memory injection + skills + time + msg).
-            for i, m in enumerate(messages[0]):
-                role = getattr(m, "type", type(m).__name__)
-                content = getattr(m, "content", "")
-                print(f"[llm-msg {i}] role={role}\n{content}\n{'='*60}")
 
         def on_llm_end(self, response, *, run_id, **kwargs):
             elapsed = time.monotonic() - self.starts.pop(run_id, time.monotonic())
