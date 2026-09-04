@@ -348,6 +348,23 @@ WEEKLY_FRESHNESS_TASK = (
 )
 
 
+# Change what the weekly memory-compile wake-up does by editing this, not code.
+MEMORY_COMPILE_TASK = (
+    "This is your scheduled weekly memory-compile pass. Compile the accumulated "
+    "daily logs into durable knowledge pages under /data/memory/knowledge/. Read "
+    "/data/sudarshana/agent/schema.md FIRST and follow it exactly — it is the "
+    "compile spec (layout, naming, page shape, may-not-contain, coverage policy, "
+    "web-of-pages link structure, mechanics, cadence). If schema.md is missing, "
+    "record that and stop; do not invent rules. Read the marker "
+    "/data/memory/knowledge/.last-compiled, read only logs newer than it, update "
+    "or create the directly-evidenced pages (<1 KB each, canonical-file pointers "
+    "only), refresh the related pages' mutual 'Related:' links (both directions), "
+    "regenerate index.md mechanically, bump the marker, and append a line to "
+    "today's /data/logs/<date>.md recording the pass. Bounded: it is a compile, "
+    "not a work session — do not do open-ended research or start new work."
+)
+
+
 def _build_timing_handler():
     """Log every model call and tool call with its duration to modal app
     logs — the only visibility into which step of invoke() is slow."""
@@ -685,6 +702,19 @@ class Sudarshana:
         self._invoke(WEEKLY_FRESHNESS_TASK)
 
         print(f"[timing] weekly_freshness_checkin finished in {time.monotonic() - started:.1f}s")
+        volume.commit()
+
+    @modal.method()
+    def memory_compile_checkin(self):
+        import time
+
+        started = time.monotonic()
+        print("[timing] memory_compile_checkin started")
+
+        # Edit MEMORY_COMPILE_TASK / the prompt to change this, not code.
+        self._invoke(MEMORY_COMPILE_TASK)
+
+        print(f"[timing] memory_compile_checkin finished in {time.monotonic() - started:.1f}s")
         volume.commit()
 
 
