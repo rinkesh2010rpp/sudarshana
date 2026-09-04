@@ -333,6 +333,21 @@ HOURLY_TASK = (
 )
 
 
+# Change what the weekly freshness wake-up does by editing this, not code.
+WEEKLY_FRESHNESS_TASK = (
+    "This is your scheduled weekly freshness check-in. Your job is to keep the "
+    "retrieval layer honest and current, cheaply and bounded. Read "
+    "/data/ROADMAP.md, /data/memory/state.md, and /data/memory/decisions.md "
+    "(and the active initiative's action file if state.md points to one). Verify "
+    "every pointer and index in state.md still links to a real, current canonical "
+    "file and still agrees with it; if anything drifted, consolidate it (the cheap, "
+    "bounded version of a compile — fix state.md, do not re-architect). Then append "
+    "a line to today's /data/logs/<date>.md recording what you checked and what, if "
+    "anything, you corrected. Do not do open-ended research or start new work — this "
+    "is a bounded freshness pass, not a work session."
+)
+
+
 def _build_timing_handler():
     """Log every model call and tool call with its duration to modal app
     logs — the only visibility into which step of invoke() is slow."""
@@ -658,6 +673,30 @@ class Sudarshana:
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
         volume.commit()
+
+    @modal.method()
+    def weekly_freshness_checkin(self):
+        import time
+
+        started = time.monotonic()
+        print("[timing] weekly_freshness_checkin started")
+
+        # Edit WEEKLY_FRESHNESS_TASK / the prompt to change this, not code.
+        self._invoke(WEEKLY_FRESHNESS_TASK)
+
+        print(f"[timing] weekly_freshness_checkin finished in {time.monotonic() - started:.1f}s")
+        volume.commit()
+
+
+@app.function(
+    image=image,
+    # Blocks on .remote(), so needs at least weekly_freshness_checkin's own timeout.
+    timeout=1000,
+    schedule=modal.Cron("0 0 * * 1", timezone="America/Los_Angeles"),
+)
+def weekly_trigger():
+    # Bare cron wrapper — schedule= isn't allowed on @modal.method().
+    Sudarshana().weekly_freshness_checkin.remote()
 
 
 @app.function(
