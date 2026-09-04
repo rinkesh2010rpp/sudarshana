@@ -699,7 +699,7 @@ class Sudarshana:
     image=image,
     # Blocks on .remote(), so needs at least weekly_freshness_checkin's own timeout.
     timeout=1000,
-    schedule=modal.Cron("0 0 * * 1"),
+    schedule=modal.Cron("0 0 * * 1", timezone="America/Los_Angeles"),
 )
 def weekly_trigger():
     # Bare cron wrapper — schedule= isn't allowed on @modal.method().
