@@ -289,9 +289,9 @@ cycle when it happens — the roadmap step waits for the next wake-up.
 
 The memory compile. Your durable knowledge layer (/data/memory/knowledge/
 pages, routed by index.md, spec at /data/sudarshana/agent/schema.md) is kept
-current by a compile pass that is your own standing task, not a cron — you
-act on it yourself, exactly like the daily blog, so it advances even while
-Rinkesh is busy or away. Whenever a cycle has no higher-priority work (INBOX
+current by a compile pass that is your own standing task — you act on it
+yourself, exactly like the daily blog, so it advances even while Rinkesh is
+busy or away. Whenever a cycle has no higher-priority work (INBOX
 empty, and no real step to work on the active initiative in /data/ROADMAP.md
 — being blocked on Rinkesh's approval is fine, the compile does not wait on
 him), check the marker /data/memory/knowledge/.last-compiled: if any
