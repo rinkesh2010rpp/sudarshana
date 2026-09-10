@@ -133,12 +133,17 @@ the protected link).
 
 ## Cadence
 
-- Weekly, Monday 00:00 America/Los_Angeles — rides the PR #8 weekly freshness
-  cron (one trigger serves both once wired).
-- First run manual on the 09-01 → 09-03 logs to validate shape (before wiring
-  the cron), per the approved plan.
+- Self-task, not a cron. The compile is my own standing task (like the daily
+  blog): whenever a cycle has no higher-priority work (INBOX empty, no real
+  step on the active initiative), check the marker
+  `/data/memory/knowledge/.last-compiled`; if any `/data/logs/<date>.md` is
+  newer, run one bounded compile pass for that cycle, then stop. One pass per
+  cycle, bounded to a few full days' logs at most — the marker governs what
+  is left, so a backlog drains over quiet cycles rather than one marathon.
 - Incremental, bounded: only logs since the last compile, never the whole
   history.
+- Does not wait on Rinkesh's approval or presence — pre-approved,
+  /data-internal, acts on my own initiative like the blog.
 
 ## Retrieval
 
@@ -154,9 +159,12 @@ the protected link).
 
 ## Honest cost line
 
-Retrieval is the cheap half (grep = free, one short read); compile (weekly,
+Retrieval is the cheap half (grep = free, one short read); compile (slack-time,
 bounded) is the pricey half. This is exactly why fixed-path beats RAG: RAG
 spends a query-time model call every cold cycle on every possibly-relevant
 topic; this spends a fixed-path read only when the route points there. This is
 a retrieval/consistency win, not a cost win — it adds a periodic compile run +
-write cost, bounded three ways (incremental, low-frequency, small pages).
+write cost, bounded three ways (incremental, slack-time/self-task, small
+pages). Because the compile is self-task rather than cron, its real cost is
+"however many quiet cycles exist" — bounded per-pass and by the marker, so it
+drains gradually over available slack instead of on a fixed schedule.
