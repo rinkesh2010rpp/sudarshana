@@ -1,7 +1,8 @@
 # Memory-compile schema — the compile spec (v1)
 
 Single source of truth for the memory-compile task. The compile prompt
-(MEMORY_COMPILE_TASK in agent/main.py) sources this file and follows it
+(the "The memory compile" self-task block in the agent's system prompt,
+in agent/main.py) sources this file and follows it
 exactly. Versioned with the compile task in this repo, reviewed in the same
 PR. This asset governs *derived* pages under `/data/memory/knowledge/`; it
 does not live there (that is derived data and would risk being clobbered).
