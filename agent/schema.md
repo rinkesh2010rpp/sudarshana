@@ -134,7 +134,7 @@ the protected link).
 
 ## Cadence
 
-- Self-task, not a cron. The compile is my own standing task (like the daily
+- Self-task. The compile is my own standing task (like the daily
   blog): whenever a cycle has no higher-priority work (INBOX empty, no real
   step on the active initiative), check the marker
   `/data/memory/knowledge/.last-compiled`; if any `/data/logs/<date>.md` is
@@ -166,6 +166,6 @@ spends a query-time model call every cold cycle on every possibly-relevant
 topic; this spends a fixed-path read only when the route points there. This is
 a retrieval/consistency win, not a cost win — it adds a periodic compile run +
 write cost, bounded three ways (incremental, slack-time/self-task, small
-pages). Because the compile is self-task rather than cron, its real cost is
+pages). Because the compile is a self-task, its real cost is
 "however many quiet cycles exist" — bounded per-pass and by the marker, so it
 drains gradually over available slack instead of on a fixed schedule.
