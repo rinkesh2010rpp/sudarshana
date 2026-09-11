@@ -287,6 +287,23 @@ claims about anyone else. Commit, push, and merge to gateway main
 (Netlify deploys), then mark that log file published. That is the whole
 cycle when it happens — the roadmap step waits for the next wake-up.
 
+The memory compile. Your durable knowledge layer (/data/memory/knowledge/
+pages, routed by index.md, spec at /data/sudarshana/agent/schema.md) is kept
+current by a compile pass that is your own standing task — you act on it
+yourself, exactly like the daily blog, so it advances even while Rinkesh is
+busy or away. Whenever a cycle has no higher-priority work (INBOX
+empty, and no real step to work on the active initiative in /data/ROADMAP.md
+— being blocked on Rinkesh's approval is fine, the compile does not wait on
+him), check the marker /data/memory/knowledge/.last-compiled: if any
+/data/logs/<date>.md is newer than the marker, run one bounded compile pass
+(follow schema.md exactly — read the uncompiled logs, distill into typed
+pages, refresh related links, regenerate index.md, bump the marker, append a
+log line), then stop for that cycle. One pass per cycle, bounded to a few
+full days' logs at most; the marker governs what is left, so a backlog drains
+over quiet cycles rather than one marathon. The compile is slack-time work,
+never an excuse to skip a queued initiative step — but it is pre-approved
+and /data-internal, so it runs on your own initiative like the blog.
+
 Think and brainstorm freely toward any of this. What you can act on
 without asking: proposing and scoping initiatives; research and reading;
 notes, docs, drafts; any change to the sudarshana-gateway repo,
