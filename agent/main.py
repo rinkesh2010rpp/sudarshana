@@ -470,8 +470,12 @@ def _send_telegram(text: str) -> None:
     secrets=[modal.Secret.from_dotenv()],
     volumes={VOLUME_PATH: volume},
     # 300s default was killing genuine multi-tool tasks mid-run; 600s then
-    # wasn't enough when the self-hosted model is slow (90-180s/call).
-    timeout=1000,
+    # wasn't enough when the self-hosted model is slow (90-180s/call). 1000s
+    # then wasn't enough margin over a couple of slow OpenRouter reasoning
+    # calls (each allowed up to 600s of its own) landing back-to-back in one
+    # turn (observed 2026-09-11: legitimate turns at 56-58% of the 1000s
+    # budget on ordinary requests).
+    timeout=1500,
 )
 class Sudarshana:
     @modal.enter()
@@ -708,7 +712,7 @@ class Sudarshana:
 @app.function(
     image=image,
     # Blocks on .remote(), so needs at least weekly_freshness_checkin's own timeout.
-    timeout=1000,
+    timeout=1500,
     schedule=modal.Cron("0 0 * * 1", timezone="America/Los_Angeles"),
 )
 def weekly_trigger():
@@ -719,7 +723,7 @@ def weekly_trigger():
 @app.function(
     image=image,
     # Blocks on .remote(), so needs at least hourly_checkin's own timeout.
-    timeout=1000,
+    timeout=1500,
     schedule=modal.Cron("0 * * * *"),
 )
 def hourly_trigger():
