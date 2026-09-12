@@ -499,7 +499,13 @@ class Sudarshana:
         # default MEMORY_SYSTEM_PROMPT is ~1.6k and geared to AGENTS.md.
         memory_middleware = MemoryMiddleware(
             backend=FilesystemBackend(root_dir="/"),
-            sources=[f"{VOLUME_PATH}/memory/state.md"],
+            # Inject the compiled knowledge catalog alongside state.md so
+            # durable lessons reach every cold cycle (memory-writeback
+            # initiative); page bodies stay on-demand via read_file.
+            sources=[
+                f"{VOLUME_PATH}/memory/state.md",
+                f"{VOLUME_PATH}/memory/knowledge/index.md",
+            ],
             add_cache_control=False,  # Anthropic-only; no-op for Qwen3-14B
             system_prompt=(
                 "--- where I am right now (from /data/memory/state.md, "
