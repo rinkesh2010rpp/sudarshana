@@ -566,9 +566,13 @@ class Sudarshana:
                 timeout=600,
                 # Pin to providers with battle-tested tool-call parsers —
                 # OpenRouter's cheap auto-route once mangled a DeepSeek tool call.
+                # Fireworks first: 2026-09-11 OpenRouter activity logs showed it
+                # running ~150-250 tok/s vs ~20-60 tok/s for deepinfra/fallback
+                # providers on this model, matching independent DeepSeek
+                # provider benchmarks (deepinfra is a repeatedly slow host).
                 extra_body={
                     "provider": {
-                        "order": ["deepinfra", "baseten", "fireworks"],
+                        "order": ["fireworks", "deepinfra", "baseten"],
                         "allow_fallbacks": True,
                     }
                 },
