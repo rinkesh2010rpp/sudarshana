@@ -639,8 +639,13 @@ class Sudarshana:
         }
         # Safety cap on the tool loop so a stuck run can't burn the full
         # timeout — a run once did 37 calls in circles. langgraph's default
-        # is 25; 100 leaves room for real multi-step work incl. a subagent.
-        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 100}
+        # is 25. Raised 100 -> 200 on 2026-09-13: a legitimate build-and-ship
+        # task (schema.md + main.py edit, commit, push, PR via curl) hit the
+        # 100-step wall at ~104 steps after the real work was already done,
+        # cutting off before it could report back or update its own record —
+        # while finishing in 341.7s, well inside the 1500s timeout. Time, not
+        # step count, is the real backstop against a stuck run.
+        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 200}
         try:
             result = self.agent.invoke(invoke_input, config=cfg)
         except GraphRecursionError:
