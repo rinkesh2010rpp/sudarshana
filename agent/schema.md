@@ -17,7 +17,7 @@ ROADMAP.md, INBOX.md, VISION.md) always win on disagreement.
 
 ## Layout
 
-One directory, an `index.md` route + three typed subdirectories, all under
+One directory, an `index.md` route + four typed subdirectories, all under
 `/data/memory/knowledge/` (LLM-Wiki shape):
 
 - `index.md` — the route/catalog. One line per page: `slug — one-line summary
@@ -31,6 +31,12 @@ One directory, an `index.md` route + three typed subdirectories, all under
   cold."
 - `built/<slug>.md` — what exists and where (initiatives, commits, PRs).
   Mechanical registry; may be more complete than concepts.
+- `lessons/<slug>.md` — durable corrections, distilled from `Lessons:`
+  flagged log entries (see lessons-tier initiative, Phase 2). Each entry is
+  a small semi-structured correction: what was wrong, the correction, when,
+  outcome. Governed by the future-need gate: store only if likely needed for
+  a future case; one-offs stay in the logs. Already-generalized corrections
+  (concepts/, system/) are not duplicated here.
 
 Compile-state marker: `/data/memory/knowledge/.last-compiled` — one line, the
 date compiled through (e.g. `2026-09-03`). Only logs newer than the marker are
@@ -119,11 +125,18 @@ The compile is a bounded *prompt*, not new machinery. Sequence:
 3. Read the existing knowledge pages to know update-vs-create.
 4. Distill per coverage policy: update only when evidence adds; else draft a
    new <1 KB page.
+   A log entry carrying a `Lessons:` flag (slug + what-was-wrong → the-correction,
+   per the lessons-tier flagging convention) becomes a `lessons/<slug>.md` page
+   (create, or update in-place if it exists), subject to the future-need gate
+   — a flag on a one-off is left in the logs, not distilled.
 5. Write/update the directly-evidenced page.
 6. Refresh related pages: grep the tree for overlapping slugs/terms, update
    mutual "Related:" links both directions (web-of-pages).
 7. Regenerate `index.md` mechanically (one line per page: slug — summary —
    Sources date).
+   The typed sections include `lessons/`, so the regenerated index carries a
+   `## lessons/` block (one line per lessons page, same slug — summary —
+   Sources format), never dropped or left stale.
 8. Bump the marker to the newest log date compiled.
 9. Append a line to today's `/data/logs/<date>.md` recording the pass (pages
    created/updated, logs covered, anything flagged).

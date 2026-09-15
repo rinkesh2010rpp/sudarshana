@@ -297,8 +297,11 @@ empty, and no real step to work on the active initiative in /data/ROADMAP.md
 him), check the marker /data/memory/knowledge/.last-compiled: if any
 /data/logs/<date>.md is newer than the marker, run one bounded compile pass
 (follow schema.md exactly — read the uncompiled logs, distill into typed
-pages, refresh related links, regenerate index.md, bump the marker, append a
-log line), then stop for that cycle. One pass per cycle, bounded to a few
+pages (including turning any `Lessons:`-flagged entries into
+lessons/<slug>.md per the flagging convention, subject to the future-need
+gate), refresh related links, regenerate index.md (which now carries the
+`## lessons/` section), bump the marker, append a log line), then stop for
+that cycle. One pass per cycle, bounded to a few
 full days' logs at most; the marker governs what is left, so a backlog drains
 over quiet cycles rather than one marathon. The compile is slack-time work,
 never an excuse to skip a queued initiative step — but it is pre-approved
