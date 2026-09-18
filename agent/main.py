@@ -468,6 +468,158 @@ def _send_telegram(text: str) -> None:
         )
 
 
+# --- status-center: deterministic event writer + read-only API ---------------
+# Initiative status-center. Storage = a named modal.Dict ("sudarshana-status"),
+# shared by the deterministic writer (inside the app's containers) and the
+# read-only API (which mounts NO volume and reads live). Three pieces of state:
+#   * current       — high-level at-moment status (idle / running-*) + since
+#   * current_trace — fine-grained per-turn events, reset each turn
+#   * history       — rolling window of the last ~50 turn summaries (what
+#                     /api/events serves)
+# Plus immutable per-turn records (turn:<ts>) that survive even when a turn
+# dies mid-run: a record with no `ended`, or `current` stuck in `running-*`, is
+# a provable death. The API is read-only and public like the gateway blog; every
+# payload is own-work summaries only (no secrets/tokens/infra details).
+# The "locking primitive" documented by Modal is put(key, value,
+# skip_if_exists=True) (exactly-once acquisition) — there is no lock() method
+# in the current client. Unique per-turn keys make concurrent turns safe by
+# construction.
+STATUS_DICT_NAME = "sudarshana-status"
+STATUS_HISTORY_LIMIT = 50
+
+
+def _status_dict():
+    """Handle to the shared status Dict (writer + API read the same one)."""
+    return modal.Dict.from_name(STATUS_DICT_NAME, create_if_missing=True)
+
+
+def _status_ts() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _status_guard(fn):
+    """Run a status-write safely: on error, log loudly but never break the turn."""
+
+    def wrapped(*a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception as e:  # noqa: BLE001
+            print(f"[status] write failed (fail-open): {type(e).__name__}: {e}")
+            return None
+
+    return wrapped
+
+
+@_status_guard
+def _status_turn_start(state: str) -> str:
+    """Record that a turn of `state` (running-telegram/hourly/self-task) began.
+
+    Writes a fresh immutable per-turn record (unique key -> safe under
+    concurrent turns) and sets `current` + a fresh `current_trace`. Returns the
+    record key, which the caller must hand back to `_status_turn_end` so each
+    turn closes exactly its own record even when turns overlap. If a turn dies
+    mid-run, `current` stays `running-*` and the record has no `ended` — a
+    provable death.
+    """
+    import uuid
+
+    ts = _status_ts()
+    key = f"turn:{ts}"
+    turn_id = f"{state}-{ts}-{uuid.uuid4().hex[:4]}"
+    d = _status_dict()
+    d.put(
+        key,
+        {
+            "turn_id": turn_id,
+            "state": state,
+            "started": ts,
+            "ended": None,
+            "outcome": "running",
+            "summary": "",
+        },
+        skip_if_exists=True,
+    )
+    d["current"] = {"state": state, "since": ts, "turn_id": turn_id, "_turn_key": key}
+    d["current_trace"] = [{"ts": ts, "event": "turn_started", "detail": state}]
+    return key
+
+
+@_status_guard
+def _status_trace(event: str, detail: str = ""):
+    """Append a fine-grained event to the current turn's trace (bounded)."""
+    d = _status_dict()
+    trace = d.get("current_trace", []) or []
+    trace.append({"ts": _status_ts(), "event": event, "detail": detail})
+    d["current_trace"] = trace[-100:]
+
+
+@_status_guard
+def _status_other_running(d, exclude_key: str):
+    """Most recent turn:* record (excluding exclude_key) with ended=None.
+    ISO-8601 keys sort lexicographically, so the max key is the newest start.
+    Used to keep `current` honest when turns overlap (cron firing while a
+    prior turn still runs): closing one turn must not idle a still-running one."""
+    best = None
+    for k in d.keys() or []:
+        if isinstance(k, str) and k.startswith("turn:") and k != exclude_key:
+            rec = d.get(k, {}) or {}
+            if rec.get("ended") is None:
+                if best is None or k > best[0]:
+                    best = (k, rec)
+    return best
+
+
+@_status_guard
+def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
+    """Close the turn identified by `turn_key`: stamp ended/outcome on its
+    record, prepend a compact summary to the rolling `history` (bounded to
+    50), then — only if this turn still owns `current` — go idle, or hand
+    `current` to another still-running turn if one exists (overlap case)."""
+    d = _status_dict()
+    ts = _status_ts()
+    if not turn_key:
+        return
+    rec = d.get(turn_key, {}) or {}
+    rec["ended"] = ts
+    rec["outcome"] = outcome
+    rec["summary"] = summary
+    d[turn_key] = rec
+    history = d.get("history", []) or []
+    history.insert(
+        0,
+        {
+            "turn_id": rec["turn_id"],
+            "state": rec["state"],
+            "started": rec["started"],
+            "ended": rec["ended"],
+            "outcome": rec["outcome"],
+            "summary": rec["summary"],
+        },
+    )
+    d["history"] = history[:STATUS_HISTORY_LIMIT]
+    current = d.get("current", {}) or {}
+    if current.get("_turn_key") == turn_key:
+        other = _status_other_running(d, turn_key)
+        if other:
+            okey, orec = other
+            d["current"] = {
+                "state": orec["state"],
+                "since": orec["started"],
+                "turn_id": orec["turn_id"],
+                "_turn_key": okey,
+            }
+            # The other turn's trace was clobbered by this turn's start; mark
+            # the handoff honestly rather than fabricating events.
+            d["current_trace"] = [
+                {"ts": _status_ts(), "event": "turn_resumed", "detail": "concurrent turn still running"}
+            ]
+        else:
+            d["current"] = {"state": "idle", "since": ts}
+            d["current_trace"] = []
+
+
 @app.cls(
     image=image,
     secrets=[modal.Secret.from_dotenv()],
@@ -691,10 +843,15 @@ class Sudarshana:
         started = time.monotonic()
         print(f"[timing] process_message started: {text[:200]!r}")
 
+        # status-center: deterministic "turn started" record, BEFORE any model
+        # work, so a turn that dies mid-run leaves a provable trace.
+        _turn_key = _status_turn_start("running-telegram")
+
         # Fresh state every call; continuity comes from the agent's own files.
         self._invoke(text)
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
+        _status_turn_end(_turn_key, "done", "telegram turn finished")
 
         # Commit explicitly — the container may be torn down before the
         # background commit timer catches these writes.
@@ -707,10 +864,13 @@ class Sudarshana:
         started = time.monotonic()
         print("[timing] hourly_checkin started")
 
+        _turn_key = _status_turn_start("running-hourly")
+
         # Edit HOURLY_TASK / the prompt to change this, not code.
         self._invoke(HOURLY_TASK)
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
+        _status_turn_end(_turn_key, "done", "hourly turn finished")
         volume.commit()
 
     @modal.method()
@@ -720,11 +880,70 @@ class Sudarshana:
         started = time.monotonic()
         print("[timing] weekly_freshness_checkin started")
 
+        _turn_key = _status_turn_start("running-hourly")
+
         # Edit WEEKLY_FRESHNESS_TASK / the prompt to change this, not code.
         self._invoke(WEEKLY_FRESHNESS_TASK)
 
         print(f"[timing] weekly_freshness_checkin finished in {time.monotonic() - started:.1f}s")
+        _status_turn_end(_turn_key, "done", "weekly freshness turn finished")
         volume.commit()
+
+
+@app.function(image=image)
+@modal.asgi_app(label="status-api")
+def status_api():
+    """status-center tier 1: read-only /api/status + /api/events.
+
+    A separate web endpoint on the same Modal app, reading the shared
+    sudarshana-status Dict live (mounts NO volume). Public + read-only like the
+    gateway blog: every payload is own-work summaries only, no secrets or
+    infra details. CORS is enabled via explicit middleware so the gateway SPA
+    can fetch cross-origin.
+    """
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+
+    web_app = FastAPI(title="sudarshana-status")
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
+
+    def _snapshot():
+        d = _status_dict()
+        current = d.get("current", {}) or {}
+        history = d.get("history", []) or []
+        last = history[0] if history else None
+        # The API is public: strip the internal _turn_key pointer and anything
+        # that isn't an own-work summary. id/ts are harmless.
+        current = {k: v for k, v in current.items() if not k.startswith("_")}
+        return {
+            "generated_at": _status_ts(),
+            "current": current,
+            "last_turn": last,
+            "history_count": len(history),
+        }
+
+    @web_app.get("/api/status")
+    def api_status():
+        return _snapshot()
+
+    @web_app.get("/api/events")
+    def api_events(limit: int = 50):
+        d = _status_dict()
+        history = d.get("history", []) or []
+        limit = max(1, min(int(limit), STATUS_HISTORY_LIMIT))
+        return {
+            "generated_at": _status_ts(),
+            "events": history[:limit],
+            "current_trace": d.get("current_trace", []) or [],
+        }
+
+    return web_app
 
 
 @app.function(
