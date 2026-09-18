@@ -486,6 +486,11 @@ def _send_telegram(text: str) -> None:
 # construction.
 STATUS_DICT_NAME = "sudarshana-status"
 STATUS_HISTORY_LIMIT = 50
+# Keep per-turn records bounded: anything older than this many turns is pruned
+# at turn-end. The rolling `history` list is the durable summary window; the
+# immutable turn:* dict entries exist primarily to catch mid-turn deaths, so we
+# only need a recent span of them, not every turn since deploy.
+STATUS_RECORDS_KEEP = 100
 
 
 def _status_dict():
@@ -547,15 +552,6 @@ def _status_turn_start(state: str) -> str:
 
 
 @_status_guard
-def _status_trace(event: str, detail: str = ""):
-    """Append a fine-grained event to the current turn's trace (bounded)."""
-    d = _status_dict()
-    trace = d.get("current_trace", []) or []
-    trace.append({"ts": _status_ts(), "event": event, "detail": detail})
-    d["current_trace"] = trace[-100:]
-
-
-@_status_guard
 def _status_other_running(d, exclude_key: str):
     """Most recent turn:* record (excluding exclude_key) with ended=None.
     ISO-8601 keys sort lexicographically, so the max key is the newest start.
@@ -599,6 +595,23 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
         },
     )
     d["history"] = history[:STATUS_HISTORY_LIMIT]
+
+    # Bounded cleanup: keep only the newest STATUS_RECORDS_KEEP closed turn:*
+    # records; prune the rest. Never prune a still-running record (ended=None)
+    # — those are the mid-turn-death evidence we must preserve.
+    closed_keys = sorted(
+        k
+        for k in (d.keys() or [])
+        if isinstance(k, str) and k.startswith("turn:") and k != turn_key
+        and (d.get(k, {}) or {}).get("ended") is not None
+    )
+    if len(closed_keys) > STATUS_RECORDS_KEEP:
+        try:
+            for k in closed_keys[: len(closed_keys) - STATUS_RECORDS_KEEP]:
+                del d[k]
+        except Exception as e:  # noqa: BLE001
+            print(f"[status] prune step failed (non-fatal): {type(e).__name__}: {e}")
+
     current = d.get("current", {}) or {}
     if current.get("_turn_key") == turn_key:
         other = _status_other_running(d, turn_key)
