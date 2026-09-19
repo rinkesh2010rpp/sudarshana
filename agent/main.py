@@ -1033,6 +1033,144 @@ def status_api():
     return web_app
 
 
+# --- P5-inbox: public "put item in inbox" surface ---------------------------------
+# Initiative gateway-engagement, piece P5 (green-lit 22:33 09-18). A stranger can
+# leave an item in my inbox via the public site; nothing they type is ever served
+# publicly until it passes my policy check. Storage (per the 19:29 corrected
+# design): the live store + intake = a named modal.Dict ("sudarshana-inbox");
+# the durable/human-readable mirror = the Volume (/data/INBOX.md visitor section,
+# no expiry). Layers cover each other: the Volume survives a Dict reset, the Dict
+# is the clean live read. Moderation gate (22:26): the status flow is
+# received (PRIVATE, set at submission) -> submitted (PUBLIC, flipped by my
+# next-cycle policy check) -> in_progress -> completed; the public read endpoint
+# serves ONLY {submitted, in_progress, completed} — the filter IS the enforcement.
+# The endpoint mounts the Volume so it can append the durable mirror (the status
+# API mounts none; this one must write).
+INBOX_DICT_NAME = "sudarshana-inbox"
+INBOX_MAX_ITEM_LEN = 2000
+INBOX_MAX_NAME_LEN = 100
+# Only these statuses are served publicly; 'received' items are private until my
+# policy check flips them to 'submitted'.
+INBOX_PUBLIC_STATUSES = {"submitted", "in_progress", "completed"}
+
+
+def _inbox_dict():
+    """Handle to the shared inbox Dict (writer + API read the same one)."""
+    return modal.Dict.from_name(INBOX_DICT_NAME, create_if_missing=True)
+
+
+def _inbox_ts() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@app.function(image=image, volumes={VOLUME_PATH: volume})
+@modal.asgi_app(label="inbox-api")
+def inbox_api():
+    """P5-inbox endpoint: accept a visitor submission + serve the public board.
+
+    A separate web endpoint on the same Modal app. POST /api/inbox receives a
+    stranger's item (required text + optional name), stores it in the inbox Dict
+    as status='received' (PRIVATE — not served publicly), and appends a durable
+    line to the /data/INBOX.md visitor section on the Volume. GET /api/inbox
+    serves the public board from the Dict, filtered to passed items only. CORS
+    is enabled so the gateway SPA can fetch/submit cross-origin.
+    """
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel, Field
+
+    web_app = FastAPI(title="sudarshana-inbox")
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+
+    class InboxSubmission(BaseModel):
+        text: str = Field(..., min_length=1, max_length=INBOX_MAX_ITEM_LEN)
+        name: str = Field(default="", max_length=INBOX_MAX_NAME_LEN)
+
+    def _append_mirror(entry: str):
+        """Durable private mirror on the Volume (no expiry). Fail-open: an
+        append failure must never break the submission — the Dict is the live
+        store and the source the site reads; the mirror is durability/audit."""
+        import os
+
+        try:
+            inbox_path = os.path.join(VOLUME_PATH, "INBOX.md")
+            with open(inbox_path, "a") as f:
+                f.write(entry + "\n")
+            volume.commit()
+        except Exception as e:  # noqa: BLE001
+            print(f"[inbox] mirror append failed (fail-open): {type(e).__name__}: {e}")
+
+    @web_app.post("/api/inbox")
+    def submit(sub: InboxSubmission):
+        import uuid
+
+        text = sub.text.strip()
+        name = sub.name.strip() or "anonymous"
+        if not text:
+            return {"ok": False, "error": "empty-item"}
+        ts = _inbox_ts()
+        key = f"item:{uuid.uuid4().hex[:12]}"
+        record = {
+            "id": key,
+            "text": text,
+            "name": name,
+            "status": "received",  # PRIVATE — only my policy check can flip it public
+            "created_at": ts,
+            "updated_at": ts,
+            "artifact_link": None,
+        }
+        d = _inbox_dict()
+        d.put(key, record, skip_if_exists=True)
+        # Durable private mirror; received items are NOT on the public board.
+        _append_mirror(f"[{ts}] {key} | status=received | name={name} | {text[:120]}")
+        return {
+            "ok": True,
+            "id": key,
+            "status": "received",
+            "message": (
+                "Received — I'll review this on my next run, and if it meets "
+                "policy it'll be added to the queue automatically."
+            ),
+        }
+
+    @web_app.get("/api/inbox")
+    def read(limit: int = 50):
+        d = _inbox_dict()
+        items = []
+        for key, rec in d.items():
+            if not key.startswith("item:"):
+                continue
+            status = rec.get("status")
+            # MODERATION GATE: only serve items that passed my policy check.
+            # The filter IS the enforcement — 'received' items are private.
+            if status not in INBOX_PUBLIC_STATUSES:
+                continue
+            items.append(
+                {
+                    "id": rec.get("id"),
+                    "text": rec.get("text"),
+                    "name": rec.get("name"),
+                    "status": status,
+                    "created_at": rec.get("created_at"),
+                    "updated_at": rec.get("updated_at"),
+                    "artifact_link": rec.get("artifact_link"),
+                }
+            )
+        items.sort(key=lambda i: i.get("created_at") or "", reverse=True)
+        items = items[: max(1, min(int(limit), 100))]
+        return {"generated_at": _inbox_ts(), "items": items, "count": len(items)}
+
+    return web_app
+
+
 @app.function(
     image=image,
     # Blocks on .remote(), so needs at least weekly_freshness_checkin's own timeout.
