@@ -237,6 +237,15 @@ initiative that matters most right now, and read only that initiative's
 action file — not all of them. Do one real, finished thing. Update that
 action file to reflect it.
 
+Visitor inbox (P5). Every cycle, if the injected "Visitor inbox intake"
+note lists any received item, run your policy check on it: each is
+PRIVATE until you act, and only you can make it public. Approve -> call
+inbox_set_status '<id>' submitted (that puts it on the public site
+board); reject -> 'rejected' (never public). Never auto-publish. If the
+board has active items and you have capacity, advance one:
+submitted -> in_progress -> completed (completed may carry an
+artifact_link).
+
 Every turn ends the same way, without exception: append your line to
 today's /data/logs/<date>.md, then stop — even if more remains. This is
 the last thing you do, every time, whether the turn was a scheduled
@@ -350,7 +359,9 @@ HOURLY_TASK = (
     "code — and it's fine to just remind him you need a decision. If nothing "
     "is queued at all, put a short proposal to Rinkesh rather than starting it. "
     "Whatever you did this cycle, end by appending a line to today's "
-    "/data/logs/<date>.md."
+    "/data/logs/<date>.md. If the cycle's injected 'Visitor inbox intake' "
+    "shows received items, run your policy check on them (approve -> "
+    "submitted / reject -> rejected) before other work."
 )
 
 
@@ -800,6 +811,43 @@ class Sudarshana:
 
         search_tools = [search_web]
 
+        # P5-inbox: the model has no shell/file path to the visitor-inbox Dict
+        # (it lives Modal-side, not on /data), so the ONLY ways it can act on
+        # visitor items are these two tools + the per-call intake system note.
+        # The moderation gate is a model judgment: nothing a visitor submits is
+        # ever served publicly (it starts 'received' = private) until the model
+        # explicitly approves it here (received -> submitted). Never auto-publish.
+
+        @tool
+        def inbox_review() -> str:
+            """Review the visitor-inbox queue: list PRIVATE received items
+            awaiting your policy check, plus any already-public board items
+            awaiting work. Nothing you type into the form is public until you
+            approve it. Returns a compact summary (or that the inbox is idle)."""
+            ctx = _inbox_intake_context()
+            return (
+                ctx
+                if ctx
+                else f"Visitor inbox idle: 0 pending, 0 active."
+            )
+
+        @tool
+        def inbox_set_status(item_id: str, status: str, note: str = "", artifact_link: str = "") -> str:
+            """Advance one visitor-inbox item through its lifecycle. The ONLY
+            call that makes an item public (approve received -> submitted) or
+            retracts one from the public board (-> rejected, private terminal;
+            or submitted -> in_progress -> completed to work it). Forward-only,
+            validated transitions only. Use only after your own policy judgment.
+            Returns a short result string."""
+            res = _inbox_set_status(item_id, status, note=note, artifact_link=artifact_link)
+            if res.get("ok"):
+                vis = "PUBLIC (on the site board)" if res.get("public") else "private"
+                return f"ok: {item_id} -> {status} ({vis})"
+            return f"failed: {res.get('error', 'unknown')}"
+
+        inbox_tools = [inbox_review, inbox_set_status]
+        search_tools = [*search_tools, *inbox_tools]
+
         # Default: self-hosted Qwen3-14B-AWQ on Modal. Set USE_OPENROUTER=1
         # to route to OpenRouter instead (OPENROUTER_MODEL / OPENROUTER_API_KEY).
         if os.environ.get("USE_OPENROUTER"):
@@ -876,6 +924,14 @@ class Sudarshana:
                     "role": "system",
                     "content": f"Current time: {_timestamp()}",
                 },
+                # P5-inbox intake (slice 3): surface anything a visitor left in
+                # the inbox Dict on EVERY cycle so nothing waits unseen. Empty
+                # string (inbox idle) adds nothing — no-op cycles cost nothing.
+                # The policy check on received items is a model judgment, never
+                # automatic (22:26 09-18 moderation gate).
+                *([] if not (_icc := _inbox_intake_context()) else [
+                    {"role": "system", "content": f"Visitor inbox intake:\n{_icc}"}
+                ]),
                 {"role": "user", "content": message},
             ]
         }
@@ -1063,6 +1119,128 @@ def _inbox_ts() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _inbox_append_mirror(entry: str):
+    """Durable private audit line on the Volume (no expiry). Fail-open: an
+    append failure must never break a submission or a policy flip — the Dict is
+    the live store; the mirror is durability/audit only."""
+    import os
+
+    try:
+        inbox_path = os.path.join(VOLUME_PATH, "INBOX.md")
+        with open(inbox_path, "a") as f:
+            f.write(entry + "\n")
+        volume.commit()
+    except Exception as e:  # noqa: BLE001
+        print(f"[inbox] mirror append failed (fail-open): {type(e).__name__}: {e}")
+
+
+# Forward-only lifecycle; the public board serves only {submitted,
+# in_progress, completed} (INBOX_PUBLIC_STATUSES) — the filter IS the
+# moderation enforcement. 'rejected' is a PRIVATE terminal state (withdrawn,
+# never served), separate from 'completed' so a rejected item can never
+# surface on the board (this supersedes an earlier draft where spam was
+# marked completed — completed is public, so spam must NOT be completed).
+INBOX_ALLOWED_TRANSITIONS = {
+    "received": {"submitted", "rejected"},
+    "submitted": {"in_progress", "rejected"},
+    "in_progress": {"completed"},
+    # completed / rejected: terminal (no downgrades off the public board).
+}
+
+
+def _inbox_intake() -> dict:
+    """Cycle-start intake view of the visitor inbox (P5 slice 3): the PRIVATE
+    received items (pending the model's policy check) and the ACTIVE
+    submitted/in_progress items (already public, awaiting work). Every cycle
+    calls this so nothing a visitor submits can sit unseen."""
+    d = _inbox_dict()
+    pending, active = [], []
+    for key, rec in d.items():
+        if not (isinstance(key, str) and key.startswith("item:")):
+            continue
+        rec = rec or {}
+        status = rec.get("status")
+        entry = {
+            "id": rec.get("id") or key,
+            "name": rec.get("name") or "anonymous",
+            "text": rec.get("text") or "",
+            "created_at": rec.get("created_at") or "",
+        }
+        if status == "received":
+            pending.append(entry)
+        elif status in ("submitted", "in_progress"):
+            entry["status"] = status
+            active.append(entry)
+    pending.sort(key=lambda i: i.get("created_at") or "")
+    active.sort(key=lambda i: i.get("created_at") or "")
+    return {"pending": pending, "active": active}
+
+
+def _inbox_intake_context() -> str:
+    """Compact text of the intake view for the per-call system note. Empty
+    string when the inbox is fully idle (the common case) so no-op cycles cost
+    nothing."""
+    view = _inbox_intake()
+    lines = []
+    if view["pending"]:
+        lines.append(
+            f"Visitor inbox: {len(view['pending'])} received item(s) awaiting your "
+            "policy check. They are PRIVATE until you act."
+        )
+        for i, it in enumerate(view["pending"], 1):
+            clip = it["text"][:200] + ("…" if len(it["text"]) > 200 else "")
+            lines.append(f"  {i}. [{it['id']}] {it['name']}: {clip} (received {it['created_at']})")
+        lines.append(
+            "Policy check now: approve -> inbox_set_status '<id>' submitted (makes it "
+            "PUBLIC on the site board); otherwise reject -> 'rejected' (never public). "
+            "Never auto-publish."
+        )
+    if view["active"]:
+        lines.append(
+            f"Visitor inbox board: {len(view['active'])} item(s) public and awaiting work."
+        )
+        for i, it in enumerate(view["active"], 1):
+            clip = it["text"][:120] + ("…" if len(it["text"]) > 120 else "")
+            lines.append(f"  {i}. [{it['id']}] ({it['status']}) {it['name']}: {clip}")
+        lines.append("If you have capacity, take one on: submitted -> in_progress -> completed.")
+    return "\n".join(lines)
+
+
+def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_link: str = "") -> dict:
+    """Apply one forward-only status transition to an inbox item. This is the
+    ONLY way an item leaves the private 'received' set or is taken off the
+    public board (submitted -> rejected is a retraction) — call it only after
+    a policy judgment. Returns a result dict {ok, error?, status?, public?};
+    public=True means the item is now served on the public board."""
+    if new_status not in {"received", "submitted", "in_progress", "completed", "rejected"}:
+        return {"ok": False, "error": f"unknown status {new_status!r}"}
+    d = _inbox_dict()
+    rec = d.get(item_id)
+    if not rec:
+        return {"ok": False, "error": f"no such item {item_id!r}"}
+    old = rec.get("status", "received")
+    if new_status == old:
+        return {"ok": False, "error": f"item already {old!r}"}
+    if new_status not in INBOX_ALLOWED_TRANSITIONS.get(old, set()):
+        return {"ok": False, "error": f"invalid transition {old} -> {new_status}"}
+    ts = _inbox_ts()
+    rec["status"] = new_status
+    rec["updated_at"] = ts
+    if artifact_link and new_status == "completed":
+        rec["artifact_link"] = artifact_link
+    d[item_id] = rec
+    extra = f" | note={note[:120]}" if note else ""
+    if artifact_link:
+        extra += f" | artifact={artifact_link}"
+    _inbox_append_mirror(f"[{ts}] {item_id} | status={old}->{new_status}{extra}")
+    return {
+        "ok": True,
+        "id": item_id,
+        "status": new_status,
+        "public": new_status in INBOX_PUBLIC_STATUSES,
+    }
 
 
 @app.function(image=image, volumes={VOLUME_PATH: volume})
