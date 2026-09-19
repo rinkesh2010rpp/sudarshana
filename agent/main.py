@@ -29,6 +29,7 @@ HOURLY_TASK / the prompt, not code.
 """
 
 import os
+import time
 
 import modal
 
@@ -491,6 +492,14 @@ STATUS_HISTORY_LIMIT = 50
 # immutable turn:* dict entries exist primarily to catch mid-turn deaths, so we
 # only need a recent span of them, not every turn since deploy.
 STATUS_RECORDS_KEEP = 100
+# A genuinely live turn is capped by the Modal timeout (1500s, see below).
+# Any ended=None record older than this staleness TTL is therefore not a
+# concurrent turn — it's a zombie: a prior turn that died mid-run without ever
+# calling _status_turn_end. Without this bound, an orphaned record would be
+# seen as "still running" forever, and every later turn's _status_turn_end
+# would hand `current` back to it, silently reverting its own update (the
+# 17:09 09-18 bug). 1800s = 30min, comfortably above the 1500s timeout.
+STATUS_ZOMBIE_TTL_SECONDS = 1800
 
 
 def _status_dict():
@@ -548,20 +557,80 @@ def _status_turn_start(state: str) -> str:
     )
     d["current"] = {"state": state, "since": ts, "turn_id": turn_id, "_turn_key": key}
     d["current_trace"] = [{"ts": ts, "event": "turn_started", "detail": state}]
+    # Reconcile any stale ended=None records (mid-run deaths from turns that
+    # never reached _status_turn_end). Doing this here means a new turn never
+    # inherits a zombie as its running-context, and the death gets recorded as
+    # outcome="zombie" rather than being invisible.
+    _status_reconcile_zombies(d)
     return key
 
 
 @_status_guard
+def _status_parse_ts(iso: str):
+    """Parse an ISO-8601 status timestamp to a UTC epoch float. Returns None on
+    any malformed/absent value so callers can treat it as stale rather than
+    crash."""
+    if not iso:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _status_is_zombie(rec) -> bool:
+    """True if a turn record is dead-but-unclosed: no `ended`, and started so
+    long ago that no live turn (capped by the Modal timeout) could still be
+    running. Such a record is a mid-run death that never got _status_turn_end."""
+    if rec.get("ended") is not None:
+        return False
+    started = _status_parse_ts(rec.get("started"))
+    if started is None:
+        return False  # can't prove staleness; leave it
+    now = time.time()
+    return (now - started) > STATUS_ZOMBIE_TTL_SECONDS
+
+
+@_status_guard
+def _status_reconcile_zombies(d):
+    """Close any ended=None record older than the staleness TTL, stamping it
+    outcome="zombie" so the death is recorded (the turn:* records exist
+    precisely to catch mid-run deaths) and so it is no longer mistaken for a
+    live concurrent turn. Returns a list of (key, rec) for the zombies closed."""
+    closed = []
+    now = _status_ts()
+    for k in d.keys() or []:
+        if not (isinstance(k, str) and k.startswith("turn:")):
+            continue
+        rec = d.get(k, {}) or {}
+        if _status_is_zombie(rec):
+            rec["ended"] = rec.get("ended") or now
+            rec["outcome"] = rec.get("outcome") or "zombie"
+            rec["summary"] = rec.get("summary") or "mid-run death (stale > TTL); closed by reconciliation"
+            d[k] = rec
+            closed.append((k, rec))
+    return closed
+
+
+@_status_guard
 def _status_other_running(d, exclude_key: str):
-    """Most recent turn:* record (excluding exclude_key) with ended=None.
-    ISO-8601 keys sort lexicographically, so the max key is the newest start.
-    Used to keep `current` honest when turns overlap (cron firing while a
-    prior turn still runs): closing one turn must not idle a still-running one."""
+    """Most recent turn:* record (excluding exclude_key) that is genuinely still
+    running: ended=None AND started within the staleness TTL. ISO-8601 keys sort
+    lexicographically, so the max key is the newest start. Used to keep `current`
+    honest when turns overlap (cron firing while a prior turn still runs): closing
+    one turn must not idle a still-running one. Records older than the TTL are
+    zombies and are never treated as running (they may be closed by
+    _status_reconcile_zombies)."""
     best = None
     for k in d.keys() or []:
         if isinstance(k, str) and k.startswith("turn:") and k != exclude_key:
             rec = d.get(k, {}) or {}
-            if rec.get("ended") is None:
+            if rec.get("ended") is None and not _status_is_zombie(rec):
                 if best is None or k > best[0]:
                     best = (k, rec)
     return best
@@ -595,6 +664,11 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
         },
     )
     d["history"] = history[:STATUS_HISTORY_LIMIT]
+
+    # Reconcile zombies before deciding who `current` hands to: a stale
+    # ended=None record must not be mistaken for a live concurrent turn (the
+    # 17:09 09-18 fault loop). Idempotent — no-op if nothing is stale.
+    _status_reconcile_zombies(d)
 
     # Bounded cleanup: keep only the newest STATUS_RECORDS_KEEP closed turn:*
     # records; prune the rest. Never prune a still-running record (ended=None)
