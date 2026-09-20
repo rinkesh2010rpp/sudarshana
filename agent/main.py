@@ -244,11 +244,13 @@ inbox_set_status '<id>' submitted (that puts it on the public site
 board); reject -> 'rejected' (never public). Never auto-publish. If the
 board has active items and you have capacity, advance one:
 submitted -> in_progress -> completed. Completing an item means writing
-the answer ON the item: pass answer=<the full detailed response> to
-inbox_set_status at the completed transition. The answer lives with the
-task and is shown on the inbox page's detail view; a blog post is a
-separate, optional daily-narrative artifact, never the carrier of the
-answer. artifact_link stays available for an external artifact only.
+the full answer as its own long-form content — paragraphs, like a blog
+post, but NOT a blog: it is a TASK ANSWER, kept apart from the blog
+collection and served on the item's detail view. Pass
+answer=<the full detailed response> to inbox_set_status at the
+completed transition; the item row carries only a link to it
+(artifact_link points to the answer). A blog post remains a separate,
+optional daily-narrative artifact, never the carrier of the answer.
 
 Every turn ends the same way, without exception: append your line to
 today's /data/logs/<date>.md, then stop — even if more remains. This is
@@ -843,10 +845,13 @@ class Sudarshana:
             retracts one from the public board (-> rejected, private terminal;
             or submitted -> in_progress -> completed to work it). Forward-only,
             validated transitions only. Use only after your own policy judgment.
-            When COMPLETING an item (-> completed) write the full answer ON the
-            item via answer=<the detailed response> — it is served with the item
-            on the public board's detail view. artifact_link is optional and only
-            for an external artifact. note is the private audit trail only.
+            When COMPLETING an item (-> completed) write the full answer as its
+            OWN long-form content entity via answer=<the detailed response>:
+            paragraphs like a blog post but NOT a blog — the item row carries
+            only the link to it (artifact_link -> answer id) and the public
+            board's detail view serves the full text. artifact_link is optional
+            and only for an external artifact. note is the private audit trail
+            only.
             Returns a short result string."""
             res = _inbox_set_status(item_id, status, note=note, artifact_link=artifact_link, answer=answer)
             if res.get("ok"):
@@ -1150,9 +1155,20 @@ class _InboxDB:
         status        TEXT NOT NULL DEFAULT 'received',
         created_at    TEXT NOT NULL,
         updated_at    TEXT NOT NULL,
-        artifact_link TEXT,
-        answer        TEXT
+        artifact_link TEXT
     );
+    -- Task answers: long-form content entities of their own, paragraphs like a
+    -- blog post but NOT blogs — kept apart from the blog collection and served
+    -- on the item's detail view. The item row links here (answer_id), it does
+    -- not carry the text.
+    CREATE TABLE IF NOT EXISTS inbox_answers (
+        id         TEXT PRIMARY KEY,
+        item_id    TEXT NOT NULL,
+        body       TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbox_answers_item ON inbox_answers(item_id);
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox_items(status);
     CREATE TABLE IF NOT EXISTS inbox_events (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1170,16 +1186,6 @@ class _InboxDB:
         conn = self._connect()
         try:
             conn.executescript(self.SCHEMA)
-            # Live-store migration (2026-09-20): an existing /data/visitor-inbox.db
-            # was created before the `answer` column existed, and CREATE TABLE IF
-            # NOT EXISTS won't add it. Add it when missing so completed items can
-            # carry their answer.
-            cols = {
-                r[1]
-                for r in conn.execute("PRAGMA table_info(inbox_items)").fetchall()
-            }
-            if "answer" not in cols:
-                conn.execute("ALTER TABLE inbox_items ADD COLUMN answer TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -1230,12 +1236,12 @@ class _InboxDB:
         finally:
             conn.close()
 
-    def set_status(self, item_id: str, new_status: str, artifact_link: str = "", answer: str = "") -> dict | None:
+    def set_status(self, item_id: str, new_status: str, artifact_link: str = "") -> dict | None:
         """Transition one item; returns the updated row (with the pre-update
         status in `old_status`), or None if no such item. Raises ValueError on
         a forward-only violation. Persists artifact_link only when the status is
-        'completed' (it is a public board artifact); persists `answer` whenever
-        provided (a completed item's full answer, served with the item)."""
+        'completed' (it is a public board artifact to the external result, or
+        the task answer's own id, which has a long-form body in inbox_answers)."""
         conn = self._connect()
         try:
             row = conn.execute(
@@ -1249,14 +1255,14 @@ class _InboxDB:
             ts = _inbox_ts()
             if artifact_link and new_status == "completed":
                 conn.execute(
-                    "UPDATE inbox_items SET status = ?, updated_at = ?, artifact_link = ?, answer = ?"
+                    "UPDATE inbox_items SET status = ?, updated_at = ?, artifact_link = ?"
                     " WHERE id = ?",
-                    (new_status, ts, artifact_link, answer, item_id),
+                    (new_status, ts, artifact_link, item_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE inbox_items SET status = ?, updated_at = ?, answer = ? WHERE id = ?",
-                    (new_status, ts, answer, item_id),
+                    "UPDATE inbox_items SET status = ?, updated_at = ? WHERE id = ?",
+                    (new_status, ts, item_id),
                 )
             conn.commit()
             row = conn.execute(
@@ -1265,6 +1271,51 @@ class _InboxDB:
             updated = dict(row)
             updated["old_status"] = old
             return updated
+        finally:
+            conn.close()
+
+    def put_answer(self, item_id: str, body: str) -> dict:
+        """Create (or replace) the long-form answer content entity for an item.
+        The item row carries only its id via artifact_link — the body lives
+        here, served with the item on the detail view. Returns the answer row.
+        NOTE: the caller (set_status path) commits the Volume after both the
+        answer write and the item transition — see _inbox_set_status."""
+        conn = self._connect()
+        try:
+            import uuid
+
+            existing = conn.execute(
+                "SELECT id FROM inbox_answers WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            ts = _inbox_ts()
+            answer_id = existing["id"] if existing else f"answer:{uuid.uuid4().hex[:12]}"
+            if existing:
+                conn.execute(
+                    "UPDATE inbox_answers SET body = ?, updated_at = ? WHERE id = ?",
+                    (body, ts, answer_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO inbox_answers (id, item_id, body, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (answer_id, item_id, body, ts, ts),
+                )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM inbox_answers WHERE id = ?", (answer_id,)
+            ).fetchone()
+            return dict(row)
+        finally:
+            conn.close()
+
+    def get_answer(self, item_id: str) -> dict | None:
+        """The answer content entity for an item, or None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM inbox_answers WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 
@@ -1360,14 +1411,20 @@ def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_li
     ONLY way an item leaves the private 'received' set or is taken off the
     public board (submitted -> rejected is a retraction) — call it only after
     a policy judgment. `answer` is the full completed-item response, written
-    ON the item (served with it on the public board). Returns a result dict
-    {ok, error?, status?, public?}; public=True means the item is now served
-    on the public board."""
+    as its OWN long-form content entity (inbox_answers): paragraphs like a
+    blog post but NOT a blog — the item row carries only the link to it, and
+    the detail view serves both. Returns a result dict {ok, error?, status?,
+    public?}; public=True means the item is now served on the public board."""
     if new_status not in {"received", "submitted", "in_progress", "completed", "rejected"}:
         return {"ok": False, "error": f"unknown status {new_status!r}"}
     db = _InboxDB()
     try:
-        row = db.set_status(item_id, new_status, artifact_link=artifact_link, answer=answer)
+        if new_status == "completed" and answer:
+            ans = db.put_answer(item_id, answer)
+            artifact_link = ans["id"]
+            row = db.set_status(item_id, new_status, artifact_link=artifact_link)
+        else:
+            row = db.set_status(item_id, new_status, artifact_link=artifact_link)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     if not row:
@@ -1383,9 +1440,11 @@ def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_li
     # (2026-09-19 21:05 finding): this process's local SQLite bytes are not in
     # the shared Volume snapshot until commit() is called; without it a status
     # transition is acknowledged to the model but invisible to every other
-    # reader (public GET, next-cycle intake). First proven lost this way
-    # 2026-09-20 08:02: item b3f94e1a655f stayed 'in_progress' on the live
-    # board while the tool's local view had 'completed'.
+    # reader (public GET, next-cycle intake). This commit covers BOTH the
+    # answer write (put_answer, when completing) and the item status transition.
+    # First proven lost this way 2026-09-20 08:02: item b3f94e1a655f stayed
+    # 'in_progress' on the live board while the tool's local view had
+    # 'completed'.
     volume.commit()
     return {
         "ok": True,
@@ -1475,19 +1534,29 @@ def inbox_api():
         rows = db.fetch(INBOX_PUBLIC_STATUSES)
         rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
         rows = rows[: max(1, min(int(limit), 100))]
-        items = [
-            {
-                "id": r["id"],
-                "text": r["text"],
-                "name": r["name"],
-                "status": r["status"],
-                "created_at": r["created_at"],
-                "updated_at": r["updated_at"],
-                "artifact_link": r["artifact_link"],
-                "answer": r["answer"],
-            }
-            for r in rows
-        ]
+        items = []
+        for r in rows:
+            ans = db.get_answer(r["id"]) if r["status"] == "completed" else None
+            items.append(
+                {
+                    "id": r["id"],
+                    "text": r["text"],
+                    "name": r["name"],
+                    "status": r["status"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "artifact_link": r["artifact_link"],
+                    "answer": (
+                        {
+                            "id": ans["id"],
+                            "body": ans["body"],
+                            "created_at": ans["created_at"],
+                        }
+                        if ans
+                        else None
+                    ),
+                }
+            )
         return {"generated_at": _inbox_ts(), "items": items, "count": len(items)}
 
     return web_app
