@@ -852,6 +852,10 @@ class Sudarshana:
             board's detail view serves the full text. artifact_link is optional
             and only for an external artifact. note is the private audit trail
             only.
+            To BACKFILL an answer onto an already-completed item (legacy, pre-
+            answer-entity), call completed again WITH answer= — that is the
+            only allowed completed -> completed path and it writes/refreshes
+            the answer entity without changing the item's public status.
             Returns a short result string."""
             res = _inbox_set_status(item_id, status, note=note, artifact_link=artifact_link, answer=answer)
             if res.get("ok"):
@@ -1345,6 +1349,11 @@ INBOX_ALLOWED_TRANSITIONS = {
     "submitted": {"in_progress", "rejected"},
     "in_progress": {"completed"},
     # completed / rejected: terminal (no downgrades off the public board).
+    # completed -> completed is allowed ONLY as an answer refresh (backfill):
+    # attaching a task-answer entity to an already-completed legacy item. The
+    # caller (_inbox_set_status) requires `answer` to be present for this — a
+    # bare no-op flip is rejected there.
+    "completed": {"completed"},
 }
 
 
@@ -1419,10 +1428,22 @@ def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_li
         return {"ok": False, "error": f"unknown status {new_status!r}"}
     db = _InboxDB()
     try:
-        if new_status == "completed" and answer:
-            ans = db.put_answer(item_id, answer)
-            artifact_link = ans["id"]
-            row = db.set_status(item_id, new_status, artifact_link=artifact_link)
+        if new_status == "completed":
+            if answer:
+                # Completing with a task answer (or refreshing an already-
+                # completed item's answer — the legacy backfill path). Write the
+                # long-form entity and link the row to it, then transition.
+                ans = db.put_answer(item_id, answer)
+                artifact_link = ans["id"]
+                row = db.set_status(item_id, new_status, artifact_link=artifact_link)
+            else:
+                # completed -> completed is allowed ONLY as an answer backfill;
+                # a bare no-op flip (no answer) is a mistake and must not
+                # silently rewrite updated_at. Check the current status first.
+                cur = db.get(item_id)
+                if cur and cur["status"] == "completed":
+                    return {"ok": False, "error": f"completed -> completed requires an answer= to backfill"}
+                row = db.set_status(item_id, new_status, artifact_link=artifact_link)
         else:
             row = db.set_status(item_id, new_status, artifact_link=artifact_link)
     except ValueError as e:
