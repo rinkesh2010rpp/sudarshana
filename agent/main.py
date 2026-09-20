@@ -243,8 +243,12 @@ PRIVATE until you act, and only you can make it public. Approve -> call
 inbox_set_status '<id>' submitted (that puts it on the public site
 board); reject -> 'rejected' (never public). Never auto-publish. If the
 board has active items and you have capacity, advance one:
-submitted -> in_progress -> completed (completed may carry an
-artifact_link).
+submitted -> in_progress -> completed. Completing an item means writing
+the answer ON the item: pass answer=<the full detailed response> to
+inbox_set_status at the completed transition. The answer lives with the
+task and is shown on the inbox page's detail view; a blog post is a
+separate, optional daily-narrative artifact, never the carrier of the
+answer. artifact_link stays available for an external artifact only.
 
 Every turn ends the same way, without exception: append your line to
 today's /data/logs/<date>.md, then stop — even if more remains. This is
@@ -833,14 +837,18 @@ class Sudarshana:
             )
 
         @tool
-        def inbox_set_status(item_id: str, status: str, note: str = "", artifact_link: str = "") -> str:
+        def inbox_set_status(item_id: str, status: str, note: str = "", artifact_link: str = "", answer: str = "") -> str:
             """Advance one visitor-inbox item through its lifecycle. The ONLY
             call that makes an item public (approve received -> submitted) or
             retracts one from the public board (-> rejected, private terminal;
             or submitted -> in_progress -> completed to work it). Forward-only,
             validated transitions only. Use only after your own policy judgment.
+            When COMPLETING an item (-> completed) write the full answer ON the
+            item via answer=<the detailed response> — it is served with the item
+            on the public board's detail view. artifact_link is optional and only
+            for an external artifact. note is the private audit trail only.
             Returns a short result string."""
-            res = _inbox_set_status(item_id, status, note=note, artifact_link=artifact_link)
+            res = _inbox_set_status(item_id, status, note=note, artifact_link=artifact_link, answer=answer)
             if res.get("ok"):
                 vis = "PUBLIC (on the site board)" if res.get("public") else "private"
                 return f"ok: {item_id} -> {status} ({vis})"
@@ -1142,7 +1150,8 @@ class _InboxDB:
         status        TEXT NOT NULL DEFAULT 'received',
         created_at    TEXT NOT NULL,
         updated_at    TEXT NOT NULL,
-        artifact_link TEXT
+        artifact_link TEXT,
+        answer        TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox_items(status);
     CREATE TABLE IF NOT EXISTS inbox_events (
@@ -1161,6 +1170,16 @@ class _InboxDB:
         conn = self._connect()
         try:
             conn.executescript(self.SCHEMA)
+            # Live-store migration (2026-09-20): an existing /data/visitor-inbox.db
+            # was created before the `answer` column existed, and CREATE TABLE IF
+            # NOT EXISTS won't add it. Add it when missing so completed items can
+            # carry their answer.
+            cols = {
+                r[1]
+                for r in conn.execute("PRAGMA table_info(inbox_items)").fetchall()
+            }
+            if "answer" not in cols:
+                conn.execute("ALTER TABLE inbox_items ADD COLUMN answer TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -1211,11 +1230,12 @@ class _InboxDB:
         finally:
             conn.close()
 
-    def set_status(self, item_id: str, new_status: str, artifact_link: str = "") -> dict | None:
+    def set_status(self, item_id: str, new_status: str, artifact_link: str = "", answer: str = "") -> dict | None:
         """Transition one item; returns the updated row (with the pre-update
         status in `old_status`), or None if no such item. Raises ValueError on
-        a forward-only violation. Only sets artifact_link when the status is
-        'completed' (it is a public board artifact)."""
+        a forward-only violation. Persists artifact_link only when the status is
+        'completed' (it is a public board artifact); persists `answer` whenever
+        provided (a completed item's full answer, served with the item)."""
         conn = self._connect()
         try:
             row = conn.execute(
@@ -1229,14 +1249,14 @@ class _InboxDB:
             ts = _inbox_ts()
             if artifact_link and new_status == "completed":
                 conn.execute(
-                    "UPDATE inbox_items SET status = ?, updated_at = ?, artifact_link = ?"
+                    "UPDATE inbox_items SET status = ?, updated_at = ?, artifact_link = ?, answer = ?"
                     " WHERE id = ?",
-                    (new_status, ts, artifact_link, item_id),
+                    (new_status, ts, artifact_link, answer, item_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE inbox_items SET status = ?, updated_at = ? WHERE id = ?",
-                    (new_status, ts, item_id),
+                    "UPDATE inbox_items SET status = ?, updated_at = ?, answer = ? WHERE id = ?",
+                    (new_status, ts, answer, item_id),
                 )
             conn.commit()
             row = conn.execute(
@@ -1335,17 +1355,19 @@ def _inbox_intake_context() -> str:
     return "\n".join(lines)
 
 
-def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_link: str = "") -> dict:
+def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_link: str = "", answer: str = "") -> dict:
     """Apply one forward-only status transition to an inbox item. This is the
     ONLY way an item leaves the private 'received' set or is taken off the
     public board (submitted -> rejected is a retraction) — call it only after
-    a policy judgment. Returns a result dict {ok, error?, status?, public?};
-    public=True means the item is now served on the public board."""
+    a policy judgment. `answer` is the full completed-item response, written
+    ON the item (served with it on the public board). Returns a result dict
+    {ok, error?, status?, public?}; public=True means the item is now served
+    on the public board."""
     if new_status not in {"received", "submitted", "in_progress", "completed", "rejected"}:
         return {"ok": False, "error": f"unknown status {new_status!r}"}
     db = _InboxDB()
     try:
-        row = db.set_status(item_id, new_status, artifact_link=artifact_link)
+        row = db.set_status(item_id, new_status, artifact_link=artifact_link, answer=answer)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     if not row:
@@ -1462,6 +1484,7 @@ def inbox_api():
                 "created_at": r["created_at"],
                 "updated_at": r["updated_at"],
                 "artifact_link": r["artifact_link"],
+                "answer": r["answer"],
             }
             for r in rows
         ]
