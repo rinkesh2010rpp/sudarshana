@@ -1125,8 +1125,14 @@ class _InboxDB:
     (/data/visitor-inbox.db) so it is durable with no expiry — unlike the
     7-day-inactivity Dict it replaces (19:27 design correction). One file,
     one true record per item, nothing to mirror or keep in sync. Each call
-    reconnects so the latest data is always read; the Volume auto-flushes
-    mounted writes when the task ends (no manual commit needed)."""
+    reconnects so the latest data is always read.
+
+    Durability note (post-merge finding 2026-09-19 21:05 PDT): relying on the Volume's
+    task-end auto-flush is WRONG for web endpoints — the POST's local SQLite
+    bytes never reach the Volume snapshot before the task is torn down, so the
+    write is invisible to every other reader (runtime store, moderation tools,
+    public GET). The endpoint must call volume.commit() explicitly after
+    mutating writes, exactly like the runtime's own durable writers do."""
 
     SCHEMA = """
     CREATE TABLE IF NOT EXISTS inbox_items (
@@ -1417,6 +1423,12 @@ def inbox_api():
             note=f"name={name}",
             artifact_link="",
         )
+        # Explicit Volume commit — post-merge finding (2026-09-19 21:05 PDT): the Volume's
+        # auto-flush at task end does NOT carry this container's local SQLite
+        # bytes to the shared snapshot before teardown; without this the item is
+        # acknowledged but lost (~the POST-style teardown write-loss bug). The
+        # runtime's own durable writers commit() explicitly for the same reason.
+        volume.commit()
         return {
             "ok": True,
             "id": item_id,
