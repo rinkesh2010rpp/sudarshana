@@ -237,6 +237,15 @@ initiative that matters most right now, and read only that initiative's
 action file — not all of them. Do one real, finished thing. Update that
 action file to reflect it.
 
+Visitor inbox (P5). Every cycle, if the injected "Visitor inbox intake"
+note lists any received item, run your policy check on it: each is
+PRIVATE until you act, and only you can make it public. Approve -> call
+inbox_set_status '<id>' submitted (that puts it on the public site
+board); reject -> 'rejected' (never public). Never auto-publish. If the
+board has active items and you have capacity, advance one:
+submitted -> in_progress -> completed (completed may carry an
+artifact_link).
+
 Every turn ends the same way, without exception: append your line to
 today's /data/logs/<date>.md, then stop — even if more remains. This is
 the last thing you do, every time, whether the turn was a scheduled
@@ -350,7 +359,9 @@ HOURLY_TASK = (
     "code — and it's fine to just remind him you need a decision. If nothing "
     "is queued at all, put a short proposal to Rinkesh rather than starting it. "
     "Whatever you did this cycle, end by appending a line to today's "
-    "/data/logs/<date>.md."
+    "/data/logs/<date>.md. If the cycle's injected 'Visitor inbox intake' "
+    "shows received items, run your policy check on them (approve -> "
+    "submitted / reject -> rejected) before other work."
 )
 
 
@@ -800,6 +811,44 @@ class Sudarshana:
 
         search_tools = [search_web]
 
+        # P5-inbox: the visitor-inbox store (/data/visitor-inbox.db) is a
+        # structured SQLite file the model must NOT hand-edit — the ONLY ways
+        # it can act on visitor items are these two tools + the per-call
+        # intake system note.
+        # The moderation gate is a model judgment: nothing a visitor submits is
+        # ever served publicly (it starts 'received' = private) until the model
+        # explicitly approves it here (received -> submitted). Never auto-publish.
+
+        @tool
+        def inbox_review() -> str:
+            """Review the visitor-inbox queue: list PRIVATE received items
+            awaiting your policy check, plus any already-public board items
+            awaiting work. Nothing you type into the form is public until you
+            approve it. Returns a compact summary (or that the inbox is idle)."""
+            ctx = _inbox_intake_context()
+            return (
+                ctx
+                if ctx
+                else f"Visitor inbox idle: 0 pending, 0 active."
+            )
+
+        @tool
+        def inbox_set_status(item_id: str, status: str, note: str = "", artifact_link: str = "") -> str:
+            """Advance one visitor-inbox item through its lifecycle. The ONLY
+            call that makes an item public (approve received -> submitted) or
+            retracts one from the public board (-> rejected, private terminal;
+            or submitted -> in_progress -> completed to work it). Forward-only,
+            validated transitions only. Use only after your own policy judgment.
+            Returns a short result string."""
+            res = _inbox_set_status(item_id, status, note=note, artifact_link=artifact_link)
+            if res.get("ok"):
+                vis = "PUBLIC (on the site board)" if res.get("public") else "private"
+                return f"ok: {item_id} -> {status} ({vis})"
+            return f"failed: {res.get('error', 'unknown')}"
+
+        inbox_tools = [inbox_review, inbox_set_status]
+        search_tools = [*search_tools, *inbox_tools]
+
         # Default: self-hosted Qwen3-14B-AWQ on Modal. Set USE_OPENROUTER=1
         # to route to OpenRouter instead (OPENROUTER_MODEL / OPENROUTER_API_KEY).
         if os.environ.get("USE_OPENROUTER"):
@@ -876,6 +925,14 @@ class Sudarshana:
                     "role": "system",
                     "content": f"Current time: {_timestamp()}",
                 },
+                # P5-inbox intake (slice 3): surface anything a visitor left in
+                # the inbox store on EVERY cycle so nothing waits unseen. Empty
+                # string (inbox idle) adds nothing — no-op cycles cost nothing.
+                # The policy check on received items is a model judgment, never
+                # automatic (22:26 09-18 moderation gate).
+                *([] if not (_icc := _inbox_intake_context()) else [
+                    {"role": "system", "content": f"Visitor inbox intake:\n{_icc}"}
+                ]),
                 {"role": "user", "content": message},
             ]
         }
@@ -1029,6 +1086,366 @@ def status_api():
             "events": history[:limit],
             "current_trace": d.get("current_trace", []) or [],
         }
+
+    return web_app
+
+
+# --- P5-inbox: public "put item in inbox" surface ---------------------------------
+# Initiative gateway-engagement, piece P5 (green-lit 22:33 09-18). A stranger can
+# leave an item in my inbox via the public site; nothing they type is ever served
+# publicly until it passes my policy check. Storage (19:27 challenge ACCEPTED
+# 19:40): ONE store — a small SQLite database on the Volume
+# (/data/visitor-inbox.db), durable with NO expiry. Supersedes the 19:29
+# Dict + INBOX.md-mirror design: the Dict's 7-day inactivity expiry shouldn't
+# hold a public inbox's durable record, the file mirror was a second source of
+# truth with its own parsing/garble failure class (e.g. 12:00 09-18), and it
+# appended into /data/INBOX.md — Rinkesh's own direct-request inbox. A single
+# db file has one true record per item and one writer lane (the API insert; my
+# transitions) — exactly SQLite's strength. Moderation gate (22:26): the status
+# flow is received (PRIVATE, at submission) -> submitted (PUBLIC, flipped by my
+# next-cycle policy check) -> in_progress -> completed; the public read endpoint
+# serves ONLY {submitted, in_progress, completed} — the filter IS the
+# enforcement. 'rejected' is a PRIVATE terminal state.
+INBOX_DB_PATH = os.path.join(VOLUME_PATH, "visitor-inbox.db")
+INBOX_MAX_ITEM_LEN = 2000
+INBOX_MAX_NAME_LEN = 100
+# Only these statuses are served publicly; 'received' items are private until my
+# policy check flips them to 'submitted'.
+INBOX_PUBLIC_STATUSES = {"submitted", "in_progress", "completed"}
+
+
+def _inbox_ts() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class _InboxDB:
+    """Small SQLite store for the visitor inbox, living on the Volume
+    (/data/visitor-inbox.db) so it is durable with no expiry — unlike the
+    7-day-inactivity Dict it replaces (19:27 design correction). One file,
+    one true record per item, nothing to mirror or keep in sync. Each call
+    reconnects so the latest data is always read; the Volume auto-flushes
+    mounted writes when the task ends (no manual commit needed)."""
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS inbox_items (
+        id            TEXT PRIMARY KEY,
+        name          TEXT NOT NULL,
+        text          TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'received',
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        artifact_link TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox_items(status);
+    CREATE TABLE IF NOT EXISTS inbox_events (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id      TEXT NOT NULL,
+        from_status  TEXT NOT NULL,
+        to_status    TEXT NOT NULL,
+        note         TEXT,
+        artifact_link TEXT,
+        ts           TEXT NOT NULL
+    );
+    """
+
+    def __init__(self, path: str = INBOX_DB_PATH):
+        self.path = path
+        conn = self._connect()
+        try:
+            conn.executescript(self.SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _connect(self):
+        import sqlite3
+
+        conn = sqlite3.connect(self.path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        # Rollback journal (not WAL): WAL's -shm/-wal sidecar files can break on
+        # a network volume; DELETE journal + one writer lane is the safe shape.
+        conn.execute("PRAGMA journal_mode=DELETE")
+        return conn
+
+    def insert(self, rec: dict):
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO inbox_items (id, name, text, status, created_at, updated_at, artifact_link)"
+                " VALUES (:id, :name, :text, :status, :created_at, :updated_at, :artifact_link)",
+                rec,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get(self, item_id: str) -> dict | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM inbox_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def fetch(self, statuses) -> list:
+        """All items with status in the given set, oldest first."""
+        conn = self._connect()
+        try:
+            placeholders = ",".join("?" * len(statuses))
+            rows = conn.execute(
+                f"SELECT * FROM inbox_items WHERE status IN ({placeholders})"
+                " ORDER BY created_at",
+                tuple(statuses),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def set_status(self, item_id: str, new_status: str, artifact_link: str = "") -> dict | None:
+        """Transition one item; returns the updated row (with the pre-update
+        status in `old_status`), or None if no such item. Raises ValueError on
+        a forward-only violation. Only sets artifact_link when the status is
+        'completed' (it is a public board artifact)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM inbox_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if not row:
+                return None
+            old = row["status"]
+            if new_status not in INBOX_ALLOWED_TRANSITIONS.get(old, set()):
+                raise ValueError(f"invalid transition {old} -> {new_status}")
+            ts = _inbox_ts()
+            if artifact_link and new_status == "completed":
+                conn.execute(
+                    "UPDATE inbox_items SET status = ?, updated_at = ?, artifact_link = ?"
+                    " WHERE id = ?",
+                    (new_status, ts, artifact_link, item_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE inbox_items SET status = ?, updated_at = ? WHERE id = ?",
+                    (new_status, ts, item_id),
+                )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM inbox_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            updated = dict(row)
+            updated["old_status"] = old
+            return updated
+        finally:
+            conn.close()
+
+    def log_event(self, item_id: str, from_status: str, to_status: str, note: str = "", artifact_link: str = ""):
+        """Private audit trail of submissions + policy transitions (also where a
+        model note goes now — the old mirror's job, inside the same store)."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO inbox_events (item_id, from_status, to_status, note, artifact_link, ts)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (item_id, from_status, to_status, note, artifact_link or None, _inbox_ts()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# Forward-only lifecycle; the public board serves only {submitted,
+# in_progress, completed} (INBOX_PUBLIC_STATUSES) — the filter IS the
+# moderation enforcement. 'rejected' is a PRIVATE terminal state (withdrawn,
+# never served), separate from 'completed' so a rejected item can never
+# surface on the board (this supersedes an earlier draft where spam was
+# marked completed — completed is public, so spam must NOT be completed).
+INBOX_ALLOWED_TRANSITIONS = {
+    "received": {"submitted", "rejected"},
+    "submitted": {"in_progress", "rejected"},
+    "in_progress": {"completed"},
+    # completed / rejected: terminal (no downgrades off the public board).
+}
+
+
+def _inbox_intake() -> dict:
+    """Cycle-start intake view of the visitor inbox (P5 slice 3): the PRIVATE
+    received items (pending the model's policy check) and the ACTIVE
+    submitted/in_progress items (already public, awaiting work). Every cycle
+    calls this so nothing a visitor submits can sit unseen."""
+    db = _InboxDB()
+    pending = [
+        {
+            "id": r["id"],
+            "name": r["name"] or "anonymous",
+            "text": r["text"] or "",
+            "created_at": r["created_at"] or "",
+        }
+        for r in db.fetch(["received"])
+    ]
+    active = [
+        {
+            "id": r["id"],
+            "name": r["name"] or "anonymous",
+            "text": r["text"] or "",
+            "status": r["status"],
+            "created_at": r["created_at"] or "",
+        }
+        for r in db.fetch(["submitted", "in_progress"])
+    ]
+    return {"pending": pending, "active": active}
+
+
+def _inbox_intake_context() -> str:
+    """Compact text of the intake view for the per-call system note. Empty
+    string when the inbox is fully idle (the common case) so no-op cycles cost
+    nothing."""
+    view = _inbox_intake()
+    lines = []
+    if view["pending"]:
+        lines.append(
+            f"Visitor inbox: {len(view['pending'])} received item(s) awaiting your "
+            "policy check. They are PRIVATE until you act."
+        )
+        for i, it in enumerate(view["pending"], 1):
+            clip = it["text"][:200] + ("…" if len(it["text"]) > 200 else "")
+            lines.append(f"  {i}. [{it['id']}] {it['name']}: {clip} (received {it['created_at']})")
+        lines.append(
+            "Policy check now: approve -> inbox_set_status '<id>' submitted (makes it "
+            "PUBLIC on the site board); otherwise reject -> 'rejected' (never public). "
+            "Never auto-publish."
+        )
+    if view["active"]:
+        lines.append(
+            f"Visitor inbox board: {len(view['active'])} item(s) public and awaiting work."
+        )
+        for i, it in enumerate(view["active"], 1):
+            clip = it["text"][:120] + ("…" if len(it["text"]) > 120 else "")
+            lines.append(f"  {i}. [{it['id']}] ({it['status']}) {it['name']}: {clip}")
+        lines.append("If you have capacity, take one on: submitted -> in_progress -> completed.")
+    return "\n".join(lines)
+
+
+def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_link: str = "") -> dict:
+    """Apply one forward-only status transition to an inbox item. This is the
+    ONLY way an item leaves the private 'received' set or is taken off the
+    public board (submitted -> rejected is a retraction) — call it only after
+    a policy judgment. Returns a result dict {ok, error?, status?, public?};
+    public=True means the item is now served on the public board."""
+    if new_status not in {"received", "submitted", "in_progress", "completed", "rejected"}:
+        return {"ok": False, "error": f"unknown status {new_status!r}"}
+    db = _InboxDB()
+    try:
+        row = db.set_status(item_id, new_status, artifact_link=artifact_link)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not row:
+        return {"ok": False, "error": f"no such item {item_id!r}"}
+    db.log_event(
+        item_id,
+        from_status=row["old_status"],
+        to_status=new_status,
+        note=note,
+        artifact_link=artifact_link if new_status == "completed" else "",
+    )
+    return {
+        "ok": True,
+        "id": item_id,
+        "status": new_status,
+        "public": new_status in INBOX_PUBLIC_STATUSES,
+    }
+
+
+@app.function(image=image, volumes={VOLUME_PATH: volume})
+@modal.asgi_app(label="inbox-api")
+def inbox_api():
+    """P5-inbox endpoint: accept a visitor submission + serve the public board.
+
+    A separate web endpoint on the same Modal app. POST /api/inbox receives a
+    stranger's item (required text + optional name) and stores it status=
+    'received' (PRIVATE) in the /data/visitor-inbox.db SQLite store — the same
+    store my runtime reads — so nothing the visitor types is ever served
+    publicly until my policy check flips it. GET /api/inbox serves the public
+    board filtered to passed items only. A single store on the Volume: durable
+    with no expiry, no Dict, no INBOX.md mirror (19:27 design correction).
+    CORS is enabled so the gateway SPA can fetch/submit cross-origin.
+    """
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel, Field
+    import uuid as _uuid
+
+    web_app = FastAPI(title="sudarshana-inbox")
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+
+    class InboxSubmission(BaseModel):
+        text: str = Field(..., min_length=1, max_length=INBOX_MAX_ITEM_LEN)
+        name: str = Field(default="", max_length=INBOX_MAX_NAME_LEN)
+
+    @web_app.post("/api/inbox")
+    def submit(sub: InboxSubmission):
+        text = sub.text.strip()
+        name = sub.name.strip() or "anonymous"
+        if not text:
+            return {"ok": False, "error": "empty-item"}
+        db = _InboxDB()
+        ts = _inbox_ts()
+        item_id = f"item:{_uuid.uuid4().hex[:12]}"
+        rec = {
+            "id": item_id,
+            "name": name,
+            "text": text,
+            "status": "received",  # PRIVATE — only my policy check can flip it public
+            "created_at": ts,
+            "updated_at": ts,
+            "artifact_link": None,
+        }
+        db.insert(rec)
+        db.log_event(
+            item_id,
+            from_status="-",
+            to_status="received",
+            note=f"name={name}",
+            artifact_link="",
+        )
+        return {
+            "ok": True,
+            "id": item_id,
+            "status": "received",
+            "message": (
+                "Received — I'll review this on my next run, and if it meets "
+                "policy it'll be added to the queue automatically."
+            ),
+        }
+
+    @web_app.get("/api/inbox")
+    def read(limit: int = 50):
+        db = _InboxDB()
+        rows = db.fetch(INBOX_PUBLIC_STATUSES)
+        rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
+        rows = rows[: max(1, min(int(limit), 100))]
+        items = [
+            {
+                "id": r["id"],
+                "text": r["text"],
+                "name": r["name"],
+                "status": r["status"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "artifact_link": r["artifact_link"],
+            }
+            for r in rows
+        ]
+        return {"generated_at": _inbox_ts(), "items": items, "count": len(items)}
 
     return web_app
 
