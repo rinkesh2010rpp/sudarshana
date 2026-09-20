@@ -1357,6 +1357,14 @@ def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_li
         note=note,
         artifact_link=artifact_link if new_status == "completed" else "",
     )
+    # Explicit Volume commit — the moderation-tool twin of the POST's commit
+    # (2026-09-19 21:05 finding): this process's local SQLite bytes are not in
+    # the shared Volume snapshot until commit() is called; without it a status
+    # transition is acknowledged to the model but invisible to every other
+    # reader (public GET, next-cycle intake). First proven lost this way
+    # 2026-09-20 08:02: item b3f94e1a655f stayed 'in_progress' on the live
+    # board while the tool's local view had 'completed'.
+    volume.commit()
     return {
         "ok": True,
         "id": item_id,
