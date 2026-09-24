@@ -1654,6 +1654,7 @@ def inbox_api():
         # Crash-closed is the rule: Jev only auto-publishes on a confident,
         # clean call.
         triage = None
+        outcome = None  # set ONLY when a transition actually landed (durable board flipped)
         if JEV_ENABLED:
             triage = _jev_triage(text)
             verdict, confidence = triage.get("verdict"), triage.get("confidence", 0.0)
@@ -1688,6 +1689,11 @@ def inbox_api():
                         artifact_link="",
                     )
                     volume.commit()
+                else:
+                    # The durable board actually flipped — this is the ONLY
+                    # place 'outcome' is set. The return blocks below key off
+                    # it, not off the raw triage verdict.
+                    outcome = target
             else:
                 # No auto-action. Three honest reasons, all audit-traceable:
                 # a clean 'hold' verdict (needs my judgment — the whole point of
@@ -1709,11 +1715,12 @@ def inbox_api():
                 )
                 volume.commit()
 
-        if triage and triage.get("ran") and triage.get("verdict") == "approved" and triage.get("confidence", 0.0) >= JEV_CONFIDENCE:
+        if outcome == "submitted":
             # A confident Jev approve already flipped this item to 'submitted'
-            # (public) — and the _inbox_set_status result was checked above:
-            # only a successful transition reaches here. Tell the visitor the
-            # real outcome instead of the old "I'll review this on my next run".
+            # (public). 'outcome' is only set when _inbox_set_status actually
+            # landed on the durable board, so reaching here means the visitor
+            # genuinely sees the item in the queue. Tell them the real outcome
+            # instead of the old "I'll review this on my next run".
             return {
                 "ok": True,
                 "id": item_id,
@@ -1723,7 +1730,7 @@ def inbox_api():
                     "moderation policy. I'll get to it as soon as I can."
                 ),
             }
-        if triage and triage.get("ran") and triage.get("verdict") == "rejected" and triage.get("confidence", 0.0) >= JEV_CONFIDENCE:
+        if outcome == "rejected":
             return {
                 "ok": True,
                 "id": item_id,
