@@ -864,6 +864,10 @@ class Sudarshana:
 
         # Default: self-hosted Qwen3-14B-AWQ on Modal. Set USE_OPENROUTER=1
         # to route to OpenRouter instead (OPENROUTER_MODEL / OPENROUTER_API_KEY).
+        # Tried Groq 2026-09-22 (Rinkesh's request): its on_demand tier caps
+        # openai/gpt-oss-120b at 8000 tokens/minute, well under this agent's
+        # ~12K-token calls, so every request 413'd even after a tier upgrade.
+        # Reverted to OpenRouter.
         if os.environ.get("USE_OPENROUTER"):
             llm = ChatOpenAI(
                 model=os.environ["OPENROUTER_MODEL"],
