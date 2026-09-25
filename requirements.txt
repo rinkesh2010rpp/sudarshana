@@ -8,3 +8,5 @@ langchain-openai
 # deprecated, sunsetting langchain-community package, so we wrap `ddgs` (its
 # maintained successor) directly instead.
 ddgs
+# LangGraph checkpointer for the agent's conversation thread (SqliteSaver).
+langgraph-checkpoint-sqlite
