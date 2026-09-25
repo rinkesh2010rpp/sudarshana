@@ -8,10 +8,12 @@ double-invoke), and runs the message through a LangChain "deep agent": a
 model with write_todos plus a LocalShellBackend rooted at a persistent
 Modal Volume (file tools + execute_command).
 
-No cross-invocation memory (no checkpointer) — replaying the trace cost
-~10x in tokens. Continuity comes instead from files the agent maintains
-on the Volume: VISION.md, ROADMAP.md, actions/<id>.md, INBOX.md,
-logs/<date>.md.
+Continuity comes from files the agent maintains on the Volume:
+VISION.md, ROADMAP.md, actions/<id>.md, INBOX.md, logs/<date>.md.
+Every turn (Telegram and scheduled) also runs on one checkpointed
+conversation thread (SqliteSaver on the Volume) that keeps the full
+history — tool calls and results included — and is condensed by
+deepagents' built-in summarization when it nears the context limit.
 
 Telegram delivery is handled by Python, not a model tool call (which the
 model sometimes forgot): the agent's final message is sent to Telegram
@@ -54,6 +56,9 @@ image = (
         # image is built from this pip_install list. Keep in sync with
         # requirements.txt.
         "ddgs",
+        # SqliteSaver for the agent's conversation thread (see
+        # setup()). Keep in sync with requirements.txt.
+        "langgraph-checkpoint-sqlite",
     )
 )
 
@@ -166,11 +171,16 @@ real, accurate, injected by the system you run on. You have no other
 sense of the date or time. Use it: date-stamp entries, and reason about
 elapsed time between cycles from it.
 
-There is no memory between invocations beyond what you write to files.
-Each message or wake-up starts with an empty history. An ordinary
-question or comment you just answer. A real task or request only
-survives this turn if you write it down — otherwise it is gone the
-moment the invocation ends.
+There is no memory between invocations beyond what you write to files,
+with one narrow exception: every turn — a message from Rinkesh or a
+scheduled wake-up — arrives with your running conversation ahead of it
+(his messages, the wake-up prompts, and your final replies), so you can
+follow a conversation — "yes, do it" refers to what was just discussed,
+often your last wake-up report. Your earlier tool calls and their output
+carry over too. Older parts of the conversation are condensed to a
+summary once it grows long, so anything that must last still belongs in
+a file. An ordinary question or comment you just answer. A real task or
+request only survives if you write it down.
 
 Everything that must persist lives under /data — the Modal Volume, the
 only path that survives a cycle. Anything written elsewhere (container
@@ -724,6 +734,23 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
             d["current_trace"] = []
 
 
+# --- Conversation thread: LangGraph checkpointer -----------------------------
+# Every turn — Telegram message, hourly and weekly wake-up — runs on one
+# checkpointed thread, so a reply ("yes, do it") sees the conversation before
+# it, including the wake-up report it answers. The thread keeps everything —
+# tool calls and results too; deepagents' built-in SummarizationMiddleware
+# condenses the oldest part when it nears the context limit.
+#
+# Storage is a SQLite file on the Volume (SqliteSaver, opened in setup()),
+# saved by each turn's volume.commit(). DELETE journal, not SqliteSaver's WAL
+# default — WAL's -wal/-shm side files don't survive a network volume (same
+# choice as the visitor-inbox store). Overlapping turns in two containers (a
+# Telegram message during a wake-up) race on the file: last commit wins, and
+# the other turn's exchange drops out of the thread. Acceptable for one user.
+CHECKPOINT_DB_PATH = os.path.join(VOLUME_PATH, "checkpoints.db")
+CONVERSATION_THREAD = {"configurable": {"thread_id": "sudarshana"}}
+
+
 @app.cls(
     image=image,
     secrets=[modal.Secret.from_dotenv()],
@@ -752,11 +779,22 @@ class Sudarshana:
         # MemoryMiddleware appends the runtime memory (state.md) to the true
         # compiled system message via append_to_system_message — the idiomatic
         # replacement for the raw {"role":"system"} ride-along in _invoke
-        # (removed in C4). It loads fresh off the volume each cold invocation,
-        # so the injected "where I am" is always current. Small custom template
-        # holds the per-call cost near state.md's own ~0.25k tokens; the
-        # default MEMORY_SYSTEM_PROMPT is ~1.6k and geared to AGENTS.md.
-        memory_middleware = MemoryMiddleware(
+        # (removed in C4). Small custom template holds the per-call cost near
+        # state.md's own ~0.25k tokens; the default MEMORY_SYSTEM_PROMPT is
+        # ~1.6k and geared to AGENTS.md.
+        #
+        # Stock MemoryMiddleware loads its sources once per *thread* (it skips
+        # when memory_contents is already in state). On the checkpointed
+        # conversation thread that would pin the first state.md forever, so
+        # reload on every turn: the injected "where I am" stays current.
+        # Upstream bug: langchain-ai/deepagents#6122 (open as of 0.7.13) —
+        # drop this subclass once a release fixes it.
+        class FreshMemoryMiddleware(MemoryMiddleware):
+            def before_agent(self, state, runtime, config):
+                state = {k: v for k, v in state.items() if k != "memory_contents"}
+                return super().before_agent(state, runtime, config)
+
+        memory_middleware = FreshMemoryMiddleware(
             backend=FilesystemBackend(root_dir="/"),
             # Inject the compiled knowledge catalog alongside state.md so
             # durable lessons reach every cold cycle (memory-writeback
@@ -780,7 +818,16 @@ class Sudarshana:
         # skill is added later, it loads per cold cycle and the model follows it
         # when the task matches. This is the forward hook Rinkesh asked for; no
         # skills exist yet, so nothing else changes.
-        skills_middleware = SkillsMiddleware(
+        # Same load-once-per-thread behaviour as MemoryMiddleware (skips when
+        # skills_metadata is in state), so rescan /data/skills/ every turn or a
+        # skill added later would never appear on the conversation thread.
+        # Upstream: langchain-ai/deepagents#5416 — drop once fixed there.
+        class FreshSkillsMiddleware(SkillsMiddleware):
+            def before_agent(self, state, runtime, config):
+                state = {k: v for k, v in state.items() if k != "skills_metadata"}
+                return super().before_agent(state, runtime, config)
+
+        skills_middleware = FreshSkillsMiddleware(
             backend=FilesystemBackend(root_dir="/"),
             sources=[f"{VOLUME_PATH}/skills/"],
         )
@@ -903,6 +950,16 @@ class Sudarshana:
                 max_tokens=32768,
                 timeout=600,
             )
+        # Conversation thread checkpointer (see the section above setup()).
+        import sqlite3
+
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        conn = sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
+        checkpointer.setup()
+        conn.execute("PRAGMA journal_mode=DELETE")
+
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
@@ -913,7 +970,8 @@ class Sudarshana:
             middleware=[memory_middleware, skills_middleware],
             # DuckDuckGo web search alongside the filesystem/shell tools.
             tools=search_tools,
-            # No checkpointer, deliberately — see module docstring.
+            # One conversation thread for every turn (CONVERSATION_THREAD).
+            checkpointer=checkpointer,
             # LocalShellBackend = file tools + unsandboxed execute_command.
             # inherit_env=True so GITHUB_TOKEN and other secrets reach shell
             # commands (defaults to False → empty env).
@@ -961,9 +1019,12 @@ class Sudarshana:
         # cutting off before it could report back or update its own record —
         # while finishing in 341.7s, well inside the 1500s timeout. Time, not
         # step count, is the real backstop against a stuck run.
-        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 200}
+        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 200, **CONVERSATION_THREAD}
         try:
-            result = self.agent.invoke(invoke_input, config=cfg)
+            # durability="exit": checkpoint once at the end of the turn, not
+            # after every step — per-step saved ~77 snapshots (2.3 MB) for one
+            # hourly turn. We never resume mid-turn, so nothing is lost.
+            result = self.agent.invoke(invoke_input, config=cfg, durability="exit")
         except GraphRecursionError:
             # Don't let this crash the invocation — that sends nothing to
             # Telegram. Report and move on.
@@ -972,10 +1033,16 @@ class Sudarshana:
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
             )
             return None
-        # Full trace to the modal logs for debugging; only the agent's final
-        # message goes to Telegram.
-        print(_format_blurb(result.get("messages", [])))
-        _send_telegram(_final_message(result.get("messages", [])))
+        # Full trace of this turn to the modal logs for debugging (the thread
+        # holds every earlier turn too, so start at this turn's message); only
+        # the agent's final message goes to Telegram.
+        msgs = result.get("messages", [])
+        start = max(
+            (i for i, m in enumerate(msgs) if type(m).__name__ == "HumanMessage" and m.content == message),
+            default=0,
+        )
+        print(_format_blurb(msgs[start:]))
+        _send_telegram(_final_message(msgs))
         return result
 
     @modal.fastapi_endpoint(method="POST")
@@ -1008,7 +1075,6 @@ class Sudarshana:
         # work, so a turn that dies mid-run leaves a provable trace.
         _turn_key = _status_turn_start("running-telegram")
 
-        # Fresh state every call; continuity comes from the agent's own files.
         self._invoke(text)
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
