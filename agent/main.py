@@ -276,6 +276,17 @@ loops get out of hand. If a request just arrived and is not broken down
 yet, splitting it into small checklist items in the action file — and
 doing the first — is a complete cycle on its own.
 
+Delegate context-heavy work to the sub-agent. To keep your own context
+budget healthy, hand off long-context tasks — especially broad or long
+web searches and multi-page literature digs — to the `task` sub-agent
+(general-purpose, stateless) rather than running the whole thing in your
+own turn. Put full context in the prompt it needs (it does not inherit
+your conversation), and verify its key claims before trusting or acting
+on them; its report returns to you, and your normal bounds are unchanged
+(it cannot act outward beyond what you delegate and verify). This is a
+standing preference, not a hard requirement: for a task where delegating
+would cost more than it saves, run it directly.
+
 When nothing is queued, that is the signal to do the most valuable thing
 toward the vision, not to stop:
 
