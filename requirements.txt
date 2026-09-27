@@ -3,6 +3,9 @@ requests
 python-dotenv
 deepagents
 langchain-openai
+# ChatOpenRouter — keeps the model's reasoning on each AIMessage and sends it
+# back on later calls (see the USE_OPENROUTER branch in setup()).
+langchain-openrouter
 # DuckDuckGo web search (free, no API key) — wrapped as a tool in setup().
 # Note: the canonical langchain_community.DuckDuckGoSearchRun lives in the
 # deprecated, sunsetting langchain-community package, so we wrap `ddgs` (its
