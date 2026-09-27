@@ -249,9 +249,11 @@ action file to reflect it.
 
 Visitor inbox (P5). Every cycle, if the injected "Visitor inbox intake"
 note lists any received item, run your policy check on it: each is
-PRIVATE until you act, and only you can make it public. Approve -> call
-inbox_set_status '<id>' submitted (that puts it on the public site
-board); reject -> 'rejected' (never public). Never auto-publish. If the
+PRIVATE until approved. Most submissions are triaged at intake by Jev: a
+confident Jev approve or reject is applied automatically, so the items
+still listed as received are the ones it held or couldn't judge. Approve -> call inbox_set_status '<id>' submitted (that
+puts it on the public site board); reject -> 'rejected' (never public).
+Never publish an item yourself without this check. If the
 board has active items and you have capacity, advance one:
 submitted -> in_progress -> completed. Completing an item means writing
 the full answer as its own long-form content — paragraphs, like a blog
@@ -1009,6 +1011,8 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
 # the other turn's exchange drops out of the thread. Acceptable for one user.
 CHECKPOINT_DB_PATH = os.path.join(VOLUME_PATH, "checkpoints.db")
 CONVERSATION_THREAD = {"configurable": {"thread_id": "sudarshana"}}
+# Max graph steps per turn; also quoted in the Telegram message when hit.
+RECURSION_LIMIT = 200
 
 
 @app.cls(
@@ -1128,9 +1132,10 @@ class Sudarshana:
         # structured SQLite file the model must NOT hand-edit — the ONLY ways
         # it can act on visitor items are these two tools + the per-call
         # intake system note.
-        # The moderation gate is a model judgment: nothing a visitor submits is
-        # ever served publicly (it starts 'received' = private) until the model
-        # explicitly approves it here (received -> submitted). Never auto-publish.
+        # The moderation gate: nothing a visitor submits is served publicly (it
+        # starts 'received' = private) until it is approved — by a confident
+        # Jev verdict at intake, or by the model here
+        # (received -> submitted).
 
         @tool
         def inbox_review() -> str:
@@ -1279,7 +1284,7 @@ class Sudarshana:
         # cutting off before it could report back or update its own record —
         # while finishing in 341.7s, well inside the 1500s timeout. Time, not
         # step count, is the real backstop against a stuck run.
-        cfg = {"callbacks": [_build_timing_handler(), _build_call_logger(trigger)], "recursion_limit": 200, **CONVERSATION_THREAD}
+        cfg = {"callbacks": [_build_timing_handler(), _build_call_logger(trigger)], "recursion_limit": RECURSION_LIMIT, **CONVERSATION_THREAD}
         try:
             # durability="exit": checkpoint once at the end of the turn, not
             # after every step — per-step saved ~77 snapshots (2.3 MB) for one
@@ -1289,7 +1294,7 @@ class Sudarshana:
             # Don't let this crash the invocation — that sends nothing to
             # Telegram. Report and move on.
             _send_telegram(
-                "[hit the 100-step safety limit this cycle without finishing — "
+                f"[hit the {RECURSION_LIMIT}-step safety limit this cycle without finishing — "
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
             )
             return None
@@ -1488,8 +1493,8 @@ JEV_TIMEOUT_SECONDS = float(os.environ.get("JEV_TIMEOUT_S", "5"))
 # 2026-09-23 22:49 — prompt injection / attempts to instruct or manipulate the
 # agent) IS this text. The question (instructions) is deliberately short; each
 # class definition lives in its OWN criteria entry so Jev sees exactly one
-# rubric item per verdict. Keep it in lockstep with the human-facing rubric in
-# /data/memory/state.md.
+# rubric item per verdict. Keep it in lockstep with the settled policy in
+# /data/memory/decisions.md (2026-09-19 and 2026-09-23 entries).
 JEV_POLICY_QUESTION = (
     "Does this visitor submission to this public AI assistant's inbox meet, "
     "violate, or fall between the moderation policy?"
@@ -1852,7 +1857,7 @@ def _inbox_intake_context() -> str:
         lines.append(
             "Policy check now: approve -> inbox_set_status '<id>' submitted (makes it "
             "PUBLIC on the site board); otherwise reject -> 'rejected' (never public). "
-            "Never auto-publish."
+            "Never publish without this check."
         )
     if view["active"]:
         lines.append(
