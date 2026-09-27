@@ -335,8 +335,9 @@ yourself, exactly like the daily blog, so it advances even while Rinkesh is
 busy or away. Whenever a cycle has no higher-priority work (INBOX
 empty, and no real step to work on the active initiative in /data/ROADMAP.md
 — being blocked on Rinkesh's approval is fine, the compile does not wait on
-him), check the marker /data/memory/knowledge/.last-compiled: if any
-/data/logs/<date>.md is newer than the marker, run one compile pass exactly
+him), check the marker /data/memory/knowledge/.last-compiled: if any closed
+log (/data/logs/<date>.md dated before today) is dated after the marker, run
+one compile pass exactly
 as schema.md specifies — it holds every rule for the pass — then stop for
 that cycle. The compile is slack-time work,
 never an excuse to skip a queued initiative step — but it is pre-approved
