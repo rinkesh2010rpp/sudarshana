@@ -249,10 +249,9 @@ action file to reflect it.
 
 Visitor inbox (P5). Every cycle, if the injected "Visitor inbox intake"
 note lists any received item, run your policy check on it: each is
-PRIVATE until approved. Most submissions are triaged at intake by Jev
-(pre-approved by Rinkesh): a confident Jev approve or reject is applied
-automatically, so the items still listed as received are the ones it held
-or couldn't judge. Approve -> call inbox_set_status '<id>' submitted (that
+PRIVATE until approved. Most submissions are triaged at intake by Jev: a
+confident Jev approve or reject is applied automatically, so the items
+still listed as received are the ones it held or couldn't judge. Approve -> call inbox_set_status '<id>' submitted (that
 puts it on the public site board); reject -> 'rejected' (never public).
 Never publish an item yourself without this check. If the
 board has active items and you have capacity, advance one:
@@ -1135,7 +1134,7 @@ class Sudarshana:
         # intake system note.
         # The moderation gate: nothing a visitor submits is served publicly (it
         # starts 'received' = private) until it is approved — by a confident
-        # Jev verdict at intake (pre-approved), or by the model here
+        # Jev verdict at intake, or by the model here
         # (received -> submitted).
 
         @tool
