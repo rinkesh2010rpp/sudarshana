@@ -47,8 +47,9 @@ All under `/data/memory/knowledge/`:
   that break this schema. Rewritten, not appended.
 - `log.md` — the wiki's own changelog, append-only, written by the compile
   (see "log.md").
-- `.last-compiled` — one line, the newest log date compiled through (e.g.
-  `2026-09-03`). Only logs newer than it are read. Absent = read all logs.
+- `.last-compiled` — one line, the newest **closed** log date compiled
+  through (e.g. `2026-09-03`). Only closed logs dated after it are read.
+  Absent = read all closed logs.
 
 Code regenerates `index.md` and `lint.md` at the end of any turn in which a
 page changed, so edits show up in the index from the next turn on.
@@ -131,8 +132,11 @@ One bounded pass per cycle:
 1. Read this file and follow it exactly; if missing, record that and stop —
    do not invent rules.
 2. Read `lint.md`. Issues on pages you touch this pass get fixed as you go.
-3. Read `.last-compiled`; read only the logs newer than it (a few days at
-   most per pass).
+3. Read `.last-compiled`; read only **closed** logs dated after it — a log
+   is closed once its date is before today (by the injected current time).
+   Never compile today's log: it is still growing, and a marker set to today
+   would skip every entry written after the pass. A few days at most per
+   pass.
 4. For each durable fact in those logs, find the page(s) it concerns (the
    index lists every page by path and claim) and choose exactly one
    operation:
@@ -150,7 +154,8 @@ One bounded pass per cycle:
    One log entry can touch several pages.
 5. For each page you ADD or UPDATE, set `Related` to its most related pages
    (≤5, forward only).
-6. Bump `.last-compiled` to the newest log date compiled.
+6. Set `.last-compiled` to the newest log date compiled — always a closed
+   day, never today.
 7. Append one line to `log.md` (format below) and one line to today's
    `/data/logs/<date>.md` saying a compile pass ran.
 
@@ -199,8 +204,8 @@ is not duplicated here.
 
 - Self-task, like the daily blog: whenever a cycle has no higher-priority
   work (INBOX empty, no real step on the active initiative — being blocked on
-  Rinkesh's approval is fine), check `.last-compiled`; if any log is newer,
-  run one compile pass, then stop for that cycle.
+  Rinkesh's approval is fine), check `.last-compiled`; if any closed log is dated
+  after it, run one compile pass, then stop for that cycle.
 - Incremental and bounded: only logs since the last compile; a backlog drains
   over quiet cycles rather than one marathon.
 - Pre-approved and /data-internal: does not wait on Rinkesh.
