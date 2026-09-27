@@ -441,6 +441,114 @@ def _build_timing_handler():
     return _TimingHandler()
 
 
+# Every model call (main agent, sub-agents, summarization) recorded in full —
+# input messages, output message, token usage, latency — as a future training /
+# eval dataset. One gzipped JSONL file per turn, so overlapping turns in two
+# containers never write the same file (the Volume is last-commit-wins):
+#   /data/llm-calls/<YYYY-MM-DD>/<HHMMSS>-<trigger>-<id>.jsonl.gz
+# Tool schemas are identical call-to-call and large, so each distinct set is
+# written once to /data/llm-calls/tools/<hash>.json and records carry the hash.
+# Committed by the turn's existing volume.commit().
+LLM_CALLS_DIR = os.path.join(VOLUME_PATH, "llm-calls")
+
+
+def _build_call_logger(trigger: str):
+    import gzip
+    import hashlib
+    import json
+    import uuid
+    from datetime import datetime, timezone
+
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.messages import message_to_dict, messages_to_dict
+
+    now = datetime.now(timezone.utc)
+    turn_id = uuid.uuid4().hex[:12]
+    day_dir = os.path.join(LLM_CALLS_DIR, now.strftime("%Y-%m-%d"))
+    path = os.path.join(day_dir, f"{now.strftime('%H%M%S')}-{trigger}-{turn_id}.jsonl.gz")
+    tools_dir = os.path.join(LLM_CALLS_DIR, "tools")
+
+    def _tools_hash(tools) -> str | None:
+        if not tools:
+            return None
+        blob = json.dumps(tools, sort_keys=True, default=str)
+        digest = hashlib.sha256(blob.encode()).hexdigest()[:16]
+        tools_path = os.path.join(tools_dir, f"{digest}.json")
+        if not os.path.exists(tools_path):
+            os.makedirs(tools_dir, exist_ok=True)
+            with open(tools_path, "w", encoding="utf-8") as f:
+                f.write(blob)
+        return digest
+
+    class _CallLogger(BaseCallbackHandler):
+        def __init__(self):
+            self.pending: dict = {}
+            self.seq = 0
+
+        def on_chat_model_start(self, serialized, messages, *, run_id, parent_run_id=None,
+                                invocation_params=None, metadata=None, **kwargs):
+            try:
+                params = dict(invocation_params or {})
+                tools = params.pop("tools", None)
+                # Keep generation settings only — nothing credential-shaped.
+                for k in ("api_key", "openai_api_key", "default_headers", "http_client"):
+                    params.pop(k, None)
+                self.pending[run_id] = {
+                    "started": time.time(),
+                    "record": {
+                        "turn_id": turn_id,
+                        "trigger": trigger,
+                        "run_id": str(run_id),
+                        "parent_run_id": str(parent_run_id) if parent_run_id else None,
+                        "node": (metadata or {}).get("langgraph_node"),
+                        "params": params,
+                        "tools_hash": _tools_hash(tools),
+                        "input": messages_to_dict(messages[0]),
+                    },
+                }
+            except Exception as e:  # never let logging break a turn
+                print(f"[llm-calls] start capture failed: {e!r}")
+
+        def _finish(self, run_id, **fields):
+            entry = self.pending.pop(run_id, None)
+            if entry is None:
+                return
+            try:
+                rec = entry["record"]
+                self.seq += 1
+                rec["seq"] = self.seq
+                rec["ts"] = datetime.now(timezone.utc).isoformat()
+                rec["latency_s"] = round(time.time() - entry["started"], 3)
+                rec.update(fields)
+                os.makedirs(day_dir, exist_ok=True)
+                # Append mode writes one gzip member per record; gzip readers
+                # read concatenated members as one stream, and a turn that
+                # dies mid-run keeps every call logged before it.
+                with gzip.open(path, "at", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+            except Exception as e:
+                print(f"[llm-calls] write failed: {e!r}")
+
+        def on_llm_end(self, response, *, run_id, **kwargs):
+            try:
+                gen = response.generations[0][0]
+                msg = getattr(gen, "message", None)
+                usage = getattr(msg, "usage_metadata", None) or (response.llm_output or {}).get("token_usage")
+                self._finish(
+                    run_id,
+                    output=message_to_dict(msg) if msg is not None else {"text": gen.text},
+                    usage=dict(usage) if usage else None,
+                )
+            except Exception as e:
+                print(f"[llm-calls] end capture failed: {e!r}")
+                self.pending.pop(run_id, None)
+
+        def on_llm_error(self, error, *, run_id, **kwargs):
+            self._finish(run_id, error=repr(error))
+
+    return _CallLogger()
+
+
 def _final_message(messages: list) -> str:
     """The agent's last spoken message — the final AIMessage with real
     content. Falls back to a marker so a silent turn still sends something
@@ -998,7 +1106,7 @@ class Sudarshana:
             ),
         )
 
-    def _invoke(self, message: str):
+    def _invoke(self, message: str, trigger: str):
         # Current time goes in a fresh system message per call — it's world
         # context, not part of Rinkesh's message, and can't be baked into the
         # once-compiled system_prompt or it would go stale. (Rinkesh 2026-09-01:
@@ -1034,7 +1142,7 @@ class Sudarshana:
         # cutting off before it could report back or update its own record —
         # while finishing in 341.7s, well inside the 1500s timeout. Time, not
         # step count, is the real backstop against a stuck run.
-        cfg = {"callbacks": [_build_timing_handler()], "recursion_limit": 200, **CONVERSATION_THREAD}
+        cfg = {"callbacks": [_build_timing_handler(), _build_call_logger(trigger)], "recursion_limit": 200, **CONVERSATION_THREAD}
         try:
             # durability="exit": checkpoint once at the end of the turn, not
             # after every step — per-step saved ~77 snapshots (2.3 MB) for one
@@ -1090,7 +1198,7 @@ class Sudarshana:
         # work, so a turn that dies mid-run leaves a provable trace.
         _turn_key = _status_turn_start("running-telegram")
 
-        self._invoke(text)
+        self._invoke(text, "telegram")
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(_turn_key, "done", "telegram turn finished")
@@ -1109,7 +1217,7 @@ class Sudarshana:
         _turn_key = _status_turn_start("running-hourly")
 
         # Edit HOURLY_TASK / the prompt to change this, not code.
-        self._invoke(HOURLY_TASK)
+        self._invoke(HOURLY_TASK, "hourly")
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(_turn_key, "done", "hourly turn finished")
@@ -1125,7 +1233,7 @@ class Sudarshana:
         _turn_key = _status_turn_start("running-hourly")
 
         # Edit WEEKLY_FRESHNESS_TASK / the prompt to change this, not code.
-        self._invoke(WEEKLY_FRESHNESS_TASK)
+        self._invoke(WEEKLY_FRESHNESS_TASK, "weekly")
 
         print(f"[timing] weekly_freshness_checkin finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(_turn_key, "done", "weekly freshness turn finished")
