@@ -51,6 +51,9 @@ image = (
         "fastapi[standard]",
         "deepagents",
         "langchain-openai",
+        # ChatOpenRouter for the USE_OPENROUTER branch (see setup()). Keep in
+        # sync with requirements.txt.
+        "langchain-openrouter",
         # DuckDuckGo web search tool (free, no API key) — required inside the
         # Modal container image, not just in requirements.txt, because the
         # image is built from this pip_install list. Keep in sync with
@@ -710,8 +713,9 @@ def _format_blurb(messages: list) -> str:
         role = type(m).__name__
         content = (getattr(m, "content", "") or "").strip()
         tool_calls = getattr(m, "tool_calls", None)
-        # Qwen3 <think> block: a separate field named `reasoning` (vLLM 0.27)
-        # or `reasoning_content` (older), in additional_kwargs or
+        # The model's reasoning: `reasoning_content` in additional_kwargs from
+        # ChatOpenRouter; `reasoning` (vLLM 0.27) or `reasoning_content`
+        # (older) from the self-hosted Qwen3 path, in additional_kwargs or
         # response_metadata. Check all four.
         _ak = getattr(m, "additional_kwargs", {}) or {}
         _rm = getattr(m, "response_metadata", {}) or {}
@@ -1181,26 +1185,36 @@ class Sudarshana:
         # ~12K-token calls, so every request 413'd even after a tier upgrade.
         # Reverted to OpenRouter.
         if os.environ.get("USE_OPENROUTER"):
-            llm = ChatOpenAI(
+            # ChatOpenRouter, not ChatOpenAI: OpenRouter returns the model's
+            # reasoning in non-standard `reasoning` / `reasoning_details`
+            # fields that ChatOpenAI drops. ChatOpenRouter keeps them in the
+            # AIMessage's additional_kwargs (so the call logs, checkpoint and
+            # _format_blurb see them) and sends them back on later calls —
+            # DeepSeek requires past reasoning to be passed back whenever
+            # tools are in the request, which is every call here. Verified
+            # 2026-09-27: deepinfra/baseten/together all count the returned
+            # reasoning in prompt_tokens (one field or both, same count).
+            from langchain_openrouter import ChatOpenRouter
+
+            llm = ChatOpenRouter(
                 model=os.environ["OPENROUTER_MODEL"],
-                base_url="https://openrouter.ai/api/v1",
                 api_key=os.environ["OPENROUTER_API_KEY"],
                 # Reasoning models spend max_tokens on their <think> trace;
                 # 4096 was too small and runs ended empty. Still under the
                 # deepagents default of 65536.
                 max_tokens=32768,
-                timeout=600,
+                # MILLISECONDS here (SDK timeout_ms), unlike ChatOpenAI's
+                # seconds — 600_000 ms = the same 10 minutes as before.
+                timeout=600_000,
                 # Pin to providers with battle-tested tool-call parsers —
                 # OpenRouter's cheap auto-route once mangled a DeepSeek tool call.
                 # Fireworks first: 2026-09-11 OpenRouter activity logs showed it
                 # running ~150-250 tok/s vs ~20-60 tok/s for deepinfra/fallback
                 # providers on this model, matching independent DeepSeek
                 # provider benchmarks (deepinfra is a repeatedly slow host).
-                extra_body={
-                    "provider": {
-                        "order": ["fireworks", "deepinfra", "baseten"],
-                        "allow_fallbacks": True,
-                    }
+                openrouter_provider={
+                    "order": ["fireworks", "deepinfra", "baseten"],
+                    "allow_fallbacks": True,
                 },
             )
         else:
