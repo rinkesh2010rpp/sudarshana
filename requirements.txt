@@ -13,3 +13,5 @@ langchain-openrouter
 ddgs
 # LangGraph checkpointer for the agent's conversation thread (SqliteSaver).
 langgraph-checkpoint-sqlite
+# Taster: prompt-injection screen for tool results (pinned tag).
+taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev1
