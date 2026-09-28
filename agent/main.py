@@ -1210,16 +1210,13 @@ class Sudarshana:
                 # MILLISECONDS here (SDK timeout_ms), unlike ChatOpenAI's
                 # seconds — 600_000 ms = the same 10 minutes as before.
                 timeout=600_000,
-                # Pin to providers with battle-tested tool-call parsers —
-                # OpenRouter's cheap auto-route once mangled a DeepSeek tool call.
-                # Fireworks first: 2026-09-11 OpenRouter activity logs showed it
-                # running ~150-250 tok/s vs ~20-60 tok/s for deepinfra/fallback
-                # providers on this model, matching independent DeepSeek
-                # provider benchmarks (deepinfra is a repeatedly slow host).
-                openrouter_provider={
-                    "order": ["fireworks", "deepinfra", "baseten"],
-                    "allow_fallbacks": True,
-                },
+                # No provider pinning: OpenRouter's default routing (price-
+                # weighted among providers without recent outages) picks the
+                # host. The old fireworks/deepinfra/baseten order cost ~$30/mo —
+                # Fireworks ($0.22/M input) took ~70% of spend on 32% of tokens
+                # and fell back often anyway, vs Relace $0.02/M. If a cheap host
+                # mangles tool calls again (the reason for pinning, pre-09-11),
+                # add a provider "ignore" / "quantizations" filter, not an order.
             )
         else:
             llm = ChatOpenAI(
