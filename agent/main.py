@@ -1717,12 +1717,14 @@ TOOL_SCREEN_CRITERIA = {
 #   threshold  min confidence for an `injection` verdict to withhold the result
 #   on_error   "label" (pass through, marked unscreened) or "block" (withhold)
 #              when Jev gives no verdict
-# Everything starts in shadow: flip a tool to enforce once its logs look right.
+# Enforced since 2026-09-27, after a live shadow test on five test pages: both
+# injections scored 1.0, an article about prompt injection scored clean 0.99.
+# A new tool should start in shadow until its logs look right.
 TOOL_SCREEN_DEFAULT_RULES = [
-    {"tool": "search_web", "mode": "shadow", "threshold": 0.85, "on_error": "label"},
+    {"tool": "search_web", "mode": "enforce", "threshold": 0.85, "on_error": "label"},
     {
         "tool": "execute",
-        "mode": "shadow",
+        "mode": "enforce",
         "threshold": 0.85,
         "on_error": "label",
         "when_args": {"command": r"\bcurl\b|\bwget\b|https?://|\bgit\s+(clone|pull|fetch)\b|\bgh\s"},
