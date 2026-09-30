@@ -1230,6 +1230,9 @@ class Sudarshana:
                 max_tokens=32768,
                 timeout=600,
             )
+        # deepagents' built-in summarization triggers at 85% of the profile's
+        # max_input_tokens: 82K here → compacts the thread at ~70K tokens.
+        llm.profile = {**(llm.profile or {}), "max_input_tokens": 82_000}
         # Conversation thread checkpointer (see the section above setup()).
         import sqlite3
 
