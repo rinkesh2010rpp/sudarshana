@@ -65,7 +65,7 @@ image = (
         # Taster: the prompt-injection screen for tool results (see
         # _build_tool_screen). Pinned to a tag so a Taster change can't reach
         # the agent unannounced. Keep in sync with requirements.txt.
-        "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev1",
+        "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev2",
     )
 )
 
