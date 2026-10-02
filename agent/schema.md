@@ -17,7 +17,7 @@ LLM Wiki (raw sources → wiki → schema; ingest / query / lint).
 Distill the accumulated logs into durable, interlinked, single-concept pages a
 cold cycle can use without re-deriving knowledge from the logs each time. Pages
 are a **cache of ground truth**, never a replacement for it. The canonical
-`/data` files (logs, decisions.md, actions/, ROADMAP.md, INBOX.md, VISION.md)
+`/data` files (logs, decisions.md, actions/, ROADMAP.md, VISION.md)
 always win on disagreement.
 
 ## Layers
@@ -203,7 +203,7 @@ is not duplicated here.
 ## Cadence
 
 - Self-task, like the daily blog: whenever a cycle has no higher-priority
-  work (INBOX empty, no real step on the active initiative — being blocked on
+  work (no open request from Rinkesh, no real step on the active initiative — being blocked on
   Rinkesh's approval is fine), check `.last-compiled`; if any closed log is dated
   after it, run one compile pass, then stop for that cycle.
 - Incremental and bounded: only logs since the last compile; a backlog drains
