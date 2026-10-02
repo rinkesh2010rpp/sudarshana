@@ -9,7 +9,7 @@ model with write_todos plus a LocalShellBackend rooted at a persistent
 Modal Volume (file tools + execute_command).
 
 Continuity comes from files the agent maintains on the Volume:
-VISION.md, ROADMAP.md, actions/<id>.md, INBOX.md, logs/<date>.md.
+VISION.md, ROADMAP.md, actions/<id>.md, logs/<date>.md.
 Every turn (Telegram and scheduled) also runs on one checkpointed
 conversation thread (SqliteSaver on the Volume) that keeps the full
 history — tool calls and results included — and is condensed by
@@ -70,7 +70,7 @@ image = (
 )
 
 # Persistent disk for the agent's file tools and its VISION/ROADMAP/actions/
-# INBOX/logs hierarchy — without it, writes vanish at the end of each invocation.
+# logs hierarchy — without it, writes vanish at the end of each invocation.
 volume = modal.Volume.from_name("sudarshana-files", create_if_missing=True)
 VOLUME_PATH = "/data"
 
@@ -208,37 +208,33 @@ Your working files:
 - /data/actions/<id>.md — one file per initiative: its live work queue
   and a short "where things stand" note. Changes constantly. Keep it
   lean — drop finished items rather than accumulating history.
-- /data/INBOX.md — direct requests from Rinkesh. Clear these before
-  self-directed work. Remove an item once handled.
 - /data/logs/<YYYY-MM-DD>.md — your daily work log, one file per
   calendar day. Every turn, append a sentence or two: what you did this
   cycle and why, anything notable or surprising that came up, and what
   is queued next. Write it with enough texture that a post could be
   built from it later — this is the raw material for the blog. Create
   the day's file on that day's first turn.
+- /data/memory/state.md — the living "where am I right now" index
+  (current focus, open questions by owner, parked threads, links). It is
+  auto-injected into every call's system message, so you see it without
+  a tool call. Rewrite it in full each cycle-end, never append; it points
+  to the canonical files (ROADMAP/actions/VISION), never restates them.
+- /data/memory/decisions.md — append-only ledger of durable decisions
+  (decided / applies-to / rationale / revisit-if). Add a dated entry only
+  when a durable choice is made; never edit an entry in place — record a
+  reversal as a new superseding entry. The latest entry for a topic is
+  authoritative.
 
-  - /data/memory/state.md — the living "where am I right now" index
-    (current focus, open questions by owner, parked threads, links). It is
-    auto-injected into every call's system message, so you see it without
-    a tool call. Rewrite it in full each cycle-end, never append; it points
-    to the canonical files (ROADMAP/actions/INBOX/VISION), never restates
-    them.
+Memory contract: /data/memory is an index, not a second copy of your data.
+state.md is a short "where am I" pointer to the real files (ROADMAP /
+actions / VISION / logs) — it never restates them. If state.md ever
+disagrees with a canonical file, the canonical file wins and state.md is
+corrected. Keep logs as the narrative source — do not fold them into
+state.md.
 
-  - /data/memory/decisions.md — append-only ledger of durable decisions
-    (decided / applies-to / rationale / revisit-if). Add a dated entry only
-    when a durable choice is made; never edit an entry in place — record a
-    reversal as a new superseding entry. The latest entry for a topic is
-    authoritative.
-
-  Memory contract: /data/memory is an index, not a second copy of your data.
-  state.md is a short "where am I" pointer to the real files (ROADMAP /
-  actions / INBOX / VISION / logs) — it never restates them. If state.md ever
-  disagrees with a canonical file, the canonical file wins and state.md is
-  corrected. Keep logs as the narrative source — do not fold them into
-  state.md.
-
-Use your file tools for these, with full paths. Use the shell only for
-git, never for editing these files. Use write_todos to break down the
+Read and edit these files with your file tools, using full paths — never
+through the shell (no echo/sed/cat redirects into them). The shell is for
+everything else: git, builds, curl, and so on. Use write_todos to break down the
 step you are on right now — that is fine to lose at end of turn; the
 action files are what has to survive.
 
@@ -248,8 +244,8 @@ HOW TO WORK
 Nobody queues your work. Deciding what is most valuable to do next,
 toward the horizons above, is the job — not something to wait for.
 
-Each cycle: check /data/INBOX.md first — direct requests outrank
-self-directed work. If it is empty, go to /data/ROADMAP.md, find the
+Each cycle: a direct request from Rinkesh still open in the conversation
+outranks self-directed work. If there is none, go to /data/ROADMAP.md, find the
 initiative that matters most right now, and read only that initiative's
 action file — not all of them. Do one real, finished thing. Update that
 action file to reflect it.
@@ -341,8 +337,8 @@ The memory compile. Your durable knowledge layer (/data/memory/knowledge/
 pages, routed by index.md, spec at /data/sudarshana/agent/schema.md) is kept
 current by a compile pass that is your own standing task — you act on it
 yourself, exactly like the daily blog, so it advances even while Rinkesh is
-busy or away. Whenever a cycle has no higher-priority work (INBOX
-empty, and no real step to work on the active initiative in /data/ROADMAP.md
+busy or away. Whenever a cycle has no higher-priority work (no open
+request from Rinkesh, and no real step to work on the active initiative in /data/ROADMAP.md
 — being blocked on Rinkesh's approval is fine, the compile does not wait on
 him), check the marker /data/memory/knowledge/.last-compiled: if any closed
 log (/data/logs/<date>.md dated before today) is dated after the marker, run
@@ -386,8 +382,8 @@ papering over them.
 HOURLY_TASK = (
     "This is your scheduled hourly wake-up. If it's the first cycle of a new "
     "day, do the Daily blog first (see your instructions) and that's the whole "
-    "cycle. Otherwise: check /data/INBOX.md first and handle one item there "
-    "before anything else; if it's empty, work the next single step of the "
+    "cycle. Otherwise: if Rinkesh has an open request in the conversation, "
+    "handle that before anything else; if not, work the next single step of the "
     "current initiative in /data/ROADMAP.md — one step, then stop and leave "
     "the rest for the next wake-up. If that initiative is still awaiting "
     "Rinkesh's approval, keep to light research only — no in-depth work, no "
@@ -1079,7 +1075,7 @@ class Sudarshana:
             system_prompt=(
                 "--- where I am right now (from /data/memory/state.md, "
                 "refreshed each cycle; the canonical files "
-                "ROADMAP/actions/INBOX/VISION/logs always win on disagreement) "
+                "ROADMAP/actions/VISION/logs always win on disagreement) "
                 "---\n{agent_memory}"
             ),
         )
