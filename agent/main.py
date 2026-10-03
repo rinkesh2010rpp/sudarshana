@@ -1117,8 +1117,9 @@ class Sudarshana:
         inbox_tools = [inbox_review, inbox_set_status]
         search_tools = [*search_tools, *inbox_tools]
 
-        # Default: self-hosted Qwen3-14B-AWQ on Modal. Set USE_OPENROUTER=1
-        # to route to OpenRouter instead (OPENROUTER_MODEL / OPENROUTER_API_KEY).
+        # Production runs on OpenRouter (USE_OPENROUTER=1, OPENROUTER_MODEL /
+        # OPENROUTER_API_KEY). The else branch targets the self-hosted Qwen
+        # endpoint on Modal, which is stopped; it is kept only as a fallback.
         # Groq was tried and dropped: its 8K tokens/min cap is below this
         # agent's ~12K-token calls.
         if os.environ.get("USE_OPENROUTER"):
@@ -1201,7 +1202,7 @@ class Sudarshana:
             ]
         }
         # The step cap catches a looping run; the timeout is the real backstop.
-        cfg ={"callbacks": [_build_timing_handler(), _build_call_logger(trigger)], "recursion_limit": RECURSION_LIMIT, **CONVERSATION_THREAD}
+        cfg = {"callbacks": [_build_timing_handler(), _build_call_logger(trigger)], "recursion_limit": RECURSION_LIMIT, **CONVERSATION_THREAD}
         try:
             # Checkpoint once at turn end, not per step (~77 snapshots/turn);
             # we never resume mid-turn.
