@@ -1188,16 +1188,19 @@ class Sudarshana:
 
         from a2a_agents import build_a2a
 
-        a2a_tools, a2a_directory = build_a2a(
+        # Registers add_agent / send_agent_task / check_agent_task itself (like
+        # deepagents' FilesystemMiddleware). Middleware tools aren't handed to
+        # the `task` subagent, which keeps outward A2A calls in the main agent.
+        a2a_middleware = build_a2a(
             _a2a_registry(), screen=_a2a_screen, notify=_send_telegram, log_dir=A2A_LOG_DIR
         )
 
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
-            middleware=[memory_middleware, skills_middleware, a2a_directory, *screen_middleware],
+            middleware=[memory_middleware, skills_middleware, a2a_middleware, *screen_middleware],
             subagents=subagents,
-            tools=[*search_tools, *a2a_tools],
+            tools=search_tools,
             checkpointer=checkpointer,
             # inherit_env=True so GITHUB_TOKEN and other secrets reach shell
             # commands. virtual_mode=False so file tools and the shell agree

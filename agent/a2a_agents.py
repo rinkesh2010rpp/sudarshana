@@ -1,14 +1,15 @@
 """
 External A2A agents: find, register and call other agents at runtime.
 
-The model gets three tools plus a note on every model call:
+build_a2a() returns one middleware that, like deepagents' FilesystemMiddleware,
+brings its own tools and prompt text:
 
     add_agent(url)                 fetch the agent's card, check and screen it,
                                    register it under an alias chosen here
     send_agent_task(alias, msg)    send a message, wait briefly, return the
                                    reply (or a task id to collect later)
     check_agent_task(alias, id)    collect a task that was still running
-    AgentDirectoryMiddleware       appends the callable agents (and any pending
+    every model call               appends the callable agents (and any pending
                                    tasks) to the system message
 
 The model only ever supplies a URL, an alias and message text. Fetching the
@@ -432,12 +433,15 @@ def _append_system(system_message, text: str):
 def _make_middleware(registry: AgentRegistry):
     from langchain.agents.middleware import AgentMiddleware
 
-    class AgentDirectoryMiddleware(AgentMiddleware):
-        """Appends the callable external agents to the system message on every
-        model call, so one added mid-turn is usable on the next call."""
+    class A2AMiddleware(AgentMiddleware):
+        """Registers the A2A tools (set on .tools by build_a2a, the way
+        deepagents' FilesystemMiddleware registers its file tools) and appends
+        the callable external agents to the system message on every model
+        call, so one added mid-turn is usable on the next call."""
 
         def __init__(self):
             super().__init__()
+            self.tools = []
             self._cached_at = 0.0
             self._note = None
 
@@ -466,14 +470,15 @@ def _make_middleware(registry: AgentRegistry):
         async def awrap_model_call(self, request, handler):
             return await handler(self._with_note(request))
 
-    return AgentDirectoryMiddleware()
+    return A2AMiddleware()
 
 
 # --- Tools -------------------------------------------------------------------
 
 
 def build_a2a(registry: AgentRegistry, screen, notify=None, log_dir=None, allow_private: bool = False):
-    """(tools, middleware) for create_deep_agent.
+    """The A2A middleware for create_deep_agent; its .tools holds add_agent,
+    send_agent_task and check_agent_task, which create_agent registers.
 
     screen(text) -> "clean" | "injection" | "unclear" | "error" checks card text
     before anything is registered. notify(text) tells Rinkesh about new agents.
@@ -677,7 +682,8 @@ def build_a2a(registry: AgentRegistry, screen, notify=None, log_dir=None, allow_
              latency_s=round(time.monotonic() - started, 2))
         return _format_result(alias, result)
 
-    return [add_agent, send_agent_task, check_agent_task], middleware
+    middleware.tools = [add_agent, send_agent_task, check_agent_task]
+    return middleware
 
 
 # --- Telegram /agents command ------------------------------------------------

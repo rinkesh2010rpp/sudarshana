@@ -172,8 +172,8 @@ def setup():
     store = {}
     notices = []
     registry = AgentRegistry(store)
-    tools, middleware = build_a2a(registry, fake_screen, notify=notices.append, allow_private=True)
-    add_agent, send_agent_task, check_agent_task = tools
+    middleware = build_a2a(registry, fake_screen, notify=notices.append, allow_private=True)
+    add_agent, send_agent_task, check_agent_task = middleware.tools
     return registry, store, notices, add_agent, send_agent_task, check_agent_task, middleware
 
 
@@ -271,8 +271,7 @@ def test_injection_card_rejected_and_not_readded(setup):
 
 def test_private_hosts_blocked_in_production():
     registry = AgentRegistry({})
-    tools, _ = build_a2a(registry, fake_screen)  # allow_private defaults to False
-    add_agent = tools[0]
+    add_agent = build_a2a(registry, fake_screen).tools[0]  # allow_private defaults to False
     out = add_agent.invoke({"url": "http://127.0.0.1:9/"})
     assert "only https" in out
     out = add_agent.invoke({"url": "https://localhost/"})
@@ -286,7 +285,7 @@ def test_card_pointing_at_private_interface_rejected():
     with AgentServer(interface_url="http://10.0.0.5/") as agent:
         # Card is fetched from localhost (allowed here) but advertises a
         # private endpoint; check the interface URL with production rules.
-        tools, _ = build_a2a(registry, fake_screen, allow_private=True)
+        tools = build_a2a(registry, fake_screen, allow_private=True).tools
         orig = a2a_agents._check_url
 
         def strict_for_interface(url, allow_private):
@@ -359,8 +358,8 @@ def test_directory_middleware_injects_into_model_call(setup):
 
     def run():
         model = RecordingModel(messages=iter([AIMessage(content="done")]))
-        agent = create_agent(model, tools=[add_agent, send, check], system_prompt="base prompt",
-                             middleware=[middleware])
+        # No tools= here: the middleware registers its own.
+        agent = create_agent(model, tools=[], system_prompt="base prompt", middleware=[middleware])
         agent.invoke({"messages": [{"role": "user", "content": "hi"}]})
         return seen[-1][0].text
 
