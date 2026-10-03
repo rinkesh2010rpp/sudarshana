@@ -46,25 +46,16 @@ image = (
         "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
         "apt-get install -y nodejs",
     )
+    # Keep in sync with requirements.txt.
     .pip_install(
         "requests",
         "fastapi[standard]",
         "deepagents",
         "langchain-openai",
-        # ChatOpenRouter for the USE_OPENROUTER branch (see setup()). Keep in
-        # sync with requirements.txt.
         "langchain-openrouter",
-        # DuckDuckGo web search tool (free, no API key) — required inside the
-        # Modal container image, not just in requirements.txt, because the
-        # image is built from this pip_install list. Keep in sync with
-        # requirements.txt.
         "ddgs",
-        # SqliteSaver for the agent's conversation thread (see
-        # setup()). Keep in sync with requirements.txt.
         "langgraph-checkpoint-sqlite",
-        # Taster: the prompt-injection screen for tool results (see
-        # _build_tool_screen). Pinned to a tag so a Taster change can't reach
-        # the agent unannounced. Keep in sync with requirements.txt.
+        # Pinned to a tag so a Taster change can't reach the agent unannounced.
         "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev2",
     )
 )
@@ -713,10 +704,7 @@ def _format_blurb(messages: list) -> str:
         role = type(m).__name__
         content = (getattr(m, "content", "") or "").strip()
         tool_calls = getattr(m, "tool_calls", None)
-        # The model's reasoning: `reasoning_content` in additional_kwargs from
-        # ChatOpenRouter; `reasoning` (vLLM 0.27) or `reasoning_content`
-        # (older) from the self-hosted Qwen3 path, in additional_kwargs or
-        # response_metadata. Check all four.
+        # Providers put reasoning in different fields; check all four.
         _ak = getattr(m, "additional_kwargs", {}) or {}
         _rm = getattr(m, "response_metadata", {}) or {}
         reasoning = (
@@ -763,35 +751,20 @@ def _send_telegram(text: str) -> None:
 
 
 # --- status-center: deterministic event writer + read-only API ---------------
-# Initiative status-center. Storage = a named modal.Dict ("sudarshana-status"),
-# shared by the deterministic writer (inside the app's containers) and the
-# read-only API (which mounts NO volume and reads live). Three pieces of state:
-#   * current       — high-level at-moment status (idle / running-*) + since
-#   * current_trace — fine-grained per-turn events, reset each turn
-#   * history       — rolling window of the last ~50 turn summaries (what
-#                     /api/events serves)
-# Plus immutable per-turn records (turn:<ts>) that survive even when a turn
-# dies mid-run: a record with no `ended`, or `current` stuck in `running-*`, is
-# a provable death. The API is read-only and public like the gateway blog; every
-# payload is own-work summaries only (no secrets/tokens/infra details).
-# The "locking primitive" documented by Modal is put(key, value,
-# skip_if_exists=True) (exactly-once acquisition) — there is no lock() method
-# in the current client. Unique per-turn keys make concurrent turns safe by
-# construction.
+# A named modal.Dict shared by the writer (agent containers) and the public,
+# read-only API (mounts no volume). State:
+#   * current       — idle / running-* + since
+#   * current_trace — per-turn events, reset each turn
+#   * history       — the last STATUS_HISTORY_LIMIT turn summaries (/api/events)
+# plus per-turn records (turn:<ts>): one with no `ended` marks a turn that died
+# mid-run. Unique per-turn keys make concurrent turns safe.
 STATUS_DICT_NAME = "sudarshana-status"
 STATUS_HISTORY_LIMIT = 50
-# Keep per-turn records bounded: anything older than this many turns is pruned
-# at turn-end. The rolling `history` list is the durable summary window; the
-# immutable turn:* dict entries exist primarily to catch mid-turn deaths, so we
-# only need a recent span of them, not every turn since deploy.
+# Closed turn:* records kept; older ones are pruned at turn-end.
 STATUS_RECORDS_KEEP = 100
-# A genuinely live turn is capped by the Modal timeout (1500s, see below).
-# Any ended=None record older than this staleness TTL is therefore not a
-# concurrent turn — it's a zombie: a prior turn that died mid-run without ever
-# calling _status_turn_end. Without this bound, an orphaned record would be
-# seen as "still running" forever, and every later turn's _status_turn_end
-# would hand `current` back to it, silently reverting its own update (the
-# 17:09 09-18 bug). 1800s = 30min, comfortably above the 1500s timeout.
+# An unclosed record older than this can't be a live turn (the Modal timeout is
+# 1500s) — it's a zombie from a turn that died before _status_turn_end, and
+# must not be handed `current`.
 STATUS_ZOMBIE_TTL_SECONDS = 1800
 
 
@@ -850,10 +823,6 @@ def _status_turn_start(state: str) -> str:
     )
     d["current"] = {"state": state, "since": ts, "turn_id": turn_id, "_turn_key": key}
     d["current_trace"] = [{"ts": ts, "event": "turn_started", "detail": state}]
-    # Reconcile any stale ended=None records (mid-run deaths from turns that
-    # never reached _status_turn_end). Doing this here means a new turn never
-    # inherits a zombie as its running-context, and the death gets recorded as
-    # outcome="zombie" rather than being invisible.
     _status_reconcile_zombies(d)
     return key
 
@@ -958,14 +927,10 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
     )
     d["history"] = history[:STATUS_HISTORY_LIMIT]
 
-    # Reconcile zombies before deciding who `current` hands to: a stale
-    # ended=None record must not be mistaken for a live concurrent turn (the
-    # 17:09 09-18 fault loop). Idempotent — no-op if nothing is stale.
+    # Before deciding who gets `current`, so a zombie isn't taken for a live turn.
     _status_reconcile_zombies(d)
 
-    # Bounded cleanup: keep only the newest STATUS_RECORDS_KEEP closed turn:*
-    # records; prune the rest. Never prune a still-running record (ended=None)
-    # — those are the mid-turn-death evidence we must preserve.
+    # Prune old closed records; never unclosed ones (mid-run death evidence).
     closed_keys = sorted(
         k
         for k in (d.keys() or [])
@@ -1023,12 +988,7 @@ RECURSION_LIMIT = 200
     image=image,
     secrets=[modal.Secret.from_dotenv()],
     volumes={VOLUME_PATH: volume},
-    # 300s default was killing genuine multi-tool tasks mid-run; 600s then
-    # wasn't enough when the self-hosted model is slow (90-180s/call). 1000s
-    # then wasn't enough margin over a couple of slow OpenRouter reasoning
-    # calls (each allowed up to 600s of its own) landing back-to-back in one
-    # turn (observed 2026-09-11: legitimate turns at 56-58% of the 1000s
-    # budget on ordinary requests).
+    # Room for a couple of slow reasoning calls (up to 600s each) in one turn.
     timeout=1500,
 )
 class Sudarshana:
@@ -1044,19 +1004,14 @@ class Sudarshana:
         from langchain_core.tools import tool
         from langchain_openai import ChatOpenAI
 
-        # MemoryMiddleware appends the runtime memory (state.md) to the true
-        # compiled system message via append_to_system_message — the idiomatic
-        # replacement for the raw {"role":"system"} ride-along in _invoke
-        # (removed in C4). Small custom template holds the per-call cost near
-        # state.md's own ~0.25k tokens; the default MEMORY_SYSTEM_PROMPT is
-        # ~1.6k and geared to AGENTS.md.
+        # Appends state.md and the knowledge index to the compiled system
+        # message. The small custom template keeps per-call cost low (the
+        # default MEMORY_SYSTEM_PROMPT is ~1.6k tokens, geared to AGENTS.md).
         #
-        # Stock MemoryMiddleware loads its sources once per *thread* (it skips
-        # when memory_contents is already in state). On the checkpointed
-        # conversation thread that would pin the first state.md forever, so
-        # reload on every turn: the injected "where I am" stays current.
-        # Upstream bug: langchain-ai/deepagents#6122 (open as of 0.7.13) —
-        # drop this subclass once a release fixes it.
+        # Stock MemoryMiddleware loads once per thread, which on the
+        # checkpointed thread would pin the first state.md forever, so reload
+        # every turn. Upstream bug: langchain-ai/deepagents#6122 — drop this
+        # subclass once a release fixes it.
         class FreshMemoryMiddleware(MemoryMiddleware):
             def before_agent(self, state, runtime, config):
                 state = {k: v for k, v in state.items() if k != "memory_contents"}
@@ -1064,14 +1019,11 @@ class Sudarshana:
 
         memory_middleware = FreshMemoryMiddleware(
             backend=FilesystemBackend(root_dir="/"),
-            # Inject the compiled knowledge catalog alongside state.md so
-            # durable lessons reach every cold cycle (memory-writeback
-            # initiative); page bodies stay on-demand via read_file.
             sources=[
                 f"{VOLUME_PATH}/memory/state.md",
                 f"{VOLUME_PATH}/memory/knowledge/index.md",
             ],
-            add_cache_control=False,  # Anthropic-only; no-op for Qwen3-14B
+            add_cache_control=False,  # Anthropic-only
             system_prompt=(
                 "--- where I am right now (from /data/memory/state.md, "
                 "refreshed each cycle; the canonical files "
@@ -1080,16 +1032,9 @@ class Sudarshana:
             ),
         )
 
-        # SkillsMiddleware (deepagents 0.7.11) — the library is currently EMPTY
-        # (/data/skills/README.md documents the format), so this surfaces a
-        # "no skills available yet" line into the runtime system prompt. When a
-        # skill is added later, it loads per cold cycle and the model follows it
-        # when the task matches. This is the forward hook Rinkesh asked for; no
-        # skills exist yet, so nothing else changes.
-        # Same load-once-per-thread behaviour as MemoryMiddleware (skips when
-        # skills_metadata is in state), so rescan /data/skills/ every turn or a
-        # skill added later would never appear on the conversation thread.
-        # Upstream: langchain-ai/deepagents#5416 — drop once fixed there.
+        # Skills library at /data/skills/ (README.md there documents the
+        # format). Same load-once-per-thread issue as memory, so rescan every
+        # turn. Upstream: langchain-ai/deepagents#5416 — drop once fixed.
         class FreshSkillsMiddleware(SkillsMiddleware):
             def before_agent(self, state, runtime, config):
                 state = {k: v for k, v in state.items() if k != "skills_metadata"}
@@ -1132,14 +1077,8 @@ class Sudarshana:
 
         search_tools = [search_web]
 
-        # P5-inbox: the visitor-inbox store (/data/visitor-inbox.db) is a
-        # structured SQLite file the model must NOT hand-edit — the ONLY ways
-        # it can act on visitor items are these two tools + the per-call
-        # intake system note.
-        # The moderation gate: nothing a visitor submits is served publicly (it
-        # starts 'received' = private) until it is approved — by a confident
-        # Jev verdict at intake, or by the model here
-        # (received -> submitted).
+        # The model acts on the visitor inbox only through these tools and the
+        # per-call intake note, never by editing /data/visitor-inbox.db.
 
         @tool
         def inbox_review() -> str:
@@ -1180,39 +1119,25 @@ class Sudarshana:
 
         # Default: self-hosted Qwen3-14B-AWQ on Modal. Set USE_OPENROUTER=1
         # to route to OpenRouter instead (OPENROUTER_MODEL / OPENROUTER_API_KEY).
-        # Tried Groq 2026-09-22 (Rinkesh's request): its on_demand tier caps
-        # openai/gpt-oss-120b at 8000 tokens/minute, well under this agent's
-        # ~12K-token calls, so every request 413'd even after a tier upgrade.
-        # Reverted to OpenRouter.
+        # Groq was tried and dropped: its 8K tokens/min cap is below this
+        # agent's ~12K-token calls.
         if os.environ.get("USE_OPENROUTER"):
-            # ChatOpenRouter, not ChatOpenAI: OpenRouter returns the model's
-            # reasoning in non-standard `reasoning` / `reasoning_details`
-            # fields that ChatOpenAI drops. ChatOpenRouter keeps them in the
-            # AIMessage's additional_kwargs (so the call logs, checkpoint and
-            # _format_blurb see them) and sends them back on later calls —
-            # DeepSeek requires past reasoning to be passed back whenever
-            # tools are in the request, which is every call here. Verified
-            # 2026-09-27: deepinfra/baseten/together all count the returned
-            # reasoning in prompt_tokens (one field or both, same count).
+            # ChatOpenRouter, not ChatOpenAI: it keeps the model's reasoning
+            # fields (ChatOpenAI drops them) and sends them back on later
+            # calls, which DeepSeek requires whenever tools are present.
             from langchain_openrouter import ChatOpenRouter
 
             llm = ChatOpenRouter(
                 model=os.environ["OPENROUTER_MODEL"],
                 api_key=os.environ["OPENROUTER_API_KEY"],
-                # Reasoning models spend max_tokens on their <think> trace;
-                # 4096 was too small and runs ended empty. Still under the
-                # deepagents default of 65536.
+                # Reasoning models spend max_tokens on thinking; 4096 ended
+                # runs empty.
                 max_tokens=32768,
-                # MILLISECONDS here (SDK timeout_ms), unlike ChatOpenAI's
-                # seconds — 600_000 ms = the same 10 minutes as before.
+                # Milliseconds here, unlike ChatOpenAI's seconds (10 minutes).
                 timeout=600_000,
-                # No provider pinning: OpenRouter's default routing (price-
-                # weighted among providers without recent outages) picks the
-                # host. The old fireworks/deepinfra/baseten order cost ~$30/mo —
-                # Fireworks ($0.22/M input) took ~70% of spend on 32% of tokens
-                # and fell back often anyway, vs Relace $0.02/M. If a cheap host
-                # mangles tool calls again (the reason for pinning, pre-09-11),
-                # add a provider "ignore" / "quantizations" filter, not an order.
+                # No provider pinning: pinning Fireworks cost ~$30/mo. If a
+                # cheap host mangles tool calls, add a provider "ignore" /
+                # "quantizations" filter rather than an order.
             )
         else:
             llm = ChatOpenAI(
@@ -1222,14 +1147,13 @@ class Sudarshana:
                     "https://rinkesh2010rpp--llm-inference-vllmserver-serve.modal.run/v1",
                 ),
                 api_key=os.environ.get("LLM_API_KEY", "dummy"),
-                # Same <think> headroom as the OpenRouter branch.
                 max_tokens=32768,
                 timeout=600,
             )
         # deepagents' built-in summarization triggers at 85% of the profile's
         # max_input_tokens: 82K here → compacts the thread at ~70K tokens.
         llm.profile = {**(llm.profile or {}), "max_input_tokens": 82_000}
-        # Conversation thread checkpointer (see the section above setup()).
+
         import sqlite3
 
         from langgraph.checkpoint.sqlite import SqliteSaver
@@ -1239,74 +1163,48 @@ class Sudarshana:
         checkpointer.setup()
         conn.execute("PRAGMA journal_mode=DELETE")
 
-        # Taster tool-result screen (see _build_tool_screen).
         screen_middleware, subagents = _build_tool_screen()
 
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
-            # Runtime memory injection (state.md) + skills library — via
-            # middleware, appended to the compiled system prompt at runtime
-            # (the idiomatic path). Memory replaced the old raw system-role
-            # ride-along; skills is a forward hook (empty for now).
             middleware=[memory_middleware, skills_middleware, *screen_middleware],
             subagents=subagents,
-            # DuckDuckGo web search alongside the filesystem/shell tools.
             tools=search_tools,
-            # One conversation thread for every turn (CONVERSATION_THREAD).
             checkpointer=checkpointer,
-            # LocalShellBackend = file tools + unsandboxed execute_command.
             # inherit_env=True so GITHUB_TOKEN and other secrets reach shell
-            # commands (defaults to False → empty env).
-            # virtual_mode=False so file tools and the shell agree on paths:
-            # /data/X is /data/X for both. The default remapped "/X" to
-            # "/data/X" for file tools only, breaking paths copied into git.
+            # commands. virtual_mode=False so file tools and the shell agree
+            # on paths (the default remaps "/X" to "/data/X" for file tools
+            # only).
             backend=LocalShellBackend(
                 root_dir=VOLUME_PATH, virtual_mode=False, inherit_env=True
             ),
         )
 
     def _invoke(self, message: str, trigger: str):
-        # Current time goes in a fresh system message per call — it's world
-        # context, not part of Rinkesh's message, and can't be baked into the
-        # once-compiled system_prompt or it would go stale. (Rinkesh 2026-09-01:
-        # keep this mechanism as-is for now — no better solve found yet; revisit
-        # with a better mechanism later.)
         from langgraph.errors import GraphRecursionError
 
         invoke_input = {
             "messages": [
-                # Only time here now — memory injection (state.md) moved to the
-                # MemoryMiddleware runtime system-prompt append (C3), so state.md
-                # is not duplicated as a ragged system-role message anymore.
+                # Current time goes in a fresh system message per call; baked
+                # into the compiled system_prompt it would go stale. Kept as-is
+                # until a better mechanism turns up.
                 {
                     "role": "system",
                     "content": f"Current time: {_timestamp()}",
                 },
-                # P5-inbox intake (slice 3): surface anything a visitor left in
-                # the inbox store on EVERY cycle so nothing waits unseen. Empty
-                # string (inbox idle) adds nothing — no-op cycles cost nothing.
-                # The policy check on received items is a model judgment, never
-                # automatic (22:26 09-18 moderation gate).
+                # Visitor inbox items, every cycle; adds nothing when idle.
                 *([] if not (_icc := _inbox_intake_context()) else [
                     {"role": "system", "content": f"Visitor inbox intake:\n{_icc}"}
                 ]),
                 {"role": "user", "content": message},
             ]
         }
-        # Safety cap on the tool loop so a stuck run can't burn the full
-        # timeout — a run once did 37 calls in circles. langgraph's default
-        # is 25. Raised 100 -> 200 on 2026-09-13: a legitimate build-and-ship
-        # task (schema.md + main.py edit, commit, push, PR via curl) hit the
-        # 100-step wall at ~104 steps after the real work was already done,
-        # cutting off before it could report back or update its own record —
-        # while finishing in 341.7s, well inside the 1500s timeout. Time, not
-        # step count, is the real backstop against a stuck run.
-        cfg = {"callbacks": [_build_timing_handler(), _build_call_logger(trigger)], "recursion_limit": RECURSION_LIMIT, **CONVERSATION_THREAD}
+        # The step cap catches a looping run; the timeout is the real backstop.
+        cfg ={"callbacks": [_build_timing_handler(), _build_call_logger(trigger)], "recursion_limit": RECURSION_LIMIT, **CONVERSATION_THREAD}
         try:
-            # durability="exit": checkpoint once at the end of the turn, not
-            # after every step — per-step saved ~77 snapshots (2.3 MB) for one
-            # hourly turn. We never resume mid-turn, so nothing is lost.
+            # Checkpoint once at turn end, not per step (~77 snapshots/turn);
+            # we never resume mid-turn.
             result = self.agent.invoke(invoke_input, config=cfg, durability="exit")
         except GraphRecursionError:
             # Don't let this crash the invocation — that sends nothing to
@@ -1358,8 +1256,7 @@ class Sudarshana:
         started = time.monotonic()
         print(f"[timing] process_message started: {text[:200]!r}")
 
-        # status-center: deterministic "turn started" record, BEFORE any model
-        # work, so a turn that dies mid-run leaves a provable trace.
+        # Before any model work, so a turn that dies mid-run leaves a trace.
         _turn_key = _status_turn_start("running-telegram")
 
         self._invoke(text, "telegram")
@@ -1379,8 +1276,6 @@ class Sudarshana:
         print("[timing] hourly_checkin started")
 
         _turn_key = _status_turn_start("running-hourly")
-
-        # Edit HOURLY_TASK / the prompt to change this, not code.
         self._invoke(HOURLY_TASK, "hourly")
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
@@ -1395,8 +1290,6 @@ class Sudarshana:
         print("[timing] weekly_freshness_checkin started")
 
         _turn_key = _status_turn_start("running-hourly")
-
-        # Edit WEEKLY_FRESHNESS_TASK / the prompt to change this, not code.
         self._invoke(WEEKLY_FRESHNESS_TASK, "weekly")
 
         print(f"[timing] weekly_freshness_checkin finished in {time.monotonic() - started:.1f}s")
@@ -1432,8 +1325,7 @@ def status_api():
         current = d.get("current", {}) or {}
         history = d.get("history", []) or []
         last = history[0] if history else None
-        # The API is public: strip the internal _turn_key pointer and anything
-        # that isn't an own-work summary. id/ts are harmless.
+        # Public API: strip internal keys like _turn_key.
         current = {k: v for k, v in current.items() if not k.startswith("_")}
         return {
             "generated_at": _status_ts(),
@@ -1460,58 +1352,29 @@ def status_api():
     return web_app
 
 
-# --- P5-inbox: public "put item in inbox" surface ---------------------------------
-# Initiative gateway-engagement, piece P5 (green-lit 22:33 09-18). A stranger can
-# leave an item in my inbox via the public site; nothing they type is ever served
-# publicly until it passes my policy check. Storage (19:27 challenge ACCEPTED
-# 19:40): ONE store — a small SQLite database on the Volume
-# (/data/visitor-inbox.db), durable with NO expiry. Supersedes the 19:29
-# Dict + INBOX.md-mirror design: the Dict's 7-day inactivity expiry shouldn't
-# hold a public inbox's durable record, the file mirror was a second source of
-# truth with its own parsing/garble failure class (e.g. 12:00 09-18), and it
-# appended into /data/INBOX.md — Rinkesh's own direct-request inbox. A single
-# db file has one true record per item and one writer lane (the API insert; my
-# transitions) — exactly SQLite's strength. Moderation gate (22:26): the status
-# flow is received (PRIVATE, at submission) -> submitted (PUBLIC, flipped by my
-# next-cycle policy check) -> in_progress -> completed; the public read endpoint
-# serves ONLY {submitted, in_progress, completed} — the filter IS the
-# enforcement. 'rejected' is a PRIVATE terminal state.
+# --- visitor inbox: public "put item in inbox" surface -----------------------
+# Strangers submit items via the public site, stored in one SQLite file on the
+# Volume (durable, no expiry). Status flow: received (PRIVATE) -> submitted
+# (PUBLIC) -> in_progress -> completed; 'rejected' is a private terminal state.
+# The public GET serves only INBOX_PUBLIC_STATUSES — that filter is the
+# moderation enforcement.
 INBOX_DB_PATH = os.path.join(VOLUME_PATH, "visitor-inbox.db")
 INBOX_MAX_ITEM_LEN = 2000
 INBOX_MAX_NAME_LEN = 100
-# Only these statuses are served publicly; 'received' items are private until my
-# policy check flips them to 'submitted'.
 INBOX_PUBLIC_STATUSES = {"submitted", "in_progress", "completed"}
 
-# --- Jev first-pass inbox triager (Path A, via OpenRouter) -------------------
-# Jev (TypeSafe System One) is a decision model: send `state` + named
-# `questions`, get back typed answers with calibrated probabilities. It is NOT
-# a chat model and does NOT speak /chat/completions — OpenRouter serves it on
-# the dedicated decisions endpoint below. Verified live 2026-09-23 22:58 PDT
-# (HTTP 200, 0.3-0.7s, ~$0.00002/decision; model served as the pinned build
-# typesafe/jev-1.13-20260917). Pinning the dated build here keeps behavior
-# stable while `typesafe/jev-latest` may move; the provider drops unknown
-# stability into the exact build it served.
+# --- Jev first-pass inbox triager (via OpenRouter) ---------------------------
+# Jev is a decision model, not a chat model: send `state` + named `questions`,
+# get typed answers with calibrated probabilities, via OpenRouter's decisions
+# endpoint.
 JEV_OPENROUTER_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL = "typesafe/jev-1.13"
-# Default-OFF: the triager only activates with JEV_INBOX_TRIAGE=1 AND an
-# OpenRouter key reaching the inbox container (secrets= on inbox_api). Fail-open
-# is the rule: on any error/timeout/missing key the item stays 'received' and my
-# next-cycle policy check handles it exactly as before — Jev can only auto-
-# publish on a confident, clean call, never on failure or uncertainty.
+# Off unless JEV_INBOX_TRIAGE=1. Fail-open: on any error the item stays
+# 'received' for the agent's own review; only a confident verdict auto-applies.
 JEV_ENABLED = os.environ.get("JEV_INBOX_TRIAGE", "0") == "1"
-# Confidence gate: only verdicts at or above this confidence auto-apply. Below
-# it the item stays 'received' (my review). Starts conservative; tunable via env
-# without a redeploy of code.
 JEV_CONFIDENCE = float(os.environ.get("JEV_CONFIDENCE", "0.90"))
-# Fast, fail-open: a submission must never hang on a third-party decision
-# call. max_retries=0; a short strict timeout keeps the POST snappy.
 JEV_TIMEOUT_SECONDS = float(os.environ.get("JEV_TIMEOUT_S", "5"))
-# The settled moderation policy (2026-09-19 22:53; reject class extended
-# 2026-09-23 22:49 — prompt injection / attempts to instruct or manipulate the
-# agent) IS this text. The question (instructions) is deliberately short; each
-# class definition lives in its OWN criteria entry so Jev sees exactly one
-# rubric item per verdict. Keep it in lockstep with the settled policy in
+# The moderation policy, one criteria entry per verdict. Keep in lockstep with
 # /data/memory/decisions.md (2026-09-19 and 2026-09-23 entries).
 JEV_POLICY_QUESTION = (
     "Does this visitor submission to this public AI assistant's inbox meet, "
@@ -1618,9 +1481,8 @@ def _jev_choice(text: str, *, instructions: str, criteria: dict, timeout: float,
 
 
 def _jev_input_hash(text: str) -> str:
-    """Short stable fingerprint of the item text for the private audit trail.
-    Purely for correlating what Jev saw with my later review — not a secret,
-    and never exposed publicly (it lives only in inbox_events)."""
+    """Short fingerprint of the item text for the private audit trail
+    (inbox_events), to correlate what Jev saw with later review."""
     import hashlib
 
     return hashlib.sha256((text or "").encode()).hexdigest()[:12]
@@ -1730,18 +1592,11 @@ def _inbox_ts() -> str:
 
 
 class _InboxDB:
-    """Small SQLite store for the visitor inbox, living on the Volume
-    (/data/visitor-inbox.db) so it is durable with no expiry — unlike the
-    7-day-inactivity Dict it replaces (19:27 design correction). One file,
-    one true record per item, nothing to mirror or keep in sync. Each call
+    """SQLite store for the visitor inbox at /data/visitor-inbox.db. Each call
     reconnects so the latest data is always read.
 
-    Durability note (post-merge finding 2026-09-19 21:05 PDT): relying on the Volume's
-    task-end auto-flush is WRONG for web endpoints — the POST's local SQLite
-    bytes never reach the Volume snapshot before the task is torn down, so the
-    write is invisible to every other reader (runtime store, moderation tools,
-    public GET). The endpoint must call volume.commit() explicitly after
-    mutating writes, exactly like the runtime's own durable writers do."""
+    Callers must volume.commit() after writes: web-endpoint containers are torn
+    down before the Volume's auto-flush, so uncommitted writes are lost."""
 
     SCHEMA = """
     CREATE TABLE IF NOT EXISTS inbox_items (
@@ -1930,25 +1785,19 @@ class _InboxDB:
             conn.close()
 
 
-# Forward-only lifecycle; the public board serves only {submitted,
-# in_progress, completed} (INBOX_PUBLIC_STATUSES) — the filter IS the
-# moderation enforcement. 'rejected' is a PRIVATE terminal state (withdrawn,
-# never served), separate from 'completed' so a rejected item can never
-# surface on the board (this supersedes an earlier draft where spam was
-# marked completed — completed is public, so spam must NOT be completed).
+# Forward-only. 'rejected' is separate from 'completed' because completed is
+# public; completed and rejected are terminal.
 INBOX_ALLOWED_TRANSITIONS = {
     "received": {"submitted", "rejected"},
     "submitted": {"in_progress", "rejected"},
     "in_progress": {"completed"},
-    # completed / rejected: terminal (no downgrades off the public board).
 }
 
 
 def _inbox_intake() -> dict:
-    """Cycle-start intake view of the visitor inbox (P5 slice 3): the PRIVATE
-    received items (pending the model's policy check) and the ACTIVE
-    submitted/in_progress items (already public, awaiting work). Every cycle
-    calls this so nothing a visitor submits can sit unseen."""
+    """Cycle-start view of the visitor inbox: PRIVATE received items (pending
+    the policy check) and ACTIVE submitted/in_progress items (public,
+    awaiting work)."""
     db = _InboxDB()
     pending = [
         {
@@ -2032,15 +1881,8 @@ def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_li
         note=note,
         artifact_link=artifact_link if new_status == "completed" else "",
     )
-    # Explicit Volume commit — the moderation-tool twin of the POST's commit
-    # (2026-09-19 21:05 finding): this process's local SQLite bytes are not in
-    # the shared Volume snapshot until commit() is called; without it a status
-    # transition is acknowledged to the model but invisible to every other
-    # reader (public GET, next-cycle intake). This commit covers BOTH the
-    # answer write (put_answer, when completing) and the item status transition.
-    # First proven lost this way 2026-09-20 08:02: item b3f94e1a655f stayed
-    # 'in_progress' on the live board while the tool's local view had
-    # 'completed'.
+    # Without an explicit commit the transition (and answer) never reach the
+    # shared Volume, so the public GET and next-cycle intake never see them.
     volume.commit()
     return {
         "ok": True,
@@ -2053,16 +1895,11 @@ def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_li
 @app.function(image=image, volumes={VOLUME_PATH: volume}, secrets=[modal.Secret.from_dotenv()])
 @modal.asgi_app(label="inbox-api")
 def inbox_api():
-    """P5-inbox endpoint: accept a visitor submission + serve the public board.
+    """Visitor inbox endpoint.
 
-    A separate web endpoint on the same Modal app. POST /api/inbox receives a
-    stranger's item (required text + optional name) and stores it status=
-    'received' (PRIVATE) in the /data/visitor-inbox.db SQLite store — the same
-    store my runtime reads — so nothing the visitor types is ever served
-    publicly until my policy check flips it. GET /api/inbox serves the public
-    board filtered to passed items only. A single store on the Volume: durable
-    with no expiry, no Dict, no INBOX.md mirror (19:27 design correction).
-    CORS is enabled so the gateway SPA can fetch/submit cross-origin.
+    POST /api/inbox stores a submission (text + optional name) as 'received'
+    (PRIVATE) until it passes the policy check. GET /api/inbox serves the
+    public board. CORS is enabled so the gateway SPA can call it cross-origin.
     """
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
@@ -2095,7 +1932,7 @@ def inbox_api():
             "id": item_id,
             "name": name,
             "text": text,
-            "status": "received",  # PRIVATE — only my policy check can flip it public
+            "status": "received",
             "created_at": ts,
             "updated_at": ts,
             "artifact_link": None,
@@ -2108,24 +1945,13 @@ def inbox_api():
             note=f"name={name}",
             artifact_link="",
         )
-        # Explicit Volume commit — post-merge finding (2026-09-19 21:05 PDT): the Volume's
-        # auto-flush at task end does NOT carry this container's local SQLite
-        # bytes to the shared snapshot before teardown; without this the item is
-        # acknowledged but lost (~the POST-style teardown write-loss bug). The
-        # runtime's own durable writers commit() explicitly for the same reason.
+        # Explicit commit: the container is torn down before auto-flush.
         volume.commit()
 
-        # Jev first-pass triage (Path A, gated): if the flag is on, run the
-        # decision model over the item and apply a high-confidence verdict
-        # IMMEDIATELY — the same transitions my policy check would make, through
-        # _inbox_set_status (the same forward-only machinery: transition +
-        # log_event + volume.commit in one place). Fail-open: any uncertainty
-        # (confidence < gate, Jev error, timeout, missing key) leaves the item
-        # 'received' and my next-cycle check handles it exactly as before.
-        # Crash-closed is the rule: Jev only auto-publishes on a confident,
-        # clean call.
+        # Apply a confident Jev verdict now via _inbox_set_status; anything
+        # else leaves the item 'received' for the agent's next-cycle review.
         triage = None
-        outcome = None  # set ONLY when a transition actually landed (durable board flipped)
+        outcome = None  # set only when a transition actually landed
         if JEV_ENABLED:
             triage = _jev_triage(text)
             verdict, confidence = triage.get("verdict"), triage.get("confidence", 0.0)
@@ -2140,13 +1966,8 @@ def inbox_api():
                     ),
                 )
                 if not applied.get("ok"):
-                    # The transition did NOT land — the visitor must NOT be
-                    # told it did. Log the failure, then fall through to the
-                    # normal 'received' response below; my next-cycle policy
-                    # check reviews the item exactly as if Jev had not run
-                    # (fail-open on real-world failure, same as on any error).
-                    # Crash-closed: never report 'submitted'/'rejected' to the
-                    # visitor unless the durable board actually flipped.
+                    # Didn't land: log it and fall through to the 'received'
+                    # response, so the visitor isn't told otherwise.
                     db.log_event(
                         item_id,
                         from_status="received",
@@ -2161,16 +1982,10 @@ def inbox_api():
                     )
                     volume.commit()
                 else:
-                    # The durable board actually flipped — this is the ONLY
-                    # place 'outcome' is set. The return blocks below key off
-                    # it, not off the raw triage verdict.
                     outcome = target
             else:
-                # No auto-action. Three honest reasons, all audit-traceable:
-                # a clean 'hold' verdict (needs my judgment — the whole point of
-                # the gate), a clean verdict below the confidence threshold, or
-                # a Jev failure of any kind (fail-open). All leave the item
-                # 'received' exactly as if no triager existed.
+                # No auto-action: a 'hold' verdict, low confidence, or a Jev
+                # failure. Logged so the reason is auditable.
                 if triage.get("ran") and verdict == "hold":
                     reason = f"hold-verdict:{confidence:.2f}"
                 elif triage.get("ran"):
@@ -2187,11 +2002,6 @@ def inbox_api():
                 volume.commit()
 
         if outcome == "submitted":
-            # A confident Jev approve already flipped this item to 'submitted'
-            # (public). 'outcome' is only set when _inbox_set_status actually
-            # landed on the durable board, so reaching here means the visitor
-            # genuinely sees the item in the queue. Tell them the real outcome
-            # instead of the old "I'll review this on my next run".
             return {
                 "ok": True,
                 "id": item_id,
