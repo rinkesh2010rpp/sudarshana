@@ -119,6 +119,28 @@ class AgentServer:
         self.thread.join(timeout=5)
 
 
+class _CaptureBodies:
+    """Pure-ASGI middleware that records every request body, for wire-shape assertions."""
+
+    def __init__(self, app, bodies: list):
+        self.app = app
+        self.bodies = bodies
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        chunks = []
+
+        async def receive_wrapped():
+            message = await receive()
+            if message["type"] == "http.request":
+                chunks.append(message.get("body", b""))
+            return message
+
+        await self.app(scope, receive_wrapped, send)
+        self.bodies.append(b"".join(chunks))
+
+
 class LegacyAgentServer(AgentServer):
     """A protocol-0.3 agent: legacy card shape at /.well-known/agent.json and
     0.3 JSON-RPC method names (message/send, tasks/get)."""
@@ -159,6 +181,11 @@ class LegacyAgentServer(AgentServer):
             Route("/.well-known/agent.json", card),
             *create_jsonrpc_routes(handler, rpc_url="/", enable_v0_3_compat=True),
         ])
+        self.bodies = []
+        # Raw request bodies, for wire-shape assertions: the compat handler
+        # accepts sends with or without acceptedOutputModes, so only inspecting
+        # the actual bytes proves what the client sent.
+        app = _CaptureBodies(app, self.bodies)
         self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning"))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
 
@@ -202,6 +229,22 @@ def test_legacy_v03_agent(setup):
         assert "Added: legacy-agent" in out, out
         reply = send.invoke({"alias": "legacy-agent", "message": "old school"})
         assert "state: completed" in reply and "echo: old school" in reply, reply
+
+
+def test_legacy_send_carries_accepted_output_modes(setup):
+    """Regression: a send to a 0.3-era agent must carry
+    configuration.acceptedOutputModes on the wire. 0.3 pydantic servers
+    validate the request schema and reject sends missing the field (-32600);
+    the protobuf generator drops the empty repeated field, so the client must
+    state it explicitly."""
+    _, _, _, add_agent, send, _, _ = setup
+    with LegacyAgentServer() as agent:
+        add_agent.invoke({"url": agent.url})
+        reply = send.invoke({"alias": "legacy-agent", "message": "wire shape"})
+        assert "echo: wire shape" in reply, reply
+        send_bodies = [b for b in agent.bodies if b'"message/send"' in b]
+        assert send_bodies, [b[:120] for b in agent.bodies]
+        assert b'"acceptedOutputModes"' in send_bodies[0], send_bodies[0]
 
 
 def test_duplicate_and_alias_collision(setup):
