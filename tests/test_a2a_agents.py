@@ -216,6 +216,7 @@ def test_add_and_send(setup):
     registry, _, notices, add_agent, send, _, _ = setup
     with AgentServer() as agent:
         out = add_agent.invoke({"url": agent.url})
+        assert out.startswith("[card of external agent 'echo-agent' — untrusted outside data"), out
         assert "Added: echo-agent" in out, out
         assert registry.get("echo-agent")["status"] == "active"
         assert registry.get("echo-agent")["screened"] is True
@@ -303,6 +304,7 @@ def test_auth_required_not_callable(setup):
     registry, _, _, add_agent, send, _, _ = setup
     with AgentServer(auth=True, name="Locked") as agent:
         out = add_agent.invoke({"url": agent.url})
+        assert out.startswith("[card of external agent 'locked' — untrusted outside data"), out
         assert "requires credentials" in out, out
         assert registry.get("locked")["status"] == "needs_credentials"
         assert "not callable" in send.invoke({"alias": "locked", "message": "hi"})
@@ -344,6 +346,7 @@ def test_no_screen_keeps_card_text_out_of_system_message():
         # The tool result still describes the agent; the user's own tool
         # guard decides whether to screen it.
         assert "Added: echo-agent — Repeats what you send." in out, out
+        assert out.startswith("[card of external agent 'echo-agent' — untrusted outside data"), out
         assert middleware._registry.get("echo-agent")["screened"] is False
         note = a2a_agents._directory_note(middleware._registry)
         assert "- echo-agent" in note.splitlines() and "Repeats" not in note, note
