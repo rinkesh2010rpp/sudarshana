@@ -19,8 +19,8 @@ Telegram delivery is handled by Python, not a model tool call (which the
 model sometimes forgot): the agent's final message is sent to Telegram
 unconditionally, and the full message trace is printed to the modal logs.
 
-External A2A agents (find, register, call at runtime) live in a2a_agents.py;
-Rinkesh controls them with /agents on Telegram.
+External A2A agents (find, register, call at runtime) come from the
+a2a-hotplug package; Rinkesh controls them with /agents on Telegram.
 
 The agent is built once per container in Sudarshana.setup(); both
 telegram_webhook and hourly_checkin reuse that instance. hourly_trigger
@@ -60,12 +60,9 @@ image = (
         "langgraph-checkpoint-sqlite",
         # Pinned to a tag so a Taster change can't reach the agent unannounced.
         "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev2",
-        # External A2A agents (a2a_agents.py). Pinned: the 1.x API is new and
-        # differs from 0.3.
-        "a2a-sdk==1.2.1",
+        # External A2A agents. Pinned to a tag, like Taster; it pins a2a-sdk.
+        "a2a-hotplug @ git+https://github.com/rinkesh2010rpp/a2a-hotplug@v0.1.0",
     )
-    # Must stay last: local files are mounted at container start, not baked in.
-    .add_local_file(os.path.join(os.path.dirname(__file__), "a2a_agents.py"), "/root/a2a_agents.py")
 )
 
 # Persistent disk for the agent's file tools and its VISION/ROADMAP/actions/
@@ -1186,7 +1183,7 @@ class Sudarshana:
 
         screen_middleware, subagents = _build_tool_screen()
 
-        from a2a_agents import A2AMiddleware
+        from a2a_hotplug import A2AMiddleware
 
         # Registers add_agent / send_agent_task / check_agent_task itself (like
         # deepagents' FilesystemMiddleware). Middleware tools aren't handed to
@@ -1626,7 +1623,7 @@ def _build_tool_screen(inherit=()):
     return [taster], taster.subagents(inherit=inherit)
 
 
-# --- External A2A agents (a2a_agents.py) -------------------------------------
+# --- External A2A agents (a2a-hotplug) ---------------------------------------
 # The store is a named modal.Dict so every container and the Telegram
 # /agents command share one list (a JSON file on the Volume can't do that:
 # reload() fails while checkpoints.db is open). Calls are logged per container
