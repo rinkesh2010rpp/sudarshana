@@ -1186,19 +1186,20 @@ class Sudarshana:
 
         screen_middleware, subagents = _build_tool_screen()
 
-        from a2a_agents import build_a2a
+        from a2a_agents import A2AMiddleware
 
         # Registers add_agent / send_agent_task / check_agent_task itself (like
         # deepagents' FilesystemMiddleware). Middleware tools aren't handed to
         # the `task` subagent, which keeps outward A2A calls in the main agent.
-        a2a_middleware = build_a2a(
-            _a2a_registry(), screen=_a2a_screen, notify=_send_telegram, log_dir=A2A_LOG_DIR
+        # Also the handle for the /agents controls in telegram_webhook.
+        self.a2a = A2AMiddleware(
+            store=_a2a_store(), screen=_a2a_screen, notify=_send_telegram, log=_a2a_log
         )
 
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
-            middleware=[memory_middleware, skills_middleware, a2a_middleware, *screen_middleware],
+            middleware=[memory_middleware, skills_middleware, self.a2a, *screen_middleware],
             subagents=subagents,
             tools=search_tools,
             checkpointer=checkpointer,
@@ -1276,9 +1277,7 @@ class Sudarshana:
 
         # Rinkesh's external-agent controls run here, never through the model.
         if message["text"].strip().lower().split()[:1] == ["/agents"]:
-            from a2a_agents import handle_agents_command
-
-            _send_telegram(handle_agents_command(_a2a_registry(), message["text"]))
+            _send_telegram(_agents_command(self.a2a, message["text"]))
             return {"ok": True}
 
         # .spawn() returns immediately so Telegram gets a fast ack; awaiting
@@ -1313,6 +1312,7 @@ class Sudarshana:
         print("[timing] hourly_checkin started")
 
         _turn_key = _status_turn_start("running-hourly")
+        _a2a_keep_alive()
         self._invoke(HOURLY_TASK, "hourly")
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
@@ -1627,42 +1627,108 @@ def _build_tool_screen(inherit=()):
 
 
 # --- External A2A agents (a2a_agents.py) -------------------------------------
-# The registry is a named modal.Dict so every container and the Telegram
-# /agents command share one list. Calls are logged per container per day,
-# committed by the turn's existing volume.commit().
+# The store is a named modal.Dict so every container and the Telegram
+# /agents command share one list (a JSON file on the Volume can't do that:
+# reload() fails while checkpoints.db is open). Calls are logged per container
+# per day, committed by the turn's existing volume.commit().
 A2A_DICT_NAME = "sudarshana-a2a-agents"
 A2A_LOG_DIR = os.path.join(VOLUME_PATH, "a2a-calls")
 A2A_CARD_SCREEN_THRESHOLD = 0.85
 
 
-def _a2a_registry():
-    from a2a_agents import AgentRegistry
-
-    return AgentRegistry(modal.Dict.from_name(A2A_DICT_NAME, create_if_missing=True))
+def _a2a_store():
+    return modal.Dict.from_name(A2A_DICT_NAME, create_if_missing=True)
 
 
-def _a2a_screen(text: str) -> str:
-    """Screen an agent card before it's registered: "clean", "injection",
-    "unclear" or "error". Runs even when the tool screen is off, because a
-    registered card's text goes into the system message on every call."""
+def _a2a_keep_alive() -> None:
+    """Read every agent record and the kill switch once, from the hourly
+    check-in: modal.Dict drops entries after 7 days without a read or write,
+    which would bring back removed agents and switch /agents off back on.
+    Reads only, so it can't overwrite a concurrent change. The daily counters
+    are left to expire."""
     try:
-        from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, ToolContext
-
-        verdict = FallbackDetector(
-            JevDetector(
-                timeout=TOOL_SCREEN_TIMEOUT_S,
-                title="sudarshana-a2a-card-screen",
-                referer="https://github.com/rinkesh2010rpp/sudarshana",
-            ),
-            HeuristicDetector(),
-        ).safe_detect(text, ToolContext(tool="add_agent"))
+        store = _a2a_store()
+        for key in [k for k, _ in store.items() if not str(k).startswith("count:")]:
+            store.get(key)
     except Exception as e:
-        print(f"[a2a] card screen failed: {e!r}")
-        return "error"
+        print(f"[a2a] keep-alive failed: {e!r}")
+
+
+def _a2a_screen(text: str) -> bool:
+    """Screen an agent card before it's registered: True clean, False
+    injection. Raises when the verdict is unclear or the screen fails, so
+    nothing is stored and a later retry can pass. Runs even when the tool
+    screen is off, because a passed card's text goes into the system message
+    on every call."""
+    from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, ToolContext
+
+    verdict = FallbackDetector(
+        JevDetector(
+            timeout=TOOL_SCREEN_TIMEOUT_S,
+            title="sudarshana-a2a-card-screen",
+            referer="https://github.com/rinkesh2010rpp/sudarshana",
+        ),
+        HeuristicDetector(),
+    ).safe_detect(text, ToolContext(tool="add_agent"))
     print(f"[a2a] card screen: {verdict.label} ({verdict.confidence:.2f}, {verdict.detector})")
-    if verdict.label == "injection":
-        return "injection" if verdict.confidence >= A2A_CARD_SCREEN_THRESHOLD else "unclear"
-    return verdict.label
+    if verdict.label == "clean":
+        return True
+    if verdict.label == "injection" and verdict.confidence >= A2A_CARD_SCREEN_THRESHOLD:
+        return False
+    raise RuntimeError(f"card screen unclear ({verdict.label}, {verdict.confidence:.2f})")
+
+
+def _a2a_log(event: dict) -> None:
+    """Print each A2A event and append it to /data/a2a-calls. One file per
+    container per day: two containers must never append to the same file on
+    the last-commit-wins Volume."""
+    import json
+
+    line = json.dumps(event, default=str)
+    print(f"[a2a] {line}")
+    try:
+        os.makedirs(A2A_LOG_DIR, exist_ok=True)
+        name = f"{event['ts'][:10]}-{os.environ.get('MODAL_TASK_ID', 'local')}.jsonl"
+        with open(os.path.join(A2A_LOG_DIR, name), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[a2a] log write failed: {e!r}")
+
+
+AGENTS_HELP = (
+    "/agents — list external agents\n"
+    "/agents remove <alias> — remove one (it can't be re-added)\n"
+    "/agents enable <alias> — make an inactive or rejected one callable again\n"
+    "/agents off | on — switch all external agents off or on"
+)
+
+
+def _agents_command(a2a, text: str) -> str:
+    """Rinkesh's /agents controls, run in the webhook without involving the model."""
+    args = text.split()[1:]
+    if not args:
+        recs = a2a.list_agents()
+        head = f"External agents: {'ON' if a2a.is_enabled() else 'OFF'}"
+        if not recs:
+            return f"{head}\nNone registered.\n\n{AGENTS_HELP}"
+        lines = [head]
+        for r in recs:
+            extra = f" — {r['note']}" if r.get("note") else ""
+            lines.append(f"- {r['alias']} [{r['status']}] {r['card_url']}{extra}")
+        return "\n".join(lines)
+    cmd = args[0].lower()
+    if cmd in ("off", "on"):
+        a2a.set_enabled(cmd == "on")
+        return f"External agents switched {cmd.upper()}."
+    if cmd in ("remove", "enable") and len(args) == 2:
+        try:
+            rec = a2a.remove(args[1]) if cmd == "remove" else a2a.enable(args[1])
+        except KeyError:
+            return f"No agent with alias '{args[1]}'."
+        except ValueError as e:
+            return f"{e}, so it can't be enabled."
+        return f"'{args[1]}' is now {rec['status']}."
+    return AGENTS_HELP
 
 
 def _inbox_ts() -> str:
