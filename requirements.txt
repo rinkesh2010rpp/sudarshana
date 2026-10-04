@@ -13,7 +13,7 @@ langchain-openrouter
 ddgs
 # LangGraph checkpointer for the agent's conversation thread (SqliteSaver).
 langgraph-checkpoint-sqlite
-# External A2A agents (agent/a2a_agents.py); pinned, the 1.x API is new.
-a2a-sdk==1.2.1
+# External A2A agents (pinned tag); it pins a2a-sdk.
+a2a-hotplug @ git+https://github.com/rinkesh2010rpp/a2a-hotplug@v0.1.0
 # Taster: prompt-injection screen for tool results (pinned tag).
 taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev2
