@@ -278,6 +278,10 @@ async def _with_client(card_data: dict, allow_private: bool, fn):
                 streaming=False,
                 # Ask for the task back immediately; we poll it ourselves.
                 polling=True,
+                # Protocol-0.3 servers reject sends whose configuration omits
+                # acceptedOutputModes; the protobuf generator drops the empty
+                # repeated field, so state it explicitly.
+                accepted_output_modes=["text/plain"],
                 httpx_client=http,
                 supported_protocol_bindings=list(USABLE_BINDINGS),
             )
