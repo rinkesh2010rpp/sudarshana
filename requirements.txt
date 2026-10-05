@@ -1,7 +1,7 @@
 modal
 requests
 python-dotenv
-deepagents
+deepagents>=0.7.22
 langchain-openai
 # ChatOpenRouter — keeps the model's reasoning on each AIMessage and sends it
 # back on later calls (see the USE_OPENROUTER branch in setup()).
