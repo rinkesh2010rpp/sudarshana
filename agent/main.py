@@ -1191,6 +1191,9 @@ class Sudarshana:
                 backend=backend,
                 trigger=("tokens", 70_000),
                 keep=("tokens", 8_000),
+                # The class default (4000) shows the summary model only the
+                # last 4K tokens; the built-in factory passes None (all of it).
+                trim_tokens_to_summarize=None,
                 truncate_args_settings={
                     "trigger": ("tokens", 70_000),
                     "keep": ("tokens", 8_000),
