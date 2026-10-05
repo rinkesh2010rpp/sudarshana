@@ -53,7 +53,7 @@ image = (
     .pip_install(
         "requests",
         "fastapi[standard]",
-        "deepagents",
+        "deepagents>=0.7.22",
         "langchain-openai",
         "langchain-openrouter",
         "ddgs",
@@ -1018,6 +1018,7 @@ class Sudarshana:
         from deepagents.backends.filesystem import FilesystemBackend
         from deepagents.middleware.memory import MemoryMiddleware
         from deepagents.middleware.skills import SkillsMiddleware
+        from deepagents.middleware.summarization import SummarizationMiddleware
         from langchain_core.tools import tool
         from langchain_openai import ChatOpenAI
 
@@ -1168,9 +1169,33 @@ class Sudarshana:
                 max_tokens=32768,
                 timeout=600,
             )
-        # deepagents' built-in summarization triggers at 85% of the profile's
-        # max_input_tokens: 82K here → compacts the thread at ~70K tokens.
-        llm.profile = {**(llm.profile or {}), "max_input_tokens": 82_000}
+        # deepagents (>=0.7.22) refuses any call above 95% of max_input_tokens
+        # minus max_tokens: 128K here → ~88K. DeepSeek V4 takes 1M, but
+        # unpinned hosts may cap lower, so stay conservative. Summarization is
+        # set explicitly at 70K below, not as a fraction of this limit (the
+        # default 85% would sit above the ~88K budget and never get to run).
+        llm.profile = {**(llm.profile or {}), "max_input_tokens": 128_000}
+
+        # inherit_env=True so GITHUB_TOKEN and other secrets reach shell
+        # commands. virtual_mode=False so file tools and the shell agree on
+        # paths (the default remaps "/X" to "/data/X" for file tools only).
+        backend = LocalShellBackend(
+            root_dir=VOLUME_PATH, virtual_mode=False, inherit_env=True
+        )
+
+        def summarization():
+            # Replaces the built-in one by name. Compacts the thread at ~70K
+            # tokens and keeps the last ~8K, as the old 82K profile did.
+            return SummarizationMiddleware(
+                llm,
+                backend=backend,
+                trigger=("tokens", 70_000),
+                keep=("tokens", 8_000),
+                truncate_args_settings={
+                    "trigger": ("tokens", 70_000),
+                    "keep": ("tokens", 8_000),
+                },
+            )
 
         import sqlite3
 
@@ -1181,7 +1206,7 @@ class Sudarshana:
         checkpointer.setup()
         conn.execute("PRAGMA journal_mode=DELETE")
 
-        screen_middleware, subagents = _build_tool_screen()
+        screen_middleware, subagents = _build_tool_screen(inherit=[summarization()])
 
         from a2a_hotplug import A2AMiddleware
 
@@ -1196,17 +1221,17 @@ class Sudarshana:
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
-            middleware=[memory_middleware, skills_middleware, self.a2a, *screen_middleware],
+            middleware=[
+                memory_middleware,
+                skills_middleware,
+                self.a2a,
+                summarization(),
+                *screen_middleware,
+            ],
             subagents=subagents,
             tools=search_tools,
             checkpointer=checkpointer,
-            # inherit_env=True so GITHUB_TOKEN and other secrets reach shell
-            # commands. virtual_mode=False so file tools and the shell agree
-            # on paths (the default remaps "/X" to "/data/X" for file tools
-            # only).
-            backend=LocalShellBackend(
-                root_dir=VOLUME_PATH, virtual_mode=False, inherit_env=True
-            ),
+            backend=backend,
         )
 
     def _invoke(self, message: str, trigger: str):
