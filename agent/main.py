@@ -2238,21 +2238,25 @@ def inbox_api():
 
 @app.function(
     image=image,
-    # Blocks on .remote(), so needs at least weekly_freshness_checkin's own timeout.
-    timeout=1500,
+    # spawn() returns once the call is queued, so a short timeout is enough.
+    timeout=60,
     schedule=modal.Cron("0 0 * * 1", timezone="America/Los_Angeles"),
 )
 def weekly_trigger():
     # Bare cron wrapper — schedule= isn't allowed on @modal.method().
-    Sudarshana().weekly_freshness_checkin.remote()
+    # spawn(), not remote(): a blocking wrapper sat for the whole run, and
+    # when Modal preempted it the retry started a second, overlapping run.
+    Sudarshana().weekly_freshness_checkin.spawn()
 
 
 @app.function(
     image=image,
-    # Blocks on .remote(), so needs at least hourly_checkin's own timeout.
-    timeout=1500,
+    # spawn() returns once the call is queued, so a short timeout is enough.
+    timeout=60,
     schedule=modal.Cron("0 * * * *"),
 )
 def hourly_trigger():
     # Bare cron wrapper — schedule= isn't allowed on @modal.method().
-    Sudarshana().hourly_checkin.remote()
+    # spawn(), not remote(): a blocking wrapper sat for the whole run, and
+    # when Modal preempted it the retry started a second, overlapping run.
+    Sudarshana().hourly_checkin.spawn()
