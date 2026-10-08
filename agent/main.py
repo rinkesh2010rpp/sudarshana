@@ -1014,7 +1014,7 @@ class Sudarshana:
         # Runs once per container start; self.agent is reused by every
         # webhook/checkin call that container handles afterward.
         from deepagents import create_deep_agent
-        from deepagents.backends import LocalShellBackend
+        from deepagents.backends import CompositeBackend, LocalShellBackend
         from deepagents.backends.filesystem import FilesystemBackend
         from deepagents.middleware.memory import MemoryMiddleware
         from deepagents.middleware.skills import SkillsMiddleware
@@ -1179,8 +1179,16 @@ class Sudarshana:
         # inherit_env=True so GITHUB_TOKEN and other secrets reach shell
         # commands. virtual_mode=False so file tools and the shell agree on
         # paths (the default remaps "/X" to "/data/X" for file tools only).
-        backend = LocalShellBackend(
-            root_dir=VOLUME_PATH, virtual_mode=False, inherit_env=True
+        # The no-route CompositeBackend only sets artifacts_root: middleware
+        # writes compacted history and evicted tool results under
+        # <artifacts_root>/, which defaults to "/" (container disk, lost on
+        # restart). Everything else passes through to the shell backend.
+        backend = CompositeBackend(
+            default=LocalShellBackend(
+                root_dir=VOLUME_PATH, virtual_mode=False, inherit_env=True
+            ),
+            routes={},
+            artifacts_root=VOLUME_PATH,
         )
 
         def summarization():
