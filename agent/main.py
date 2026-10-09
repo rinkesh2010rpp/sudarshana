@@ -1217,7 +1217,12 @@ class Sudarshana:
         checkpointer.setup()
         conn.execute("PRAGMA journal_mode=DELETE")
 
-        screen_middleware, subagents = _build_tool_screen(inherit=[summarization()])
+        # deepagents no longer adds write_todos by default; the prompt relies on it.
+        from langchain.agents.middleware import TodoListMiddleware
+
+        screen_middleware, subagents = _build_tool_screen(
+            inherit=[summarization(), TodoListMiddleware()]
+        )
 
         from a2a_hotplug import A2AMiddleware
 
@@ -1235,6 +1240,7 @@ class Sudarshana:
             middleware=[
                 memory_middleware,
                 skills_middleware,
+                TodoListMiddleware(),
                 self.a2a,
                 summarization(),
                 *screen_middleware,
