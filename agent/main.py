@@ -59,7 +59,7 @@ image = (
         "ddgs",
         "langgraph-checkpoint-sqlite",
         # Pinned to a tag so a Taster change can't reach the agent unannounced.
-        "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev2",
+        "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev3",
         # External A2A agents. Pinned to a tag, like Taster; it pins a2a-sdk.
         "a2a-hotplug @ git+https://github.com/rinkesh2010rpp/a2a-hotplug@v0.1.0",
     )
@@ -1218,11 +1218,8 @@ class Sudarshana:
         conn.execute("PRAGMA journal_mode=DELETE")
 
         # deepagents no longer adds write_todos by default; the prompt relies on it.
+        from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
         from langchain.agents.middleware import TodoListMiddleware
-
-        screen_middleware, subagents = _build_tool_screen(
-            inherit=[summarization(), TodoListMiddleware()]
-        )
 
         from a2a_hotplug import A2AMiddleware
 
@@ -1234,18 +1231,28 @@ class Sudarshana:
             store=_a2a_store(), screen=_a2a_screen, notify=_send_telegram, log=_a2a_log
         )
 
+        main_middleware = [
+            memory_middleware,
+            skills_middleware,
+            TodoListMiddleware(),
+            self.a2a,
+            summarization(),
+        ]
+        # deepagents doesn't hand custom middleware to its auto-added
+        # general-purpose subagent, which has search_web and execute too, so
+        # declare it with its own. A declared subagent gets the main agent's
+        # model and tools but not its middleware.
+        subagent_middleware = [summarization(), TodoListMiddleware()]
+        if TOOL_SCREEN_ENABLED:
+            taster = _build_tool_screen()  # one instance, shared by both
+            main_middleware.append(taster)
+            subagent_middleware.append(taster)
+
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
-            middleware=[
-                memory_middleware,
-                skills_middleware,
-                TodoListMiddleware(),
-                self.a2a,
-                summarization(),
-                *screen_middleware,
-            ],
-            subagents=subagents,
+            middleware=main_middleware,
+            subagents=[{**GENERAL_PURPOSE_SUBAGENT, "middleware": subagent_middleware}],
             tools=search_tools,
             checkpointer=checkpointer,
             backend=backend,
@@ -1617,41 +1624,23 @@ TOOL_SCREEN_DEFAULT_RULES = [
 ]
 
 
-def _tool_screen_policy():
-    """The rule table: JEV_TOOL_SCREEN_RULES (a JSON list of rules) if set and
-    valid, else the defaults above. A bad override falls back to the defaults,
-    loudly, rather than to no screening."""
-    import json as _json
-
-    from taster_ai import Policy
-
-    raw = os.environ.get("JEV_TOOL_SCREEN_RULES", "").strip()
-    if raw:
-        try:
-            data = _json.loads(raw)
-            return Policy.from_dict({"rules": data} if isinstance(data, list) else data)
-        except Exception as e:
-            print(f"[taster] JEV_TOOL_SCREEN_RULES invalid ({e!r}); using defaults")
-    return Policy.from_dict({"rules": TOOL_SCREEN_DEFAULT_RULES})
-
-
-def _build_tool_screen(inherit=()):
-    """(middleware, subagents) for create_deep_agent; ([], None) when off.
-
-    deepagents does NOT hand new custom middleware to its auto-added
-    general-purpose subagent, and the subagent has search_web and execute
-    too, so Taster declares that subagent explicitly with the screen. An
-    explicit subagent inherits the main agent's model and tools but not its
-    middleware overrides: pass those in `inherit` (e.g. a customised
-    SummarizationMiddleware) so the subagent keeps them.
-    """
-    if not TOOL_SCREEN_ENABLED:
-        return [], None
-    from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, JsonlSink, print_sink
+def _build_tool_screen():
+    """Sudarshana's TasterMiddleware. The caller checks TOOL_SCREEN_ENABLED
+    and adds it to the main agent and to each subagent that calls tools."""
+    from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, JsonlSink, Policy, print_sink
     from taster_ai.adapters.langchain import TasterMiddleware
 
-    taster = TasterMiddleware(
-        policy=_tool_screen_policy(),
+    # Rules: JEV_TOOL_SCREEN_RULES (JSON: {"rules": [...]}) if set and valid,
+    # else the defaults above. A bad override falls back to the defaults,
+    # loudly, never to no screening.
+    policy = Policy.from_dict({"rules": TOOL_SCREEN_DEFAULT_RULES})
+    try:
+        policy = Policy.from_env("JEV_TOOL_SCREEN_RULES", default=policy)
+    except Exception as e:
+        print(f"[taster] JEV_TOOL_SCREEN_RULES invalid ({e!r}); using defaults")
+
+    return TasterMiddleware(
+        policy=policy,
         detector=FallbackDetector(
             JevDetector(
                 timeout=TOOL_SCREEN_TIMEOUT_S,
@@ -1662,7 +1651,6 @@ def _build_tool_screen(inherit=()):
         ),
         sinks=[print_sink, JsonlSink(TOOL_SCREEN_LOG_DIR)],
     )
-    return [taster], taster.subagents(inherit=inherit)
 
 
 # --- External A2A agents (a2a-hotplug) ---------------------------------------
