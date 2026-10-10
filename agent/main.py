@@ -1627,34 +1627,25 @@ TOOL_SCREEN_DEFAULT_RULES = [
 ]
 
 
-def _tool_screen_policy():
-    """The rule table: JEV_TOOL_SCREEN_RULES (a JSON list of rules) if set and
-    valid, else the defaults above. A bad override falls back to the defaults,
-    loudly, rather than to no screening."""
-    import json as _json
-
-    from taster_ai import Policy
-
-    raw = os.environ.get("JEV_TOOL_SCREEN_RULES", "").strip()
-    if raw:
-        try:
-            data = _json.loads(raw)
-            return Policy.from_dict({"rules": data} if isinstance(data, list) else data)
-        except Exception as e:
-            print(f"[taster] JEV_TOOL_SCREEN_RULES invalid ({e!r}); using defaults")
-    return Policy.from_dict({"rules": TOOL_SCREEN_DEFAULT_RULES})
-
-
 def _build_tool_screen():
     """The TasterMiddleware, or None when the screen is off. The caller adds
     it to the main agent and to each subagent that calls tools."""
     if not TOOL_SCREEN_ENABLED:
         return None
-    from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, JsonlSink, print_sink
+    from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, JsonlSink, Policy, print_sink
     from taster_ai.adapters.langchain import TasterMiddleware
 
-    taster = TasterMiddleware(
-        policy=_tool_screen_policy(),
+    # Rules: JEV_TOOL_SCREEN_RULES (JSON: {"rules": [...]}) if set and valid,
+    # else the defaults above. A bad override falls back to the defaults,
+    # loudly, never to no screening.
+    policy = Policy.from_dict({"rules": TOOL_SCREEN_DEFAULT_RULES})
+    try:
+        policy = Policy.from_env("JEV_TOOL_SCREEN_RULES", default=policy)
+    except Exception as e:
+        print(f"[taster] JEV_TOOL_SCREEN_RULES invalid ({e!r}); using defaults")
+
+    return TasterMiddleware(
+        policy=policy,
         detector=FallbackDetector(
             JevDetector(
                 timeout=TOOL_SCREEN_TIMEOUT_S,
@@ -1665,7 +1656,6 @@ def _build_tool_screen():
         ),
         sinks=[print_sink, JsonlSink(TOOL_SCREEN_LOG_DIR)],
     )
-    return taster
 
 
 # --- External A2A agents (a2a-hotplug) ---------------------------------------
