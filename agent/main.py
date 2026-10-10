@@ -1221,19 +1221,6 @@ class Sudarshana:
         from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
         from langchain.agents.middleware import TodoListMiddleware
 
-        screen = _build_tool_screen()
-        screen_middleware = [screen] if screen else []
-        # deepagents doesn't hand custom middleware to its auto-added
-        # general-purpose subagent, which has search_web and execute too, so
-        # declare it with its own. A declared subagent gets the main agent's
-        # model and tools but not its middleware.
-        subagents = [
-            {
-                **GENERAL_PURPOSE_SUBAGENT,
-                "middleware": [summarization(), TodoListMiddleware(), *screen_middleware],
-            }
-        ]
-
         from a2a_hotplug import A2AMiddleware
 
         # Registers add_agent / send_agent_task / check_agent_task itself (like
@@ -1244,18 +1231,28 @@ class Sudarshana:
             store=_a2a_store(), screen=_a2a_screen, notify=_send_telegram, log=_a2a_log
         )
 
+        main_middleware = [
+            memory_middleware,
+            skills_middleware,
+            TodoListMiddleware(),
+            self.a2a,
+            summarization(),
+        ]
+        # deepagents doesn't hand custom middleware to its auto-added
+        # general-purpose subagent, which has search_web and execute too, so
+        # declare it with its own. A declared subagent gets the main agent's
+        # model and tools but not its middleware.
+        subagent_middleware = [summarization(), TodoListMiddleware()]
+        if TOOL_SCREEN_ENABLED:
+            taster = _build_tool_screen()  # one instance, shared by both
+            main_middleware.append(taster)
+            subagent_middleware.append(taster)
+
         self.agent = create_deep_agent(
             model=llm,
             system_prompt=SYSTEM_PROMPT,
-            middleware=[
-                memory_middleware,
-                skills_middleware,
-                TodoListMiddleware(),
-                self.a2a,
-                summarization(),
-                *screen_middleware,
-            ],
-            subagents=subagents,
+            middleware=main_middleware,
+            subagents=[{**GENERAL_PURPOSE_SUBAGENT, "middleware": subagent_middleware}],
             tools=search_tools,
             checkpointer=checkpointer,
             backend=backend,
@@ -1628,10 +1625,8 @@ TOOL_SCREEN_DEFAULT_RULES = [
 
 
 def _build_tool_screen():
-    """The TasterMiddleware, or None when the screen is off. The caller adds
-    it to the main agent and to each subagent that calls tools."""
-    if not TOOL_SCREEN_ENABLED:
-        return None
+    """Sudarshana's TasterMiddleware. The caller checks TOOL_SCREEN_ENABLED
+    and adds it to the main agent and to each subagent that calls tools."""
     from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, JsonlSink, Policy, print_sink
     from taster_ai.adapters.langchain import TasterMiddleware
 
