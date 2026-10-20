@@ -996,6 +996,9 @@ RECURSION_LIMIT = 200
     volumes={VOLUME_PATH: volume},
     # Room for a couple of slow reasoning calls (up to 600s each) in one turn.
     timeout=1500,
+    # One container, so hourly/weekly/Telegram turns queue instead of running
+    # side by side and clobbering each other's writes to state.md and the log.
+    max_containers=1,
 )
 class Sudarshana:
     @modal.enter()
