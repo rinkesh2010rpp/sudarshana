@@ -48,6 +48,10 @@ image = (
     .run_commands(
         "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
         "apt-get install -y nodejs",
+        # Fixed commit identity: a self-set noreply email once linked agent
+        # commits to an unrelated real GitHub user. .invalid never resolves.
+        "git config --global user.name \"Sudarshana (Rinkesh's autonomous agent)\"",
+        "git config --global user.email sudarshana@agent.invalid",
     )
     # Keep in sync with requirements.txt.
     .pip_install(
@@ -368,7 +372,8 @@ BOUNDS BY REPO
   lands.
 
 Push every commit to origin the same cycle you make it — never leave
-work only in the local checkout. Verify that external actions (pushes,
+work only in the local checkout. Your git identity is preset; never run
+`git config user.*`. Verify that external actions (pushes,
 merges, deploys, PRs) actually succeeded before reporting them done.
 
 Be direct and precise. Be honest about your limitations rather than
