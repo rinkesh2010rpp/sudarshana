@@ -1077,6 +1077,10 @@ class Sudarshana:
             except TimeoutException:
                 return "(no results: DuckDuckGo search timed out — try again shortly)"
             except DDGSException as e:
+                # ddgs raises (not returns []) when a query matches nothing;
+                # "search failed" made the agent misread that as throttling.
+                if "no results" in str(e).lower():
+                    return "(no results for this query — try different wording)"
                 return f"(search failed: {e})"
 
             results = []
