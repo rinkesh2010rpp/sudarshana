@@ -1,6 +1,8 @@
 modal
 requests
 python-dotenv
+# status-api and inbox-api web endpoints.
+fastapi[standard]
 deepagents>=0.7.22
 langchain-openai
 # ChatOpenRouter — keeps the model's reasoning on each AIMessage and sends it
