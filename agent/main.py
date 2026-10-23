@@ -21,6 +21,8 @@ unconditionally, and the full message trace is printed to the modal logs.
 
 External A2A agents (find, register, call at runtime) come from the
 a2a-hotplug package; Rinkesh controls them with /agents on Telegram.
+Two public web endpoints share the app: status-api (read-only turn
+status) and inbox-api (the visitor inbox). See README.md.
 
 The agent is built once per container in Sudarshana.setup(); both
 telegram_webhook and hourly_checkin reuse that instance. hourly_trigger
