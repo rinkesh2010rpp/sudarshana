@@ -2352,6 +2352,22 @@ def control_api():
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
 
+    # Logs and action files ship whole (sessions are paged); cap them so one
+    # runaway file can't blow up a response. Largest today is ~150 KiB.
+    MAX_FILE_CHARS = 2_000_000
+
+    def _read_capped(path: str) -> dict | None:
+        if not _os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(MAX_FILE_CHARS + 1)
+        truncated = len(text) > MAX_FILE_CHARS
+        return {
+            "size": _os.path.getsize(path),
+            "truncated": truncated,
+            "content": text[:MAX_FILE_CHARS],
+        }
+
     def _list_files(root: str) -> list:
         if not _os.path.isdir(root):
             return []
@@ -2394,7 +2410,7 @@ def control_api():
             lines = f.readlines()  # reading in memory is fine; only a window ships
         total = len(lines)
         if tail > 0:
-            n = min(int(tail), 2000)
+            n = min(int(tail), 2000, total)
             body = lines[-n:]
             _audit(user, f"read_session {session_id} tail={n}")
             return {
@@ -2428,11 +2444,11 @@ def control_api():
         if not _DATE_RE.match(log_date):
             raise HTTPException(status_code=400, detail="invalid log date")
         path = _safe_join(LOG_DIR, f"{log_date}.md")
-        text = _read_text(path)
-        if text is None:
+        doc = _read_capped(path)
+        if doc is None:
             raise HTTPException(status_code=404, detail="no log for that date")
         _audit(user, f"read_log {log_date}")
-        return {"date": log_date, "size": len(text), "content": text}
+        return {"date": log_date, **doc}
 
     @web_app.get("/api/control/state")
     def read_state(user: dict = Depends(_owner)):
@@ -2461,11 +2477,11 @@ def control_api():
         if not _ACTION_RE.match(action_id):
             raise HTTPException(status_code=400, detail="invalid action id")
         path = _safe_join(ACTION_DIR, action_id)
-        text = _read_text(path)
-        if text is None:
+        doc = _read_capped(path)
+        if doc is None:
             raise HTTPException(status_code=404, detail="no such action file")
         _audit(user, f"read_action {action_id}")
-        return {"id": action_id, "size": len(text), "content": text}
+        return {"id": action_id, **doc}
 
     return web_app
 
