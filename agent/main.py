@@ -2241,6 +2241,253 @@ def inbox_api():
     return web_app
 
 
+def _control_secret() -> modal.Secret:
+    # Only the owner allowlist, not the whole .env: control-api is public-facing
+    # and needs none of the API keys. Same .env lookup as Secret.from_dotenv()
+    # (cwd only). In the container the deployed secret is used, so skip the read.
+    if not modal.is_local():
+        return modal.Secret.from_dict({})
+    from dotenv import dotenv_values, find_dotenv
+
+    email = dotenv_values(find_dotenv(".env", usecwd=True)).get("CONTROL_OWNER_EMAIL") or ""
+    return modal.Secret.from_dict({"CONTROL_OWNER_EMAIL": email})
+
+
+@app.function(image=image, volumes={VOLUME_PATH: volume}, secrets=[_control_secret()])
+@modal.asgi_app(label="control-api")
+def control_api():
+    """Private control endpoint: read-only view over the agent's own files.
+
+    This is the data side of the /control page on the gateway. Auth is
+    forward-auth to the site's Netlify Identity: the SPA sends the Identity
+    access JWT, and this API re-validates it against
+    https://sudarshanaai.netlify.app/.netlify/identity/user before serving
+    anything. (GoTrue signs tokens HS256 with a server-side secret — there is
+    no public JWKS — so re-validating via the live endpoint is the only sound
+    check.) The validated user's email must then match CONTROL_OWNER_EMAIL
+    from .env. No write endpoints; every path is validated against a fixed
+    directory allowlist and strict basename rules — no traversal.
+    """
+    from fastapi import Depends, FastAPI, Header, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+    import os as _os
+    import re as _re
+    import time as _time
+    from datetime import datetime as _datetime, timezone as _timezone
+    import requests as _requests
+
+    CONV_DIR = _os.path.join(VOLUME_PATH, "conversation_history")
+    LOG_DIR = _os.path.join(VOLUME_PATH, "logs")
+    ACTION_DIR = _os.path.join(VOLUME_PATH, "actions")
+    MEMORY_DIR = _os.path.join(VOLUME_PATH, "memory")
+    # The public site the panel lives on and which hosts the Identity backend.
+    IDENTITY_BASE = "https://sudarshanaai.netlify.app"
+    OWNER_EMAIL = _os.environ.get("CONTROL_OWNER_EMAIL", "").strip().lower()
+
+    web_app = FastAPI(title="sudarshana-control")
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["https://sudarshanaai.netlify.app"],
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["authorization", "accept"],
+    )
+
+    _SESSION_RE = _re.compile(r"^session_[0-9a-f]{32}\.md$")
+    _DATE_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    _ACTION_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
+
+    def _safe_join(root: str, name: str) -> str:
+        # Strict basename + extension allowlist: no separators, no leading
+        # dots, no traversal. root is a fixed allowlisted constant.
+        if not name:
+            raise HTTPException(status_code=400, detail="empty name")
+        if name != _os.path.basename(name) or name in (".", "..") or name.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid name")
+        if "/" in name or "\\" in name or "\x00" in name:
+            raise HTTPException(status_code=400, detail="invalid name")
+        return _os.path.join(root, name)
+
+    def _owner(authorization: str | None = Header(default=None, alias="Authorization")):
+        if not OWNER_EMAIL:
+            raise HTTPException(
+                status_code=503,
+                detail="CONTROL_OWNER_EMAIL not configured — set it in .env and redeploy",
+            )
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="missing bearer token")
+        token = authorization.split(" ", 1)[1].strip()
+        if not token:
+            raise HTTPException(status_code=401, detail="empty bearer token")
+        try:
+            resp = _requests.get(
+                f"{IDENTITY_BASE}/.netlify/identity/user",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+        except _requests.RequestException:
+            raise HTTPException(status_code=503, detail="identity service unreachable")
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="invalid token")
+        try:
+            user = resp.json()
+        except ValueError:
+            raise HTTPException(status_code=503, detail="identity service returned invalid JSON")
+        email = (user.get("email") or "").strip().lower()
+        if email != OWNER_EMAIL:
+            raise HTTPException(
+                status_code=403, detail="authenticated, but not the control owner"
+            )
+        # A warm container sees the Volume as of its start; reload so the panel
+        # shows what the agent has committed since. Only after auth, so
+        # anonymous requests can't drive reloads.
+        volume.reload()
+        return user
+
+    def _audit(user: dict, what: str) -> None:
+        # Best-effort request trace in the Modal logs only — never in a payload.
+        print(f"[control-api] {user.get('email')} {what} at {_time.time():.0f}")
+
+    def _read_text(path: str) -> str | None:
+        if not _os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    # Logs and action files ship whole (sessions are paged); cap them so one
+    # runaway file can't blow up a response. Largest today is ~150 KiB.
+    MAX_FILE_CHARS = 2_000_000
+
+    def _read_capped(path: str) -> dict | None:
+        if not _os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(MAX_FILE_CHARS + 1)
+        truncated = len(text) > MAX_FILE_CHARS
+        return {
+            "size": _os.path.getsize(path),
+            "truncated": truncated,
+            "content": text[:MAX_FILE_CHARS],
+        }
+
+    def _list_files(root: str) -> list:
+        if not _os.path.isdir(root):
+            return []
+        out = []
+        for name in sorted(_os.listdir(root)):
+            p = _os.path.join(root, name)
+            if not _os.path.isfile(p):
+                continue
+            st = _os.stat(p)
+            out.append(
+                {
+                    "id": name,
+                    "size": st.st_size,
+                    "modified": _datetime.fromtimestamp(st.st_mtime, _timezone.utc).isoformat(),
+                }
+            )
+        return out
+
+    @web_app.get("/api/control/sessions")
+    def list_sessions(user: dict = Depends(_owner)):
+        _audit(user, "list_sessions")
+        return {"sessions": _list_files(CONV_DIR)}
+
+    @web_app.get("/api/control/sessions/{session_id}")
+    def read_session(
+        session_id: str,
+        user: dict = Depends(_owner),
+        page: int = 1,
+        per_page: int = 200,
+        tail: int = 0,
+    ):
+        # Session transcripts grow every turn (the live one is ~8 MB); always
+        # slice server-side and never ship more than a bounded window.
+        if not _SESSION_RE.match(session_id):
+            raise HTTPException(status_code=400, detail="invalid session id")
+        path = _safe_join(CONV_DIR, session_id)
+        if not _os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="no such session")
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()  # reading in memory is fine; only a window ships
+        total = len(lines)
+        if tail > 0:
+            n = min(int(tail), 2000, total)
+            body = lines[-n:]
+            _audit(user, f"read_session {session_id} tail={n}")
+            return {
+                "id": session_id,
+                "total_lines": total,
+                "start_line": total - n,
+                "end_line": total,
+                "lines": body,
+            }
+        per = max(1, min(int(per_page), 500))
+        pg = max(1, int(page))
+        start = (pg - 1) * per
+        _audit(user, f"read_session {session_id} page={pg}")
+        return {
+            "id": session_id,
+            "total_lines": total,
+            "page": pg,
+            "per_page": per,
+            "start_line": start,
+            "end_line": min(total, start + per),
+            "lines": lines[start : start + per],
+        }
+
+    @web_app.get("/api/control/logs")
+    def list_logs(user: dict = Depends(_owner)):
+        _audit(user, "list_logs")
+        return {"logs": _list_files(LOG_DIR)}
+
+    @web_app.get("/api/control/logs/{log_date}")
+    def read_log(log_date: str, user: dict = Depends(_owner)):
+        if not _DATE_RE.match(log_date):
+            raise HTTPException(status_code=400, detail="invalid log date")
+        path = _safe_join(LOG_DIR, f"{log_date}.md")
+        doc = _read_capped(path)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="no log for that date")
+        _audit(user, f"read_log {log_date}")
+        return {"date": log_date, **doc}
+
+    @web_app.get("/api/control/state")
+    def read_state(user: dict = Depends(_owner)):
+        _audit(user, "read_state")
+        files = {
+            "state_md": _os.path.join(MEMORY_DIR, "state.md"),
+            "decisions_md": _os.path.join(MEMORY_DIR, "decisions.md"),
+            "roadmap_md": _os.path.join(VOLUME_PATH, "ROADMAP.md"),
+        }
+        out, missing = {}, []
+        for key, path in files.items():
+            text = _read_text(path)
+            if text is None:
+                missing.append(key)
+            else:
+                out[key] = text
+        return {"files": out, "missing": missing}
+
+    @web_app.get("/api/control/actions")
+    def list_actions(user: dict = Depends(_owner)):
+        _audit(user, "list_actions")
+        return {"actions": _list_files(ACTION_DIR)}
+
+    @web_app.get("/api/control/actions/{action_id}")
+    def read_action(action_id: str, user: dict = Depends(_owner)):
+        if not _ACTION_RE.match(action_id):
+            raise HTTPException(status_code=400, detail="invalid action id")
+        path = _safe_join(ACTION_DIR, action_id)
+        doc = _read_capped(path)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="no such action file")
+        _audit(user, f"read_action {action_id}")
+        return {"id": action_id, **doc}
+
+    return web_app
+
+
 @app.function(
     image=image,
     # spawn() returns once the call is queued, so a short timeout is enough.
