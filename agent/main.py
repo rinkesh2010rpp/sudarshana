@@ -2239,7 +2239,19 @@ def inbox_api():
     return web_app
 
 
-@app.function(image=image, volumes={VOLUME_PATH: volume}, secrets=[modal.Secret.from_dotenv()])
+def _control_secret() -> modal.Secret:
+    # Only the owner allowlist, not the whole .env: control-api is public-facing
+    # and needs none of the API keys. Same .env lookup as Secret.from_dotenv()
+    # (cwd only). In the container the deployed secret is used, so skip the read.
+    if not modal.is_local():
+        return modal.Secret.from_dict({})
+    from dotenv import dotenv_values, find_dotenv
+
+    email = dotenv_values(find_dotenv(".env", usecwd=True)).get("CONTROL_OWNER_EMAIL") or ""
+    return modal.Secret.from_dict({"CONTROL_OWNER_EMAIL": email})
+
+
+@app.function(image=image, volumes={VOLUME_PATH: volume}, secrets=[_control_secret()])
 @modal.asgi_app(label="control-api")
 def control_api():
     """Private control endpoint: read-only view over the agent's own files.
@@ -2324,6 +2336,10 @@ def control_api():
             raise HTTPException(
                 status_code=403, detail="authenticated, but not the control owner"
             )
+        # A warm container sees the Volume as of its start; reload so the panel
+        # shows what the agent has committed since. Only after auth, so
+        # anonymous requests can't drive reloads.
+        volume.reload()
         return user
 
     def _audit(user: dict, what: str) -> None:
@@ -2380,6 +2396,7 @@ def control_api():
         if tail > 0:
             n = min(int(tail), 2000)
             body = lines[-n:]
+            _audit(user, f"read_session {session_id} tail={n}")
             return {
                 "id": session_id,
                 "total_lines": total,
