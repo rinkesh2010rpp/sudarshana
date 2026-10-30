@@ -14,12 +14,12 @@ checkpointed conversation thread.
 
 ```
 Telegram ──► telegram_webhook ──spawn──► process_message ─┐
-Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ──┼─► Sudarshana._invoke ─► deep agent
-Cron Mon 00:00 PT ─► weekly_trigger ──spawn──► weekly_freshness_checkin ┘        │
+Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ──┴─► Sudarshana._invoke ─► deep agent
+                                                                                 │
                                                                   final message ──► Telegram
 ```
 
-- **One container (`max_containers=1`).** Telegram, hourly and weekly turns
+- **One container (`max_containers=1`).** Telegram and hourly turns
   queue, so two of them never write `state.md` or the day's log at the same
   time. A turn can run for up to 1500 s.
 - **Triggers and the webhook call `spawn()` and return right away.** A webhook
@@ -31,7 +31,7 @@ Cron Mon 00:00 PT ─► weekly_trigger ──spawn──► weekly_freshness_ch
   are dropped without a reply. `/agents …` commands go straight to the A2A
   controls and never reach the model.
 - **What the cycles do is set by prompt, not code:** `SYSTEM_PROMPT`,
-  `HOURLY_TASK` and `WEEKLY_FRESHNESS_TASK` in `main.py`.
+  `SYSTEM_PROMPT` and `HOURLY_TASK` in `main.py`.
 
 ## The agent
 
