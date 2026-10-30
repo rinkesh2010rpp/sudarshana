@@ -400,21 +400,6 @@ HOURLY_TASK = (
 )
 
 
-# Change what the weekly freshness wake-up does by editing this, not code.
-WEEKLY_FRESHNESS_TASK = (
-    "This is your scheduled weekly freshness check-in. Your job is to keep the "
-    "retrieval layer honest and current, cheaply and bounded. Read "
-    "/data/ROADMAP.md, /data/memory/state.md, and /data/memory/decisions.md "
-    "(and the active initiative's action file if state.md points to one). Verify "
-    "every pointer and index in state.md still links to a real, current canonical "
-    "file and still agrees with it; if anything drifted, consolidate it (the cheap, "
-    "bounded version of a compile — fix state.md, do not re-architect). Then append "
-    "a line to today's /data/logs/<date>.md recording what you checked and what, if "
-    "anything, you corrected. Do not do open-ended research or start new work — this "
-    "is a bounded freshness pass, not a work session."
-)
-
-
 def _build_timing_handler():
     """Log every model call and tool call with its duration to modal app
     logs — the only visibility into which step of invoke() is slow."""
@@ -979,7 +964,7 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
 
 
 # --- Conversation thread: LangGraph checkpointer -----------------------------
-# Every turn — Telegram message, hourly and weekly wake-up — runs on one
+# Every turn — Telegram message or hourly wake-up — runs on one
 # checkpointed thread, so a reply ("yes, do it") sees the conversation before
 # it, including the wake-up report it answers. The thread keeps everything —
 # tool calls and results too; deepagents' built-in SummarizationMiddleware
@@ -1003,7 +988,7 @@ RECURSION_LIMIT = 200
     volumes={VOLUME_PATH: volume},
     # Room for a couple of slow reasoning calls (up to 600s each) in one turn.
     timeout=1500,
-    # One container, so hourly/weekly/Telegram turns queue instead of running
+    # One container, so hourly/Telegram turns queue instead of running
     # side by side and clobbering each other's writes to state.md and the log.
     max_containers=1,
 )
@@ -1366,20 +1351,6 @@ class Sudarshana:
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(_turn_key, "done", "hourly turn finished")
-        volume.commit()
-
-    @modal.method()
-    def weekly_freshness_checkin(self):
-        import time
-
-        started = time.monotonic()
-        print("[timing] weekly_freshness_checkin started")
-
-        _turn_key = _status_turn_start("running-hourly")
-        self._invoke(WEEKLY_FRESHNESS_TASK, "weekly")
-
-        print(f"[timing] weekly_freshness_checkin finished in {time.monotonic() - started:.1f}s")
-        _status_turn_end(_turn_key, "done", "weekly freshness turn finished")
         volume.commit()
 
 
@@ -2486,19 +2457,6 @@ def control_api():
         return {"id": action_id, **doc}
 
     return web_app
-
-
-@app.function(
-    image=image,
-    # spawn() returns once the call is queued, so a short timeout is enough.
-    timeout=60,
-    schedule=modal.Cron("0 0 * * 1", timezone="America/Los_Angeles"),
-)
-def weekly_trigger():
-    # Bare cron wrapper — schedule= isn't allowed on @modal.method().
-    # spawn(), not remote(): a blocking wrapper sat for the whole run, and
-    # when Modal preempted it the retry started a second, overlapping run.
-    Sudarshana().weekly_freshness_checkin.spawn()
 
 
 @app.function(
