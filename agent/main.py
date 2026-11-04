@@ -93,6 +93,9 @@ them:
   either a standing rule below, or Rinkesh's explicit go-ahead.
 - You never push to or merge your own source's main branch. Changes to
   your own code go up as a pull request for Rinkesh to review.
+- You never write the value of a secret, API key or token into a file, a
+  commit or a message, and never send one to any host except the one that
+  issued it. Using $GITHUB_TOKEN to authenticate to GitHub is fine.
 - You are honest about what you did, what failed, and what you are
   unsure of — especially when it would be easier not to be.
 - Everything you think, say, and do in a turn is visible to Rinkesh.
@@ -1602,6 +1605,19 @@ TOOL_SCREEN_DEFAULT_SCOPE = {
     ]
 }
 
+# Rinkesh's firm rules, checked against tool calls before they run. Each one
+# matches a rule in SYSTEM_PROMPT, so the agent knows what it's held to: change
+# both together. Each must be checkable from one call: Jev sees the tool and its arguments, not the conversation. This is
+# sent to Jev with every checked call, so keep secrets out of it. It lives in
+# code for the same reason as the scope above: never on /data.
+TOOL_CONSTITUTION = """\
+Never push to or merge the main branch of the sudarshana repository, Sudarshana's own source. Changes to it go on a branch, as a pull request. Pushing to or merging main of the sudarshana-gateway repository is allowed.
+Never send an external agent anything from /data/memory, credentials, or personal details about Rinkesh.
+Never write the value of a secret, API key or token into a file, a commit or a message, and never send one to any host except the one that issued it. Using $GITHUB_TOKEN to authenticate to GitHub is allowed.
+Never pay for or sign up to anything an agent offers.
+
+If a git push or merge touches main and the call doesn't show which repository it is in, answer unclear."""
+
 
 def _injection_judge(title: str):
     """Jev first, then Taster's free patterns, so a Jev outage still catches
@@ -1623,7 +1639,7 @@ def _build_tool_screen():
     and adds it to the main agent and to each subagent that calls tools."""
     import json
 
-    from taster_ai import Injection, JsonlSink, Scope, print_sink
+    from taster_ai import Constitution, Injection, JsonlSink, Scope, print_sink
     from taster_ai.adapters.langchain import TasterMiddleware
 
     # Scope: JEV_TOOL_SCREEN_RULES (JSON: {"tool_result": [...]}) if set and
@@ -1639,7 +1655,21 @@ def _build_tool_screen():
             print(f"[taster] JEV_TOOL_SCREEN_RULES invalid ({e!r}); using defaults")
 
     return TasterMiddleware(
-        checks=[Injection(scope=scope, judge=_injection_judge("sudarshana-tool-screen"))],
+        checks=[
+            Injection(scope=scope, judge=_injection_judge("sudarshana-tool-screen")),
+            # Every tool call, in shadow: logs what it would block and changes
+            # nothing. Give it a scope to enforce once the logs look right on
+            # real traffic. Review `would=blocked` and also `label=unclear`: an
+            # unclear verdict logs as `would=passed`. Jev alone: InjectionPatterns ignores the
+            # standard, so it can't stand in here. While Jev is down, calls run
+            # and log the error.
+            Constitution(
+                TOOL_CONSTITUTION,
+                timeout=TOOL_SCREEN_TIMEOUT_S,
+                title="sudarshana-constitution",
+                referer="https://github.com/rinkesh2010rpp/sudarshana",
+            ),
+        ],
         sinks=[print_sink, JsonlSink(TOOL_SCREEN_LOG_DIR)],
     )
 
