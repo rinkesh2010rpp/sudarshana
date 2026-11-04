@@ -47,7 +47,7 @@ Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ─
 | Subagent | The general-purpose `task` subagent, declared with its own summarization, todos and tool screen. |
 | Tools | File tools plus `execute`, `search_web` (DuckDuckGo via `ddgs`), `inbox_review` / `inbox_set_status`, and the A2A tools. |
 | A2A | [a2a-hotplug](https://github.com/rinkesh2010rpp/a2a-hotplug) adds `add_agent` / `send_agent_task` / `check_agent_task`. Its store is the `sudarshana-a2a-agents` `modal.Dict`, kept alive by the hourly turn. |
-| Tool screen | [Taster](https://github.com/rinkesh2010rpp/taster-ai) checks tool results for prompt injection (Jev with a pattern-matching fallback) when `JEV_TOOL_SCREEN=1`. It enforces on `search_web`, network-touching `execute`, and A2A replies. Scope: `TOOL_SCREEN_DEFAULT_SCOPE`, or override it with `JEV_TOOL_SCREEN_RULES` (JSON, same shape). |
+| Tool screen | [Taster](https://github.com/rinkesh2010rpp/taster-ai) checks tool results for prompt injection (Jev with a pattern-matching fallback) when `JEV_TOOL_SCREEN=1`. It enforces on `search_web`, network-touching `execute`, and A2A replies. Scope: `TOOL_SCREEN_DEFAULT_SCOPE`, or override it with `JEV_TOOL_SCREEN_RULES` (JSON, same shape). The same switch also checks every tool call against `TOOL_CONSTITUTION`, in shadow mode: it logs what it would block and changes nothing. |
 
 Every turn also gets a fresh `Current time:` system message, plus the visitor
 inbox intake when there is anything in it.
