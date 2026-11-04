@@ -65,7 +65,7 @@ image = (
         "ddgs",
         "langgraph-checkpoint-sqlite",
         # Pinned to a tag so a Taster change can't reach the agent unannounced.
-        "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.1.0.dev3",
+        "taster-ai[langchain] @ git+https://github.com/rinkesh2010rpp/taster-ai@v0.2.0.dev0",
         # External A2A agents. Pinned to a tag, like Taster; it pins a2a-sdk.
         "a2a-hotplug @ git+https://github.com/rinkesh2010rpp/a2a-hotplug@v0.1.0",
     )
@@ -1548,13 +1548,14 @@ def _jev_input_hash(text: str) -> str:
 # --- Taster: prompt-injection screen for tool results -----------------------
 # Every tool result passes through Taster (github.com/rinkesh2010rpp/taster-ai,
 # the package this screen grew into), on the main agent AND the
-# general-purpose subagent. The rule table below decides per tool whether a
-# result is screened; screening asks Jev whether the text tries to hijack the
-# reader, and in enforce mode withholds a confident `injection` result or
-# wraps an uncertain one as untrusted data. If Jev is down, Taster's free
-# heuristic answers instead of the result passing through unscreened.
+# general-purpose subagent. The scope below decides per tool whether a result
+# is screened; screening asks Jev whether the text breaks Taster's injection
+# standard (does it try to hijack the reader), and in enforce mode withholds a
+# confident `breaks` result or wraps an uncertain one as untrusted data. If Jev
+# is down, Taster's free InjectionPatterns answers instead of the result
+# passing through unscreened.
 #
-# The rules live in code (or the JEV_TOOL_SCREEN_RULES env var, from the Modal
+# The scope lives in code (or the JEV_TOOL_SCREEN_RULES env var, from the Modal
 # secret) and NEVER on /data: the agent can write anywhere on the Volume, so an
 # injection that got through could otherwise switch its own screen off.
 #
@@ -1567,62 +1568,78 @@ TOOL_SCREEN_TIMEOUT_S = float(os.environ.get("JEV_TOOL_SCREEN_TIMEOUT_S", "5"))
 # existing volume.commit().
 TOOL_SCREEN_LOG_DIR = os.path.join(VOLUME_PATH, "tool-screen")
 
-# First matching rule wins. Fields:
+# A Taster scope: only the tool_result stage, so tool calls aren't checked.
+# First matching target wins, and a tool no target matches isn't screened.
+# Fields:
 #   tool       fnmatch pattern on the tool name
 #   mode       "pass"    — not screened
 #              "shadow"  — screened and logged, result unchanged
 #              "enforce" — screened, logged, and acted on
-#   when_args  optional {arg_name: regex}: the rule matches only if every named
-#              arg matches (re.search), e.g. `execute` only when the command
-#              touched the network. A non-matching call falls to later rules.
-#   threshold  min confidence for an `injection` verdict to withhold the result
+#   when_args  optional {arg_name: regex}: the target matches only if every
+#              named arg matches (re.search), e.g. `execute` only when the
+#              command touched the network. A non-matching call falls to later
+#              targets.
+#   threshold  min confidence for a `breaks` verdict to withhold the result
 #   on_error   "label" (pass through, marked unscreened) or "block" (withhold)
-#              when no verdict can be had (Jev and the heuristic both failed)
+#              when no verdict can be had (Jev and the patterns both failed)
 # Enforced since 2026-09-27, after a live shadow test on five test pages: both
 # injections scored 1.0, an article about prompt injection scored clean 0.99.
 # A new tool should start in shadow until its logs look right.
-TOOL_SCREEN_DEFAULT_RULES = [
-    {"tool": "search_web", "mode": "enforce", "threshold": 0.85, "on_error": "label"},
-    {
-        "tool": "execute",
-        "mode": "enforce",
-        "threshold": 0.85,
-        "on_error": "label",
-        "when_args": {"command": r"\bcurl\b|\bwget\b|https?://|\bgit\s+(clone|pull|fetch)\b|\bgh\s"},
-    },
-    # External agents' replies are written by strangers, so these start in
-    # enforce rather than shadow.
-    {"tool": "send_agent_task", "mode": "enforce", "threshold": 0.85, "on_error": "label"},
-    {"tool": "check_agent_task", "mode": "enforce", "threshold": 0.85, "on_error": "label"},
-    {"tool": "*", "mode": "pass"},
-]
+TOOL_SCREEN_DEFAULT_SCOPE = {
+    "tool_result": [
+        {"tool": "search_web", "mode": "enforce", "threshold": 0.85, "on_error": "label"},
+        {
+            "tool": "execute",
+            "mode": "enforce",
+            "threshold": 0.85,
+            "on_error": "label",
+            "when_args": {"command": r"\bcurl\b|\bwget\b|https?://|\bgit\s+(clone|pull|fetch)\b|\bgh\s"},
+        },
+        # External agents' replies are written by strangers, so these start in
+        # enforce rather than shadow.
+        {"tool": "send_agent_task", "mode": "enforce", "threshold": 0.85, "on_error": "label"},
+        {"tool": "check_agent_task", "mode": "enforce", "threshold": 0.85, "on_error": "label"},
+    ]
+}
+
+
+def _injection_judge(title: str):
+    """Jev first, then Taster's free patterns, so a Jev outage still catches
+    the obvious attacks."""
+    from taster_ai import FallbackDetector, InjectionPatterns, JevDetector
+
+    return FallbackDetector(
+        JevDetector(
+            timeout=TOOL_SCREEN_TIMEOUT_S,
+            title=title,
+            referer="https://github.com/rinkesh2010rpp/sudarshana",
+        ),
+        InjectionPatterns(),
+    )
 
 
 def _build_tool_screen():
     """Sudarshana's TasterMiddleware. The caller checks TOOL_SCREEN_ENABLED
     and adds it to the main agent and to each subagent that calls tools."""
-    from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, JsonlSink, Policy, print_sink
+    import json
+
+    from taster_ai import Injection, JsonlSink, Scope, print_sink
     from taster_ai.adapters.langchain import TasterMiddleware
 
-    # Rules: JEV_TOOL_SCREEN_RULES (JSON: {"rules": [...]}) if set and valid,
-    # else the defaults above. A bad override falls back to the defaults,
-    # loudly, never to no screening.
-    policy = Policy.from_dict({"rules": TOOL_SCREEN_DEFAULT_RULES})
-    try:
-        policy = Policy.from_env("JEV_TOOL_SCREEN_RULES", default=policy)
-    except Exception as e:
-        print(f"[taster] JEV_TOOL_SCREEN_RULES invalid ({e!r}); using defaults")
+    # Scope: JEV_TOOL_SCREEN_RULES (JSON: {"tool_result": [...]}) if set and
+    # valid, else the default above. A bad override falls back to the default,
+    # loudly, never to no screening. It's a scope, not Taster's checks_from_env,
+    # because checks loaded from JSON are judged by Jev alone, with no fallback.
+    scope = Scope.from_dict(TOOL_SCREEN_DEFAULT_SCOPE)
+    override = os.environ.get("JEV_TOOL_SCREEN_RULES", "").strip()
+    if override:
+        try:
+            scope = Scope.from_dict(json.loads(override))
+        except Exception as e:
+            print(f"[taster] JEV_TOOL_SCREEN_RULES invalid ({e!r}); using defaults")
 
     return TasterMiddleware(
-        policy=policy,
-        detector=FallbackDetector(
-            JevDetector(
-                timeout=TOOL_SCREEN_TIMEOUT_S,
-                title="sudarshana-tool-screen",
-                referer="https://github.com/rinkesh2010rpp/sudarshana",
-            ),
-            HeuristicDetector(),
-        ),
+        checks=[Injection(scope=scope, judge=_injection_judge("sudarshana-tool-screen"))],
         sinks=[print_sink, JsonlSink(TOOL_SCREEN_LOG_DIR)],
     )
 
@@ -1661,20 +1678,13 @@ def _a2a_screen(text: str) -> bool:
     nothing is stored and a later retry can pass. Runs even when the tool
     screen is off, because a passed card's text goes into the system message
     on every call."""
-    from taster_ai import FallbackDetector, HeuristicDetector, JevDetector, ToolContext
+    from taster_ai import INJECTION_STANDARD
 
-    verdict = FallbackDetector(
-        JevDetector(
-            timeout=TOOL_SCREEN_TIMEOUT_S,
-            title="sudarshana-a2a-card-screen",
-            referer="https://github.com/rinkesh2010rpp/sudarshana",
-        ),
-        HeuristicDetector(),
-    ).safe_detect(text, ToolContext(tool="add_agent"))
+    verdict = _injection_judge("sudarshana-a2a-card-screen").safe_detect(text, INJECTION_STANDARD)
     print(f"[a2a] card screen: {verdict.label} ({verdict.confidence:.2f}, {verdict.detector})")
-    if verdict.label == "clean":
+    if verdict.label == "follows":
         return True
-    if verdict.label == "injection" and verdict.confidence >= A2A_CARD_SCREEN_THRESHOLD:
+    if verdict.label == "breaks" and verdict.confidence >= A2A_CARD_SCREEN_THRESHOLD:
         return False
     raise RuntimeError(f"card screen unclear ({verdict.label}, {verdict.confidence:.2f})")
 
