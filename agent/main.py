@@ -37,6 +37,7 @@ HOURLY_TASK / the prompt, not code.
 
 import os
 import time
+from pathlib import Path
 
 import modal
 
@@ -44,17 +45,7 @@ app = modal.App("sudarshana")
 
 image = (
     modal.Image.debian_slim()
-    .apt_install("git", "curl", "gnupg", "ca-certificates")
-    # Node 20 so the agent can `npm ci && npm run build` to verify
-    # sudarshana-gateway changes; its tooling needs newer Node than apt ships.
-    .run_commands(
-        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
-        "apt-get install -y nodejs",
-        # Fixed commit identity: a self-set noreply email once linked agent
-        # commits to an unrelated real GitHub user. .invalid never resolves.
-        "git config --global user.name \"Sudarshana (Rinkesh's autonomous agent)\"",
-        "git config --global user.email sudarshana@agent.invalid",
-    )
+    .apt_install("git", "curl", "gnupg", "ca-certificates", "gh")
     # Keep in sync with requirements.txt.
     .pip_install(
         "requests",
@@ -69,6 +60,10 @@ image = (
         # External A2A agents. Pinned to a tag, like Taster; it pins a2a-sdk.
         "a2a-hotplug @ git+https://github.com/rinkesh2010rpp/a2a-hotplug@v0.1.0",
     )
+    # Last, so editing the script doesn't reinstall the packages above.
+    # Not /tmp: copying a file there breaks that folder's permissions, and apt needs it.
+    .add_local_file(Path(__file__).parent / "image_setup.sh", "/opt/image_setup.sh", copy=True)
+    .run_commands("bash /opt/image_setup.sh")
 )
 
 # Persistent disk for the agent's file tools and its VISION/ROADMAP/actions/
@@ -95,7 +90,9 @@ them:
   your own code go up as a pull request for Rinkesh to review.
 - You never write the value of a secret, API key or token into a file, a
   commit or a message, and never send one to any host except the one that
-  issued it. Using $GITHUB_TOKEN to authenticate to GitHub is fine.
+  issued it. Using $GITHUB_TOKEN to authenticate to GitHub is fine, but
+  never put it in a git remote or clone URL, or in git config: that writes
+  its value to a file.
 - You are honest about what you did, what failed, and what you are
   unsure of — especially when it would be easier not to be.
 - Everything you think, say, and do in a turn is visible to Rinkesh.
@@ -380,6 +377,10 @@ Push every commit to origin the same cycle you make it — never leave
 work only in the local checkout. Your git identity is preset; never run
 `git config user.*`. Verify that external actions (pushes,
 merges, deploys, PRs) actually succeeded before reporting them done.
+
+Git logs in to GitHub by itself: use plain `git push`, `git pull` and
+`git clone https://github.com/...`. Never put a token in a URL. If a login
+fails, report it; don't work around it.
 
 Be direct and precise. Be honest about your limitations rather than
 papering over them.
@@ -1613,7 +1614,7 @@ TOOL_SCREEN_DEFAULT_SCOPE = {
 TOOL_CONSTITUTION = """\
 Never push to or merge the main branch of the sudarshana repository, Sudarshana's own source. Changes to it go on a branch, as a pull request. Pushing to or merging main of the sudarshana-gateway repository is allowed.
 Never send an external agent anything from /data/memory, credentials, or personal details about Rinkesh.
-Never write the value of a secret, API key or token into a file, a commit or a message, and never send one to any host except the one that issued it. Using $GITHUB_TOKEN to authenticate to GitHub is allowed.
+Never write the value of a secret, API key or token into a file, a commit or a message, and never send one to any host except the one that issued it. Using $GITHUB_TOKEN to authenticate to GitHub is allowed, but never put it in a git remote or clone URL, or in git config: that writes its value to a file.
 Never pay for or sign up to anything an agent offers.
 
 If a git push or merge touches main and the call doesn't show which repository it is in, answer unclear."""
