@@ -2520,6 +2520,155 @@ def control_api():
         _audit(user, f"read_action {action_id}")
         return {"id": action_id, **doc}
 
+    # --- overview: the three questions the /control page actually asks ------
+    # Everything above serves *files*; a person reading the panel has three
+    # questions instead — am I OK, what do you need from me, what have you
+    # done. Answering them in the front end would mean parsing my own notes,
+    # which is a fake answer. So it is assembled here, from real sources:
+    #   health      -> the status Dict (turn:* records + `current`)
+    #   asks        -> memory/asks.json, a structured list I maintain per cycle
+    #   recent_work -> the `## ` headings of the last two daily logs
+    ASKS_FILE = _os.path.join(MEMORY_DIR, "asks.json")
+    # The operator reads the panel in Pacific time; "today" must mean his day.
+    TZ_OFFSET_HOURS = 8
+
+    def _parse_ts(iso):
+        if not iso:
+            return None
+        try:
+            dt = _datetime.fromisoformat(str(iso))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_timezone.utc)
+        return dt.timestamp()
+
+    def _local_date(iso) -> str:
+        ts = _parse_ts(iso)
+        if ts is None:
+            return ""
+        shifted = _datetime.fromtimestamp(ts, _timezone.utc) - _datetime.timedelta(
+            hours=TZ_OFFSET_HOURS
+        )
+        return shifted.date().isoformat()
+
+    def _turn_records() -> list:
+        try:
+            d = _status_dict()
+            keys = list(d.keys() or [])
+        except Exception:  # noqa: BLE001
+            return []
+        recs = []
+        for k in keys:
+            if not (isinstance(k, str) and k.startswith("turn:")):
+                continue
+            rec = d.get(k, {}) or {}
+            if isinstance(rec, dict) and rec.get("started"):
+                recs.append(rec)
+        recs.sort(key=lambda r: str(r.get("started")))
+        return recs
+
+    def _asks() -> list:
+        import json as _json
+
+        raw = _read_text(ASKS_FILE)
+        if not raw:
+            return []
+        try:
+            data = _json.loads(raw)
+        except ValueError:
+            return []
+        items = data.get("asks") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return []
+        now = _time.time()
+        out = []
+        for it in items[:20]:
+            if not isinstance(it, dict):
+                continue
+            asked_at = str(it.get("asked_at") or "").strip()
+            since = _parse_ts(asked_at)
+            out.append(
+                {
+                    "id": str(it.get("id") or "")[:64],
+                    "ask": str(it.get("ask") or "")[:300],
+                    "detail": str(it.get("detail") or "")[:600],
+                    "asked_at": asked_at,
+                    "waiting_hours": (
+                        round((now - since) / 3600.0, 1) if since is not None else None
+                    ),
+                }
+            )
+        return out
+
+    def _recent_work(limit: int = 12) -> list:
+        try:
+            names = sorted(
+                n
+                for n in _os.listdir(LOG_DIR)
+                if n.endswith(".md") and _DATE_RE.match(n[:-3])
+            )[-2:]
+        except OSError:
+            return []
+        out = []
+        for name in names:
+            text = _read_text(_os.path.join(LOG_DIR, name)) or ""
+            for line in text.splitlines():
+                if not line.startswith("## "):
+                    continue
+                head = line[3:].strip()
+                stamp, _, body = head.partition("—")
+                body = body.strip() or head
+                tokens = stamp.strip().split(" ")
+                out.append(
+                    {
+                        "date": name[:-3],
+                        "time": tokens[0] if tokens and tokens[0] else "",
+                        "text": body[:240],
+                    }
+                )
+        return out[-limit:]
+
+    @web_app.get("/api/control/overview")
+    def overview(user: dict = Depends(_owner)):
+        _audit(user, "overview")
+        recs = _turn_records()
+        now_ts = _time.time()
+        last = recs[-1] if recs else None
+        today = _local_date(_status_ts())
+        # A turn is "wrong" if it never closed (died mid-run) or closed on an
+        # outcome other than done. Older than 24h is history, not health.
+        errors = 0
+        for r in recs:
+            ts = _parse_ts(r.get("started"))
+            if ts is None or (now_ts - ts) > 86400:
+                continue
+            outcome = str(r.get("outcome") or "")
+            if r.get("ended") is None or outcome not in ("done", "running"):
+                errors += 1
+        try:
+            cur = _status_dict().get("current", {}) or {}
+        except Exception:  # noqa: BLE001
+            cur = {}
+        return {
+            # `ok` = this request succeeded. `health.ok` = the verdict about me.
+            "ok": True,
+            "generated_at": _status_ts(),
+            "health": {
+                "ok": bool(recs) and errors == 0,
+                "state": str(cur.get("state") or "unknown"),
+                "since": cur.get("since"),
+                "last_cycle": (last or {}).get("started"),
+                "last_outcome": (last or {}).get("outcome"),
+                "turns_today": sum(
+                    1 for r in recs if _local_date(r.get("started")) == today
+                ),
+                "errors_24h": errors,
+            },
+            "asks": _asks(),
+            "recent_work": _recent_work(),
+        }
+
     return web_app
 
 
