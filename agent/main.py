@@ -1146,6 +1146,11 @@ class Sudarshana:
                 max_tokens=32768,
                 # Milliseconds here, unlike ChatOpenAI's seconds (10 minutes).
                 timeout=600_000,
+                # OpenRouter attribution (HTTP-Referer / X-Title). The
+                # defaults are LangChain's, so usage showed as "langchain".
+                # Same referer as the Jev calls.
+                app_url="https://github.com/rinkesh2010rpp/sudarshana",
+                app_title="sudarshana",
                 # No provider pinning: pinning Fireworks cost ~$30/mo. If a
                 # cheap host mangles tool calls, add a provider "ignore" /
                 # "quantizations" filter rather than an order.
