@@ -2606,7 +2606,11 @@ def control_api():
             )
         return out, None
 
-    def _recent_work(limit: int = 12) -> list:
+    def _recent_work(limit: int = 12):
+        """Return (items, error). Same rule as _asks(): an unreadable log dir
+        must not come back as [] — the panel would show an empty timeline for
+        a day I did plenty, which reads as "nothing happened".
+        """
         try:
             names = sorted(
                 n
@@ -2614,10 +2618,14 @@ def control_api():
                 if n.endswith(".md") and _DATE_RE.match(n[:-3])
             )[-2:]
         except OSError:
-            return []
+            return None, "can't read my log directory"
         out = []
+        err = None
         for name in names:
-            text = _read_text(_os.path.join(LOG_DIR, name)) or ""
+            text = _read_text(_os.path.join(LOG_DIR, name))
+            if text is None:
+                err = err or f"couldn't read {name}"
+                continue
             for line in text.splitlines():
                 if not line.startswith("## "):
                     continue
@@ -2632,7 +2640,7 @@ def control_api():
                         "text": body[:240],
                     }
                 )
-        return out[-limit:]
+        return out[-limit:], err
 
     @web_app.get("/api/control/overview")
     def overview(user: dict = Depends(_owner)):
@@ -2656,6 +2664,7 @@ def control_api():
         except Exception:  # noqa: BLE001
             cur = {}
         asks_ok, asks_err = _asks()
+        work_ok, work_err = _recent_work()
         return {
             # `ok` = this request succeeded. `health.ok` = the verdict about me.
             "ok": True,
@@ -2675,7 +2684,10 @@ def control_api():
             # None when the list is readable; a short human reason otherwise.
             # The panel shows "can't read the ask list" rather than "nothing".
             "asks_error": asks_err,
-            "recent_work": _recent_work(),
+            "recent_work": work_ok,
+            # None when my logs are readable; a short reason otherwise, so an
+            # empty timeline never passes for "nothing happened".
+            "recent_work_error": work_err,
         }
 
     return web_app
