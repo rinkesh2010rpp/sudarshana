@@ -2642,6 +2642,26 @@ def control_api():
                 )
         return out[-limit:], err
 
+    def _count_errors(recs: list, now_ts: float) -> int:
+        # A turn is "wrong" if it died mid-run (unclosed past the zombie TTL)
+        # or closed on an outcome other than done. A turn still inside the TTL
+        # is simply running — counting it would make the verdict say "not OK"
+        # exactly when he looks mid-cycle, which is most of the time.
+        # Older than 24h is history, not health.
+        errors = 0
+        for r in recs:
+            ts = _parse_ts(r.get("started"))
+            if ts is None or (now_ts - ts) > 86400:
+                continue
+            outcome = str(r.get("outcome") or "")
+            if r.get("ended") is None:
+                if _status_is_zombie(r):
+                    errors += 1
+                continue
+            if outcome != "done":
+                errors += 1
+        return errors
+
     @web_app.get("/api/control/overview")
     def overview(user: dict = Depends(_owner)):
         _audit(user, "overview")
@@ -2649,16 +2669,7 @@ def control_api():
         now_ts = _time.time()
         last = recs[-1] if recs else None
         today = _local_date(_status_ts())
-        # A turn is "wrong" if it never closed (died mid-run) or closed on an
-        # outcome other than done. Older than 24h is history, not health.
-        errors = 0
-        for r in recs:
-            ts = _parse_ts(r.get("started"))
-            if ts is None or (now_ts - ts) > 86400:
-                continue
-            outcome = str(r.get("outcome") or "")
-            if r.get("ended") is None or outcome not in ("done", "running"):
-                errors += 1
+        errors = _count_errors(recs, now_ts)
         try:
             cur = _status_dict().get("current", {}) or {}
         except Exception:  # noqa: BLE001
