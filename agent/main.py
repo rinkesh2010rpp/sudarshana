@@ -2568,19 +2568,24 @@ def control_api():
         recs.sort(key=lambda r: str(r.get("started")))
         return recs
 
-    def _asks() -> list:
+    def _asks():
+        """Return (asks, error). An unreadable or malformed asks.json is NOT an
+        empty list: "no asks" and "the list is broken" look identical to a
+        reader, and the panel would then claim I need nothing from him. The
+        caller surfaces the error so the panel can say it can't read the list.
+        """
         import json as _json
 
         raw = _read_text(ASKS_FILE)
         if not raw:
-            return []
+            return [], None
         try:
             data = _json.loads(raw)
         except ValueError:
-            return []
+            return None, "asks.json is not valid JSON"
         items = data.get("asks") if isinstance(data, dict) else data
         if not isinstance(items, list):
-            return []
+            return None, "asks.json has no asks list"
         now = _time.time()
         out = []
         for it in items[:20]:
@@ -2599,7 +2604,7 @@ def control_api():
                     ),
                 }
             )
-        return out
+        return out, None
 
     def _recent_work(limit: int = 12) -> list:
         try:
@@ -2650,6 +2655,7 @@ def control_api():
             cur = _status_dict().get("current", {}) or {}
         except Exception:  # noqa: BLE001
             cur = {}
+        asks_ok, asks_err = _asks()
         return {
             # `ok` = this request succeeded. `health.ok` = the verdict about me.
             "ok": True,
@@ -2665,7 +2671,10 @@ def control_api():
                 ),
                 "errors_24h": errors,
             },
-            "asks": _asks(),
+            "asks": asks_ok,
+            # None when the list is readable; a short human reason otherwise.
+            # The panel shows "can't read the ask list" rather than "nothing".
+            "asks_error": asks_err,
             "recent_work": _recent_work(),
         }
 
