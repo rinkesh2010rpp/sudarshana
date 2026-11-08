@@ -684,6 +684,24 @@ def _maintain_knowledge(force: bool = False) -> None:
         print(f"[knowledge] maintenance failed: {e!r}")
 
 
+def _content_text(m) -> str:
+    """A message's text. Content is a list of blocks, not a string, once an
+    image is involved (the agent viewing a screenshot); keep the text blocks
+    and mark the rest."""
+    content = getattr(m, "content", "") or ""
+    if isinstance(content, str):
+        return content.strip()
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        elif isinstance(block, dict):
+            parts.append(f"[{block.get('type', 'block')}]")
+    return "\n".join(p for p in parts if p).strip()
+
+
 def _final_message(messages: list) -> str:
     """The agent's last spoken message — the final AIMessage with real
     content. Falls back to a marker so a silent turn still sends something
@@ -691,7 +709,7 @@ def _final_message(messages: list) -> str:
     for m in reversed(messages):
         if type(m).__name__ != "AIMessage":
             continue
-        content = (getattr(m, "content", "") or "").strip()
+        content = _content_text(m)
         if content:
             return content
     return "[cycle ended with no final message — see modal app logs for the trace]"
@@ -704,7 +722,7 @@ def _format_blurb(messages: list) -> str:
     lines = []
     for m in messages:
         role = type(m).__name__
-        content = (getattr(m, "content", "") or "").strip()
+        content = _content_text(m)
         tool_calls = getattr(m, "tool_calls", None)
         # Providers put reasoning in different fields; check all four.
         _ak = getattr(m, "additional_kwargs", {}) or {}
