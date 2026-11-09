@@ -2359,6 +2359,67 @@ def control_api():
             raise HTTPException(status_code=400, detail="invalid name")
         return _os.path.join(root, name)
 
+    # --- latency: two costs on the hot path were repeat work -----------------
+    # Measured 2026-11-09 from the operator's browser: ~8-10 s for the first
+    # panel load, 2-4 s for a reload right after. This function does no heavy
+    # computation — it reads files — so the time went to two things done on
+    # *every* request: a forward-auth round trip to Netlify Identity, and a
+    # full volume.reload(). A panel load fires four requests at once, so both
+    # were paid four times. (The remaining ~6.6 s is the container cold start,
+    # which is a separate question and not addressable from in here.)
+    import hashlib as _hashlib
+    import threading as _threading
+
+    # How long a token that proved it belongs to the owner is trusted in this
+    # container. Short enough that a revoked session stops working within
+    # minutes; long enough that a panel load pays one round trip, not four.
+    _AUTH_TTL = 600.0
+    _AUTH_CACHE: dict[str, tuple[str, float]] = {}
+    _AUTH_LOCK = _threading.Lock()
+    # A panel load fires its four requests at once with the same token, so a
+    # cache miss would otherwise be four forward-auth round trips in parallel.
+    # Only one thread validates a given miss; the rest wait and reuse it.
+    _AUTH_FILL_LOCK = _threading.Lock()
+    # A container re-syncs the Volume at most this often, so a burst of panel
+    # requests waits for one reload instead of running four.
+    _RELOAD_MIN_INTERVAL = 5.0
+    _RELOAD_STATE = {"at": 0.0}
+    _RELOAD_LOCK = _threading.Lock()
+
+    def _auth_lookup(token: str):
+        """(cache key, cached email or None) — never validates on a miss."""
+        key = _hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with _AUTH_LOCK:
+            hit = _AUTH_CACHE.get(key)
+            if hit is not None and hit[1] > _time.time():
+                return key, hit[0]
+            _AUTH_CACHE.pop(key, None)
+            return key, None
+
+    def _auth_store(key: str, email: str) -> None:
+        with _AUTH_LOCK:
+            if len(_AUTH_CACHE) > 64:  # one owner, a few tabs; keep it bounded
+                _AUTH_CACHE.clear()
+            _AUTH_CACHE[key] = (email, _time.time() + _AUTH_TTL)
+
+    def _refresh_volume() -> None:
+        """Reload the Volume, at most once every few seconds, across threads.
+
+        A warm container sees the Volume as of its start, so the panel must
+        reload to see what the agent has committed since — but it does not
+        need to do it once per request.
+        """
+        with _RELOAD_LOCK:
+            if _time.time() - _RELOAD_STATE["at"] < _RELOAD_MIN_INTERVAL:
+                return
+            try:
+                volume.reload()
+                _RELOAD_STATE["at"] = _time.time()
+            except Exception:  # noqa: BLE001
+                # No stamp on failure, so the next request retries: a stale
+                # view is worse than a slow one.
+                _RELOAD_STATE["at"] = 0.0
+
     def _owner(authorization: str | None = Header(default=None, alias="Authorization")):
         if not OWNER_EMAIL:
             raise HTTPException(
@@ -2370,30 +2431,43 @@ def control_api():
         token = authorization.split(" ", 1)[1].strip()
         if not token:
             raise HTTPException(status_code=401, detail="empty bearer token")
-        try:
-            resp = _requests.get(
-                f"{IDENTITY_BASE}/.netlify/identity/user",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15,
-            )
-        except _requests.RequestException:
-            raise HTTPException(status_code=503, detail="identity service unreachable")
-        if resp.status_code != 200:
-            raise HTTPException(status_code=401, detail="invalid token")
-        try:
-            user = resp.json()
-        except ValueError:
-            raise HTTPException(status_code=503, detail="identity service returned invalid JSON")
-        email = (user.get("email") or "").strip().lower()
-        if email != OWNER_EMAIL:
-            raise HTTPException(
-                status_code=403, detail="authenticated, but not the control owner"
-            )
-        # A warm container sees the Volume as of its start; reload so the panel
-        # shows what the agent has committed since. Only after auth, so
-        # anonymous requests can't drive reloads.
-        volume.reload()
-        return user
+        key, email = _auth_lookup(token)
+        if email is None:
+            with _AUTH_FILL_LOCK:
+                # Re-check: another request in this burst may have just
+                # validated the same token while we waited.
+                key, email = _auth_lookup(token)
+                if email is None:
+                    try:
+                        resp = _requests.get(
+                            f"{IDENTITY_BASE}/.netlify/identity/user",
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=15,
+                        )
+                    except _requests.RequestException:
+                        raise HTTPException(
+                            status_code=503, detail="identity service unreachable"
+                        )
+                    if resp.status_code != 200:
+                        raise HTTPException(status_code=401, detail="invalid token")
+                    try:
+                        user = resp.json()
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=503, detail="identity service returned invalid JSON"
+                        )
+                    email = (user.get("email") or "").strip().lower()
+                    if email != OWNER_EMAIL:
+                        raise HTTPException(
+                            status_code=403, detail="authenticated, but not the control owner"
+                        )
+                    # Cache only a token that proved it is the owner: a bad
+                    # token or someone else's re-validates (and is refused)
+                    # every time.
+                    _auth_store(key, email)
+        # Only after auth, so anonymous requests can't drive reloads.
+        _refresh_volume()
+        return {"email": email}
 
     def _audit(user: dict, what: str) -> None:
         # Best-effort request trace in the Modal logs only — never in a payload.
