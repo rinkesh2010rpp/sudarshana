@@ -782,10 +782,12 @@ STATUS_DICT_NAME = "sudarshana-status"
 STATUS_HISTORY_LIMIT = 50
 # Closed turn:* records kept; older ones are pruned at turn-end.
 STATUS_RECORDS_KEEP = 100
-# An unclosed record older than this can't be a live turn (the Modal timeout is
-# 1500s) — it's a zombie from a turn that died before _status_turn_end, and
-# must not be handed `current`.
-STATUS_ZOMBIE_TTL_SECONDS = 1800
+# An unclosed record older than this can't be a live turn — it's a zombie from a
+# turn that died before _status_turn_end, and must not be handed `current`.
+# This is the turn cap itself (record_timeout=1500), not a round 30 minutes: with
+# 1800 a crashed turn read as "running" and healthy for the extra 5 minutes after
+# the container could no longer possibly be alive.
+STATUS_ZOMBIE_TTL_SECONDS = 1500
 
 
 def _status_dict():
@@ -1002,6 +1004,9 @@ CHECKPOINT_DB_PATH = os.path.join(VOLUME_PATH, "checkpoints.db")
 CONVERSATION_THREAD = {"configurable": {"thread_id": "sudarshana"}}
 # Max graph steps per turn; also quoted in the Telegram message when hit.
 RECURSION_LIMIT = 200
+# Returned by _invoke() when a turn hit the step cap instead of finishing, so
+# callers can close the turn with an honest outcome rather than "done".
+STEP_LIMIT = "step-limit"
 
 
 @app.cls(
@@ -1305,7 +1310,10 @@ class Sudarshana:
                 f"[hit the {RECURSION_LIMIT}-step safety limit this cycle without finishing — "
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
             )
-            return None
+            # A distinct return value, not None: this turn did not finish, and
+            # closing it as "done" hid exactly the failure the panel exists to
+            # show. The callers record it as the `step-limit` outcome.
+            return STEP_LIMIT
         finally:
             # Rebuild index.md / lint.md if the turn changed any knowledge
             # page — before the caller's volume.commit(), so they land with it.
@@ -1356,10 +1364,14 @@ class Sudarshana:
         # Before any model work, so a turn that dies mid-run leaves a trace.
         _turn_key = _status_turn_start("running-telegram")
 
-        self._invoke(text, "telegram")
+        result = self._invoke(text, "telegram")
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
-        _status_turn_end(_turn_key, "done", "telegram turn finished")
+        _status_turn_end(
+            _turn_key,
+            STEP_LIMIT if result == STEP_LIMIT else "done",
+            "telegram turn finished",
+        )
 
         # Commit explicitly — the container may be torn down before the
         # background commit timer catches these writes.
@@ -1374,10 +1386,14 @@ class Sudarshana:
 
         _turn_key = _status_turn_start("running-hourly")
         _a2a_keep_alive()
-        self._invoke(HOURLY_TASK, "hourly")
+        result = self._invoke(HOURLY_TASK, "hourly")
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
-        _status_turn_end(_turn_key, "done", "hourly turn finished")
+        _status_turn_end(
+            _turn_key,
+            STEP_LIMIT if result == STEP_LIMIT else "done",
+            "hourly turn finished",
+        )
         volume.commit()
 
 
@@ -2530,40 +2546,18 @@ def control_api():
     #   recent_work -> the `## ` headings of the last two daily logs
     ASKS_FILE = _os.path.join(MEMORY_DIR, "asks.json")
     # The operator reads the panel in Pacific time; "today" must mean his day.
-    # tzdata is not guaranteed in the image, so the US rule is applied directly
-    # rather than leaning on zoneinfo: PDT (UTC-7) from the second Sunday of
-    # March 02:00 local to the first Sunday of November 02:00 local, PST (UTC-8)
-    # otherwise. A fixed 8 would put the day boundary at 01:00 through the whole
-    # summer, filing turns just after local midnight under yesterday.
-    def _pacific_offset_hours(ts: float) -> int:
-        def nth_sunday(year: int, month: int, n: int) -> _datetime:
-            first = _datetime(year, month, 1, tzinfo=_timezone.utc)
-            return first + _timedelta(days=(6 - first.weekday()) % 7 + 7 * (n - 1))
+    # ZoneInfo carries the real rules (tzdata is in the image — _timestamp has
+    # used it since the beginning), so this no longer hand-rolls the US DST
+    # calendar and cannot drift from what _timestamp reports.
+    from zoneinfo import ZoneInfo as _ZoneInfo
 
-        dt = _datetime.fromtimestamp(ts, _timezone.utc)
-        start = nth_sunday(dt.year, 3, 2).replace(hour=10)  # 02:00 PST == 10:00 UTC
-        end = nth_sunday(dt.year, 11, 1).replace(hour=9)  # 02:00 PDT == 09:00 UTC
-        return 7 if start <= dt < end else 8
-
-    def _parse_ts(iso):
-        if not iso:
-            return None
-        try:
-            dt = _datetime.fromisoformat(str(iso))
-        except ValueError:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_timezone.utc)
-        return dt.timestamp()
+    PACIFIC = _ZoneInfo("America/Los_Angeles")
 
     def _local_date(iso) -> str:
-        ts = _parse_ts(iso)
+        ts = _status_parse_ts(iso)
         if ts is None:
             return ""
-        shifted = _datetime.fromtimestamp(ts, _timezone.utc) - _timedelta(
-            hours=_pacific_offset_hours(ts)
-        )
-        return shifted.date().isoformat()
+        return _datetime.fromtimestamp(ts, PACIFIC).date().isoformat()
 
     def _turn_records():
         """The turn records, plus a reason string when they cannot be read.
@@ -2575,15 +2569,16 @@ def control_api():
         recent_work_error, in the section that answers "am I OK".
         """
         try:
-            d = _status_dict()
-            keys = list(d.keys() or [])
+            # One fetch for the whole Dict. A get() per turn key meant ~100
+            # sequential round-trips per panel load; items() is one call, and
+            # it fails as a unit rather than half-reading.
+            items = list(_status_dict().items() or [])
         except Exception:  # noqa: BLE001
             return None, "the status store didn't answer"
         recs = []
-        for k in keys:
+        for k, rec in items:
             if not (isinstance(k, str) and k.startswith("turn:")):
                 continue
-            rec = d.get(k, {}) or {}
             if isinstance(rec, dict) and rec.get("started"):
                 recs.append(rec)
         recs.sort(key=lambda r: str(r.get("started")))
@@ -2597,7 +2592,13 @@ def control_api():
         """
         import json as _json
 
-        raw = _read_text(ASKS_FILE)
+        try:
+            raw = _read_text(ASKS_FILE)
+        except Exception:  # noqa: BLE001
+            # The file exists but the read failed. Left uncaught this raised out
+            # of the handler and 500'd the whole panel — losing health and the
+            # timeline too, over one bad file.
+            return None, "couldn't read asks.json"
         if not raw:
             return [], None
         try:
@@ -2613,7 +2614,7 @@ def control_api():
             if not isinstance(it, dict):
                 continue
             asked_at = str(it.get("asked_at") or "").strip()
-            since = _parse_ts(asked_at)
+            since = _status_parse_ts(asked_at)
             out.append(
                 {
                     "id": str(it.get("id") or "")[:64],
@@ -2643,7 +2644,10 @@ def control_api():
         out = []
         err = None
         for name in names:
-            text = _read_text(_os.path.join(LOG_DIR, name))
+            try:
+                text = _read_text(_os.path.join(LOG_DIR, name))
+            except Exception:  # noqa: BLE001
+                text = None
             if text is None:
                 err = err or f"couldn't read {name}"
                 continue
@@ -2661,7 +2665,11 @@ def control_api():
                         "text": body[:240],
                     }
                 )
-        return out[-limit:], err
+        # None rather than [] when nothing could be read: the panel drops the
+        # timeline on an error, and an empty list would otherwise render as
+        # "nothing happened". A partial read keeps what it got and still carries
+        # the reason.
+        return (out[-limit:] or None), err
 
     def _count_errors(recs: list, now_ts: float) -> int:
         # A turn is "wrong" if it died mid-run (unclosed past the zombie TTL)
@@ -2671,7 +2679,7 @@ def control_api():
         # Older than 24h is history, not health.
         errors = 0
         for r in recs:
-            ts = _parse_ts(r.get("started"))
+            ts = _status_parse_ts(r.get("started"))
             if ts is None or (now_ts - ts) > 86400:
                 continue
             outcome = str(r.get("outcome") or "")
