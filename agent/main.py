@@ -2344,6 +2344,18 @@ def control_api():
         allow_headers=["authorization", "accept"],
     )
 
+    # Every request logs one line with its own wall time, so the next latency
+    # question ("which call is slow now?") is answered by the Modal logs
+    # instead of by a stopwatch in a browser. Paths and statuses only — never
+    # a token, a payload or a file body.
+    @web_app.middleware("http")
+    async def _timing(request, call_next):
+        _t0 = _time.monotonic()
+        response = await call_next(request)
+        _ms = int((_time.monotonic() - _t0) * 1000)
+        print(f"[control-api] {request.method} {request.url.path} {response.status_code} {_ms}ms")
+        return response
+
     _SESSION_RE = _re.compile(r"^session_[0-9a-f]{32}\.md$")
     _DATE_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
     _ACTION_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
@@ -2442,7 +2454,11 @@ def control_api():
                         resp = _requests.get(
                             f"{IDENTITY_BASE}/.netlify/identity/user",
                             headers={"Authorization": f"Bearer {token}"},
-                            timeout=15,
+                            # A miss is single-flighted, so a hung Identity
+                            # call would hold the whole burst for this long.
+                            # Identity answers in well under a second; 6 s
+                            # fails fast instead of stalling the panel.
+                            timeout=6,
                         )
                     except _requests.RequestException:
                         raise HTTPException(
