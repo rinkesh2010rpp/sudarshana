@@ -2629,9 +2629,10 @@ def control_api():
         return out, None
 
     def _recent_work(limit: int = 12):
-        """Return (items, error). Same rule as _asks(): an unreadable log dir
-        must not come back as [] — the panel would show an empty timeline for
-        a day I did plenty, which reads as "nothing happened".
+        """Return (items, error). Same rule as _asks(): an unreadable log must
+        not come back as [] — the panel would show an empty timeline for a day
+        I did plenty, which reads as "nothing happened". Readable logs that
+        simply have no entries yet are [] with no error, which is the truth.
         """
         try:
             names = sorted(
@@ -2665,11 +2666,14 @@ def control_api():
                         "text": body[:240],
                     }
                 )
-        # None rather than [] when nothing could be read: the panel drops the
-        # timeline on an error, and an empty list would otherwise render as
-        # "nothing happened". A partial read keeps what it got and still carries
-        # the reason.
-        return (out[-limit:] or None), err
+        if out:
+            return out[-limit:], err
+        # Nothing to show splits in two, and the panel must not conflate them:
+        # the logs read fine but have no `## ` entries yet (just after midnight)
+        # is an honest empty — [] with no reason. Only a read that failed and
+        # produced nothing is None, because an empty list there would render as
+        # "nothing happened" over a day I actually worked.
+        return ([] if err is None else None), err
 
     def _count_errors(recs: list, now_ts: float) -> int:
         # A turn is "wrong" if it died mid-run (unclosed past the zombie TTL)
