@@ -2308,7 +2308,7 @@ def control_api():
     import os as _os
     import re as _re
     import time as _time
-    from datetime import datetime as _datetime, timezone as _timezone
+    from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
     import requests as _requests
 
     CONV_DIR = _os.path.join(VOLUME_PATH, "conversation_history")
@@ -2530,7 +2530,20 @@ def control_api():
     #   recent_work -> the `## ` headings of the last two daily logs
     ASKS_FILE = _os.path.join(MEMORY_DIR, "asks.json")
     # The operator reads the panel in Pacific time; "today" must mean his day.
-    TZ_OFFSET_HOURS = 8
+    # tzdata is not guaranteed in the image, so the US rule is applied directly
+    # rather than leaning on zoneinfo: PDT (UTC-7) from the second Sunday of
+    # March 02:00 local to the first Sunday of November 02:00 local, PST (UTC-8)
+    # otherwise. A fixed 8 would put the day boundary at 01:00 through the whole
+    # summer, filing turns just after local midnight under yesterday.
+    def _pacific_offset_hours(ts: float) -> int:
+        def nth_sunday(year: int, month: int, n: int) -> _datetime:
+            first = _datetime(year, month, 1, tzinfo=_timezone.utc)
+            return first + _timedelta(days=(6 - first.weekday()) % 7 + 7 * (n - 1))
+
+        dt = _datetime.fromtimestamp(ts, _timezone.utc)
+        start = nth_sunday(dt.year, 3, 2).replace(hour=10)  # 02:00 PST == 10:00 UTC
+        end = nth_sunday(dt.year, 11, 1).replace(hour=9)  # 02:00 PDT == 09:00 UTC
+        return 7 if start <= dt < end else 8
 
     def _parse_ts(iso):
         if not iso:
@@ -2547,8 +2560,8 @@ def control_api():
         ts = _parse_ts(iso)
         if ts is None:
             return ""
-        shifted = _datetime.fromtimestamp(ts, _timezone.utc) - _datetime.timedelta(
-            hours=TZ_OFFSET_HOURS
+        shifted = _datetime.fromtimestamp(ts, _timezone.utc) - _timedelta(
+            hours=_pacific_offset_hours(ts)
         )
         return shifted.date().isoformat()
 
