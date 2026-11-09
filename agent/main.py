@@ -2578,7 +2578,7 @@ def control_api():
             d = _status_dict()
             keys = list(d.keys() or [])
         except Exception:  # noqa: BLE001
-            return None, "can't read my status records"
+            return None, "the status store didn't answer"
         recs = []
         for k in keys:
             if not (isinstance(k, str) and k.startswith("turn:")):
@@ -2696,7 +2696,7 @@ def control_api():
             cur = _status_dict().get("current", {}) or {}
         except Exception:  # noqa: BLE001
             cur = {}
-            records_err = records_err or "can't read my status records"
+            records_err = records_err or "the status store didn't answer"
         asks_ok, asks_err = _asks()
         work_ok, work_err = _recent_work()
         return {
