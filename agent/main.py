@@ -782,10 +782,12 @@ STATUS_DICT_NAME = "sudarshana-status"
 STATUS_HISTORY_LIMIT = 50
 # Closed turn:* records kept; older ones are pruned at turn-end.
 STATUS_RECORDS_KEEP = 100
-# An unclosed record older than this can't be a live turn (the Modal timeout is
-# 1500s) — it's a zombie from a turn that died before _status_turn_end, and
-# must not be handed `current`.
-STATUS_ZOMBIE_TTL_SECONDS = 1800
+# An unclosed record older than this can't be a live turn — it's a zombie from a
+# turn that died before _status_turn_end, and must not be handed `current`.
+# This is the turn cap itself (record_timeout=1500), not a round 30 minutes: with
+# 1800 a crashed turn read as "running" and healthy for the extra 5 minutes after
+# the container could no longer possibly be alive.
+STATUS_ZOMBIE_TTL_SECONDS = 1500
 
 
 def _status_dict():
@@ -1002,6 +1004,9 @@ CHECKPOINT_DB_PATH = os.path.join(VOLUME_PATH, "checkpoints.db")
 CONVERSATION_THREAD = {"configurable": {"thread_id": "sudarshana"}}
 # Max graph steps per turn; also quoted in the Telegram message when hit.
 RECURSION_LIMIT = 200
+# Returned by _invoke() when a turn hit the step cap instead of finishing, so
+# callers can close the turn with an honest outcome rather than "done".
+STEP_LIMIT = "step-limit"
 
 
 @app.cls(
@@ -1305,7 +1310,10 @@ class Sudarshana:
                 f"[hit the {RECURSION_LIMIT}-step safety limit this cycle without finishing — "
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
             )
-            return None
+            # A distinct return value, not None: this turn did not finish, and
+            # closing it as "done" hid exactly the failure the panel exists to
+            # show. The callers record it as the `step-limit` outcome.
+            return STEP_LIMIT
         finally:
             # Rebuild index.md / lint.md if the turn changed any knowledge
             # page — before the caller's volume.commit(), so they land with it.
@@ -1356,10 +1364,14 @@ class Sudarshana:
         # Before any model work, so a turn that dies mid-run leaves a trace.
         _turn_key = _status_turn_start("running-telegram")
 
-        self._invoke(text, "telegram")
+        result = self._invoke(text, "telegram")
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
-        _status_turn_end(_turn_key, "done", "telegram turn finished")
+        _status_turn_end(
+            _turn_key,
+            STEP_LIMIT if result == STEP_LIMIT else "done",
+            "telegram turn finished",
+        )
 
         # Commit explicitly — the container may be torn down before the
         # background commit timer catches these writes.
@@ -1374,10 +1386,14 @@ class Sudarshana:
 
         _turn_key = _status_turn_start("running-hourly")
         _a2a_keep_alive()
-        self._invoke(HOURLY_TASK, "hourly")
+        result = self._invoke(HOURLY_TASK, "hourly")
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
-        _status_turn_end(_turn_key, "done", "hourly turn finished")
+        _status_turn_end(
+            _turn_key,
+            STEP_LIMIT if result == STEP_LIMIT else "done",
+            "hourly turn finished",
+        )
         volume.commit()
 
 
@@ -2308,7 +2324,7 @@ def control_api():
     import os as _os
     import re as _re
     import time as _time
-    from datetime import datetime as _datetime, timezone as _timezone
+    from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
     import requests as _requests
 
     CONV_DIR = _os.path.join(VOLUME_PATH, "conversation_history")
@@ -2519,6 +2535,211 @@ def control_api():
             raise HTTPException(status_code=404, detail="no such action file")
         _audit(user, f"read_action {action_id}")
         return {"id": action_id, **doc}
+
+    # --- overview: the three questions the /control page actually asks ------
+    # Everything above serves *files*; a person reading the panel has three
+    # questions instead — am I OK, what do you need from me, what have you
+    # done. Answering them in the front end would mean parsing my own notes,
+    # which is a fake answer. So it is assembled here, from real sources:
+    #   health      -> the status Dict (turn:* records + `current`)
+    #   asks        -> memory/asks.json, a structured list I maintain per cycle
+    #   recent_work -> the `## ` headings of the last two daily logs
+    ASKS_FILE = _os.path.join(MEMORY_DIR, "asks.json")
+    # The operator reads the panel in Pacific time; "today" must mean his day.
+    # ZoneInfo carries the real rules (tzdata is in the image — _timestamp has
+    # used it since the beginning), so this no longer hand-rolls the US DST
+    # calendar and cannot drift from what _timestamp reports.
+    from zoneinfo import ZoneInfo as _ZoneInfo
+
+    PACIFIC = _ZoneInfo("America/Los_Angeles")
+
+    def _local_date(iso) -> str:
+        ts = _status_parse_ts(iso)
+        if ts is None:
+            return ""
+        return _datetime.fromtimestamp(ts, PACIFIC).date().isoformat()
+
+    def _turn_records():
+        """The turn records, plus a reason string when they cannot be read.
+
+        Returning a bare `[]` on a Dict read failure made "I can see no turns"
+        indistinguishable from "I cannot see my own records": the panel would
+        show 0 turns today and 0 errors — a quiet, healthy-looking agent — when
+        the truth was that it had gone blind. Same lie-mode as asks_error and
+        recent_work_error, in the section that answers "am I OK".
+        """
+        try:
+            # One fetch for the whole Dict. A get() per turn key meant ~100
+            # sequential round-trips per panel load; items() is one call, and
+            # it fails as a unit rather than half-reading.
+            items = list(_status_dict().items() or [])
+        except Exception:  # noqa: BLE001
+            return None, "the status store didn't answer"
+        recs = []
+        for k, rec in items:
+            if not (isinstance(k, str) and k.startswith("turn:")):
+                continue
+            if isinstance(rec, dict) and rec.get("started"):
+                recs.append(rec)
+        recs.sort(key=lambda r: str(r.get("started")))
+        return recs, None
+
+    def _asks():
+        """Return (asks, error). An unreadable or malformed asks.json is NOT an
+        empty list: "no asks" and "the list is broken" look identical to a
+        reader, and the panel would then claim I need nothing from him. The
+        caller surfaces the error so the panel can say it can't read the list.
+        """
+        import json as _json
+
+        try:
+            raw = _read_text(ASKS_FILE)
+        except Exception:  # noqa: BLE001
+            # The file exists but the read failed. Left uncaught this raised out
+            # of the handler and 500'd the whole panel — losing health and the
+            # timeline too, over one bad file.
+            return None, "couldn't read asks.json"
+        if not raw:
+            return [], None
+        try:
+            data = _json.loads(raw)
+        except ValueError:
+            return None, "asks.json is not valid JSON"
+        items = data.get("asks") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return None, "asks.json has no asks list"
+        now = _time.time()
+        out = []
+        for it in items[:20]:
+            if not isinstance(it, dict):
+                continue
+            asked_at = str(it.get("asked_at") or "").strip()
+            since = _status_parse_ts(asked_at)
+            out.append(
+                {
+                    "id": str(it.get("id") or "")[:64],
+                    "ask": str(it.get("ask") or "")[:300],
+                    "detail": str(it.get("detail") or "")[:600],
+                    "asked_at": asked_at,
+                    "waiting_hours": (
+                        round((now - since) / 3600.0, 1) if since is not None else None
+                    ),
+                }
+            )
+        return out, None
+
+    def _recent_work(limit: int = 12):
+        """Return (items, error). Same rule as _asks(): an unreadable log must
+        not come back as [] — the panel would show an empty timeline for a day
+        I did plenty, which reads as "nothing happened". Readable logs that
+        simply have no entries yet are [] with no error, which is the truth.
+        """
+        try:
+            names = sorted(
+                n
+                for n in _os.listdir(LOG_DIR)
+                if n.endswith(".md") and _DATE_RE.match(n[:-3])
+            )[-2:]
+        except OSError:
+            return None, "can't read my log directory"
+        out = []
+        err = None
+        for name in names:
+            try:
+                text = _read_text(_os.path.join(LOG_DIR, name))
+            except Exception:  # noqa: BLE001
+                text = None
+            if text is None:
+                err = err or f"couldn't read {name}"
+                continue
+            for line in text.splitlines():
+                if not line.startswith("## "):
+                    continue
+                head = line[3:].strip()
+                stamp, _, body = head.partition("—")
+                body = body.strip() or head
+                tokens = stamp.strip().split(" ")
+                out.append(
+                    {
+                        "date": name[:-3],
+                        "time": tokens[0] if tokens and tokens[0] else "",
+                        "text": body[:240],
+                    }
+                )
+        if out:
+            return out[-limit:], err
+        # Nothing to show splits in two, and the panel must not conflate them:
+        # the logs read fine but have no `## ` entries yet (just after midnight)
+        # is an honest empty — [] with no reason. Only a read that failed and
+        # produced nothing is None, because an empty list there would render as
+        # "nothing happened" over a day I actually worked.
+        return ([] if err is None else None), err
+
+    def _count_errors(recs: list, now_ts: float) -> int:
+        # A turn is "wrong" if it died mid-run (unclosed past the zombie TTL)
+        # or closed on an outcome other than done. A turn still inside the TTL
+        # is simply running — counting it would make the verdict say "not OK"
+        # exactly when he looks mid-cycle, which is most of the time.
+        # Older than 24h is history, not health.
+        errors = 0
+        for r in recs:
+            ts = _status_parse_ts(r.get("started"))
+            if ts is None or (now_ts - ts) > 86400:
+                continue
+            outcome = str(r.get("outcome") or "")
+            if r.get("ended") is None:
+                if _status_is_zombie(r):
+                    errors += 1
+                continue
+            if outcome != "done":
+                errors += 1
+        return errors
+
+    @web_app.get("/api/control/overview")
+    def overview(user: dict = Depends(_owner)):
+        _audit(user, "overview")
+        recs, records_err = _turn_records()
+        recs = recs or []
+        now_ts = _time.time()
+        last = recs[-1] if recs else None
+        today = _local_date(_status_ts())
+        errors = _count_errors(recs, now_ts)
+        try:
+            cur = _status_dict().get("current", {}) or {}
+        except Exception:  # noqa: BLE001
+            cur = {}
+            records_err = records_err or "the status store didn't answer"
+        asks_ok, asks_err = _asks()
+        work_ok, work_err = _recent_work()
+        return {
+            # `ok` = this request succeeded. `health.ok` = the verdict about me.
+            "ok": True,
+            "generated_at": _status_ts(),
+            "health": {
+                "ok": bool(recs) and errors == 0,
+                "state": str(cur.get("state") or "unknown"),
+                "since": cur.get("since"),
+                "last_cycle": (last or {}).get("started"),
+                "last_outcome": (last or {}).get("outcome"),
+                "turns_today": sum(
+                    1 for r in recs if _local_date(r.get("started")) == today
+                ),
+                "errors_24h": errors,
+                # None when the status Dict was readable; a short reason
+                # otherwise, so "no turns today" cannot stand in for "I went
+                # blind". The panel drops the numbers when this is set rather
+                # than rendering zeros it did not measure.
+                "records_error": records_err,
+            },
+            "asks": asks_ok,
+            # None when the list is readable; a short human reason otherwise.
+            # The panel shows "can't read the ask list" rather than "nothing".
+            "asks_error": asks_err,
+            "recent_work": work_ok,
+            # None when my logs are readable; a short reason otherwise, so an
+            # empty timeline never passes for "nothing happened".
+            "recent_work_error": work_err,
+        }
 
     return web_app
 
