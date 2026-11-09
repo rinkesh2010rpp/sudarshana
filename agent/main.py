@@ -2565,12 +2565,20 @@ def control_api():
         )
         return shifted.date().isoformat()
 
-    def _turn_records() -> list:
+    def _turn_records():
+        """The turn records, plus a reason string when they cannot be read.
+
+        Returning a bare `[]` on a Dict read failure made "I can see no turns"
+        indistinguishable from "I cannot see my own records": the panel would
+        show 0 turns today and 0 errors — a quiet, healthy-looking agent — when
+        the truth was that it had gone blind. Same lie-mode as asks_error and
+        recent_work_error, in the section that answers "am I OK".
+        """
         try:
             d = _status_dict()
             keys = list(d.keys() or [])
         except Exception:  # noqa: BLE001
-            return []
+            return None, "can't read my status records"
         recs = []
         for k in keys:
             if not (isinstance(k, str) and k.startswith("turn:")):
@@ -2579,7 +2587,7 @@ def control_api():
             if isinstance(rec, dict) and rec.get("started"):
                 recs.append(rec)
         recs.sort(key=lambda r: str(r.get("started")))
-        return recs
+        return recs, None
 
     def _asks():
         """Return (asks, error). An unreadable or malformed asks.json is NOT an
@@ -2678,7 +2686,8 @@ def control_api():
     @web_app.get("/api/control/overview")
     def overview(user: dict = Depends(_owner)):
         _audit(user, "overview")
-        recs = _turn_records()
+        recs, records_err = _turn_records()
+        recs = recs or []
         now_ts = _time.time()
         last = recs[-1] if recs else None
         today = _local_date(_status_ts())
@@ -2687,6 +2696,7 @@ def control_api():
             cur = _status_dict().get("current", {}) or {}
         except Exception:  # noqa: BLE001
             cur = {}
+            records_err = records_err or "can't read my status records"
         asks_ok, asks_err = _asks()
         work_ok, work_err = _recent_work()
         return {
@@ -2703,6 +2713,11 @@ def control_api():
                     1 for r in recs if _local_date(r.get("started")) == today
                 ),
                 "errors_24h": errors,
+                # None when the status Dict was readable; a short reason
+                # otherwise, so "no turns today" cannot stand in for "I went
+                # blind". The panel drops the numbers when this is set rather
+                # than rendering zeros it did not measure.
+                "records_error": records_err,
             },
             "asks": asks_ok,
             # None when the list is readable; a short human reason otherwise.
