@@ -939,8 +939,16 @@ def _status_prune(d, keep_key: str = ""):
         if (now - started) > STATUS_RECORDS_TTL_SECONDS:
             stale.append(k)
     live = [k for k in turn_keys if k not in stale]
-    if len(live) > STATUS_RECORDS_KEEP:
-        stale.extend(live[: len(live) - STATUS_RECORDS_KEEP])
+    excess = len(live) - STATUS_RECORDS_KEEP
+    if excess > 0:
+        # The cap reads only the few records it would delete — and only to keep
+        # the one guarantee the age rule can't make on its own: an unclosed
+        # record is a mid-run death, and deleting it would erase the evidence
+        # (the old count-only prune never dropped one either). Under the cap
+        # this branch does zero reads; it is a burst backstop, not the rule.
+        for k in live[:excess]:
+            if (d.get(k, {}) or {}).get("ended") is not None:
+                stale.append(k)
     for k in stale:
         try:
             del d[k]
