@@ -2304,7 +2304,20 @@ def _control_secret() -> modal.Secret:
     return modal.Secret.from_dict({"CONTROL_OWNER_EMAIL": email})
 
 
-@app.function(image=image, volumes={VOLUME_PATH: volume}, secrets=[_control_secret()])
+@app.function(
+    image=image,
+    volumes={VOLUME_PATH: volume},
+    secrets=[_control_secret()],
+    # His call, 11-09: no always-on container, and stay warm at most 2 minutes
+    # after a visit. Costs pennies (~$0.40/mo at five visits a day) and buys
+    # back the ~4.7 s cold start for the second and later loads of a session.
+    scaledown_window=120,
+)
+# Without this every container answers one request at a time, so the panel's
+# four parallel calls serialise — or each boot its own cold container, which
+# made the round trips below invisible in practice. Read-only handlers, so 8
+# concurrent inputs is safe; it is what lets one warm container serve a burst.
+@modal.concurrent(max_inputs=8)
 @modal.asgi_app(label="control-api")
 def control_api():
     """Private control endpoint: read-only view over the agent's own files.
@@ -2344,6 +2357,25 @@ def control_api():
         allow_headers=["authorization", "accept"],
     )
 
+    # Every request logs one line with its own wall time, so the next latency
+    # question ("which call is slow now?") is answered by the Modal logs
+    # instead of by a stopwatch in a browser. Paths and statuses only — never
+    # a token, a payload or a file body. In a finally block so a 500 is timed
+    # too instead of vanishing from the log. The number is in-container time:
+    # it starts after the container is up, so it does NOT include the cold
+    # start — never quote it as the whole load time.
+    @web_app.middleware("http")
+    async def _timing(request, call_next):
+        _t0 = _time.monotonic()
+        _status = 500
+        try:
+            response = await call_next(request)
+            _status = response.status_code
+            return response
+        finally:
+            _ms = int((_time.monotonic() - _t0) * 1000)
+            print(f"[control-api] {request.method} {request.url.path} {_status} {_ms}ms")
+
     _SESSION_RE = _re.compile(r"^session_[0-9a-f]{32}\.md$")
     _DATE_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
     _ACTION_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
@@ -2359,6 +2391,125 @@ def control_api():
             raise HTTPException(status_code=400, detail="invalid name")
         return _os.path.join(root, name)
 
+    # --- latency: two costs on the hot path were repeat work -----------------
+    # Measured 2026-11-09 from the operator's browser: ~8-10 s for the first
+    # panel load, 2-4 s for a reload right after. This function does no heavy
+    # computation — it reads files — so the time went to two things done on
+    # *every* request: a forward-auth round trip to Netlify Identity, and a
+    # full volume.reload(). A panel load fires four requests at once, so both
+    # were paid four times. (The cold start is separate and not addressable
+    # from in here: 11-09 it was mostly file count on the Volume — 207K files,
+    # ~97% Lean tooling — and after that was cleared it measured ~4.7 s, of
+    # which ~3 s is an empty container and a slim image would not help.)
+    import hashlib as _hashlib
+    import threading as _threading
+
+    # How long a token that proved it belongs to the owner is trusted in this
+    # container. Short enough that a revoked session stops working quickly;
+    # long enough that a panel load pays one round trip, not four.
+    _AUTH_TTL = 120.0
+    _AUTH_CACHE: dict[str, tuple[str, float]] = {}
+    _AUTH_LOCK = _threading.Lock()
+    # A panel load fires its four requests at once with the same token, so a
+    # cache miss would otherwise be four forward-auth round trips in parallel.
+    # One fill lock *per token*: two tabs (or a second device) must not queue
+    # behind each other the way they would on a single container-wide lock.
+    _FILL_LOCKS: dict = {}
+    # If Identity is down, remember how long to stop asking. A container serving
+    # 8 concurrent inputs must not stack one 6 s timeout per request.
+    _IDENTITY_DOWN_UNTIL = {"at": 0.0}
+    _IDENTITY_BREAKER = 10.0
+    # A container re-syncs the Volume at most this often, so a burst of panel
+    # requests waits for one reload instead of running four.
+    _RELOAD_MIN_INTERVAL = 5.0
+    _RELOAD_STATE = {"at": 0.0}
+    _RELOAD_LOCK = _threading.Lock()
+    # A reload swaps the Volume's view underneath whoever is reading. Readers
+    # register while they touch files; a reload waits for them to finish and
+    # holds new readers out for its duration, so a concurrent read can never
+    # see a half-swapped volume (a blank file, a vanished directory).
+    _VOL_COND = _threading.Condition()
+    _READERS = {"n": 0}
+    _RELOADING = {"on": False}
+
+    class _VolumeRead:
+        """Context manager for every read of the mounted Volume."""
+
+        def __enter__(self):
+            with _VOL_COND:
+                while _RELOADING["on"]:
+                    # Bounded: never let a stuck reload wedge a request.
+                    if not _VOL_COND.wait(timeout=5.0):
+                        break
+                _READERS["n"] += 1
+            return self
+
+        def __exit__(self, *_exc):
+            with _VOL_COND:
+                _READERS["n"] = max(0, _READERS["n"] - 1)
+                if _READERS["n"] == 0:
+                    _VOL_COND.notify_all()
+            return False
+
+    def _fill_lock(key: str):
+        with _AUTH_LOCK:
+            lk = _FILL_LOCKS.get(key)
+            if lk is None:
+                if len(_FILL_LOCKS) > 64:  # one owner, a few tabs
+                    _FILL_LOCKS.clear()
+                lk = _FILL_LOCKS[key] = _threading.Lock()
+            return lk
+
+    def _auth_lookup(token: str):
+        """(cache key, cached email or None) — never validates on a miss."""
+        key = _hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with _AUTH_LOCK:
+            hit = _AUTH_CACHE.get(key)
+            if hit is not None and hit[1] > _time.time():
+                return key, hit[0]
+            _AUTH_CACHE.pop(key, None)
+            return key, None
+
+    def _auth_store(key: str, email: str) -> None:
+        with _AUTH_LOCK:
+            if len(_AUTH_CACHE) > 64:  # one owner, a few tabs; keep it bounded
+                _AUTH_CACHE.clear()
+            _AUTH_CACHE[key] = (email, _time.time() + _AUTH_TTL)
+
+    def _refresh_volume() -> None:
+        """Reload the Volume, at most once every few seconds, across threads.
+
+        A warm container sees the Volume as of its start, so the panel must
+        reload to see what the agent has committed since — but it does not
+        need to do it once per request, and it must not swap the view out from
+        under a read that is in flight.
+        """
+        with _RELOAD_LOCK:
+            if _time.time() - _RELOAD_STATE["at"] < _RELOAD_MIN_INTERVAL:
+                return
+            # Park new readers and wait (briefly) for the ones already inside.
+            # Monotonic, not wall clock: a clock step must not cut the wait
+            # short and let a reload swap the view under a live read.
+            with _VOL_COND:
+                _RELOADING["on"] = True
+                _deadline = _time.monotonic() + 5.0
+                while _READERS["n"] > 0:
+                    _left = _deadline - _time.monotonic()
+                    if _left <= 0:
+                        break
+                    _VOL_COND.wait(timeout=_left)
+            try:
+                volume.reload()
+                _RELOAD_STATE["at"] = _time.time()
+            except Exception:  # noqa: BLE001
+                # No stamp on failure, so the next request retries: a stale
+                # view is worse than a slow one.
+                _RELOAD_STATE["at"] = 0.0
+            finally:
+                with _VOL_COND:
+                    _RELOADING["on"] = False
+                    _VOL_COND.notify_all()
+
     def _owner(authorization: str | None = Header(default=None, alias="Authorization")):
         if not OWNER_EMAIL:
             raise HTTPException(
@@ -2370,74 +2521,107 @@ def control_api():
         token = authorization.split(" ", 1)[1].strip()
         if not token:
             raise HTTPException(status_code=401, detail="empty bearer token")
-        try:
-            resp = _requests.get(
-                f"{IDENTITY_BASE}/.netlify/identity/user",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15,
-            )
-        except _requests.RequestException:
-            raise HTTPException(status_code=503, detail="identity service unreachable")
-        if resp.status_code != 200:
-            raise HTTPException(status_code=401, detail="invalid token")
-        try:
-            user = resp.json()
-        except ValueError:
-            raise HTTPException(status_code=503, detail="identity service returned invalid JSON")
-        email = (user.get("email") or "").strip().lower()
-        if email != OWNER_EMAIL:
-            raise HTTPException(
-                status_code=403, detail="authenticated, but not the control owner"
-            )
-        # A warm container sees the Volume as of its start; reload so the panel
-        # shows what the agent has committed since. Only after auth, so
-        # anonymous requests can't drive reloads.
-        volume.reload()
-        return user
+        key, email = _auth_lookup(token)
+        if email is None:
+            with _fill_lock(key):
+                # Re-check: another request for this token may have just
+                # validated it while we waited.
+                key, email = _auth_lookup(token)
+                if email is None:
+                    # If Identity just failed, answer now instead of paying
+                    # another 6 s timeout on top of the last one.
+                    if _time.time() < _IDENTITY_DOWN_UNTIL["at"]:
+                        raise HTTPException(
+                            status_code=503, detail="identity service unreachable"
+                        )
+                    try:
+                        resp = _requests.get(
+                            f"{IDENTITY_BASE}/.netlify/identity/user",
+                            headers={"Authorization": f"Bearer {token}"},
+                            # One request per token validates; the rest of the
+                            # burst reuses it. Identity answers in well under a
+                            # second, so 6 s fails fast rather than stalling.
+                            timeout=6,
+                        )
+                    except _requests.RequestException:
+                        _IDENTITY_DOWN_UNTIL["at"] = _time.time() + _IDENTITY_BREAKER
+                        raise HTTPException(
+                            status_code=503, detail="identity service unreachable"
+                        )
+                    if resp.status_code >= 500:
+                        # Their outage, not a bad token: trip the breaker too,
+                        # or every queued request pays its own timeout.
+                        _IDENTITY_DOWN_UNTIL["at"] = _time.time() + _IDENTITY_BREAKER
+                        raise HTTPException(
+                            status_code=503, detail="identity service unavailable"
+                        )
+                    if resp.status_code != 200:
+                        raise HTTPException(status_code=401, detail="invalid token")
+                    try:
+                        user = resp.json()
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=503, detail="identity service returned invalid JSON"
+                        )
+                    email = (user.get("email") or "").strip().lower()
+                    if email != OWNER_EMAIL:
+                        raise HTTPException(
+                            status_code=403, detail="authenticated, but not the control owner"
+                        )
+                    # Cache only a token that proved it is the owner: a bad
+                    # token or someone else's re-validates (and is refused)
+                    # every time.
+                    _auth_store(key, email)
+        # Only after auth, so anonymous requests can't drive reloads.
+        _refresh_volume()
+        return {"email": email}
 
     def _audit(user: dict, what: str) -> None:
         # Best-effort request trace in the Modal logs only — never in a payload.
         print(f"[control-api] {user.get('email')} {what} at {_time.time():.0f}")
 
     def _read_text(path: str) -> str | None:
-        if not _os.path.isfile(path):
-            return None
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        with _VolumeRead():
+            if not _os.path.isfile(path):
+                return None
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
 
     # Logs and action files ship whole (sessions are paged); cap them so one
     # runaway file can't blow up a response. Largest today is ~150 KiB.
     MAX_FILE_CHARS = 2_000_000
 
     def _read_capped(path: str) -> dict | None:
-        if not _os.path.isfile(path):
-            return None
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read(MAX_FILE_CHARS + 1)
-        truncated = len(text) > MAX_FILE_CHARS
-        return {
-            "size": _os.path.getsize(path),
-            "truncated": truncated,
-            "content": text[:MAX_FILE_CHARS],
-        }
+        with _VolumeRead():
+            if not _os.path.isfile(path):
+                return None
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read(MAX_FILE_CHARS + 1)
+            truncated = len(text) > MAX_FILE_CHARS
+            return {
+                "size": _os.path.getsize(path),
+                "truncated": truncated,
+                "content": text[:MAX_FILE_CHARS],
+            }
 
     def _list_files(root: str) -> list:
-        if not _os.path.isdir(root):
-            return []
-        out = []
-        for name in sorted(_os.listdir(root)):
-            p = _os.path.join(root, name)
-            if not _os.path.isfile(p):
-                continue
-            st = _os.stat(p)
-            out.append(
-                {
-                    "id": name,
-                    "size": st.st_size,
-                    "modified": _datetime.fromtimestamp(st.st_mtime, _timezone.utc).isoformat(),
-                }
-            )
-        return out
+        with _VolumeRead():
+            if not _os.path.isdir(root):
+                return []
+            out = []
+            for name in sorted(_os.listdir(root)):
+                p = _os.path.join(root, name)
+                if not _os.path.isfile(p):
+                    continue
+                st = _os.stat(p)
+                out.append(
+                    {
+                        "id": name,
+                        "size": st.st_size,
+                        "modified": _datetime.fromtimestamp(st.st_mtime, _timezone.utc).isoformat(),
+                    }
+                )
+            return out
 
     @web_app.get("/api/control/sessions")
     def list_sessions(user: dict = Depends(_owner)):
@@ -2457,10 +2641,11 @@ def control_api():
         if not _SESSION_RE.match(session_id):
             raise HTTPException(status_code=400, detail="invalid session id")
         path = _safe_join(CONV_DIR, session_id)
-        if not _os.path.isfile(path):
-            raise HTTPException(status_code=404, detail="no such session")
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()  # reading in memory is fine; only a window ships
+        with _VolumeRead():
+            if not _os.path.isfile(path):
+                raise HTTPException(status_code=404, detail="no such session")
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()  # reading in memory is fine; only a window ships
         total = len(lines)
         if tail > 0:
             n = min(int(tail), 2000, total)
