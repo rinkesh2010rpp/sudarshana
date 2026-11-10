@@ -555,7 +555,10 @@ KNOWLEDGE_RELATED_MAX = 5
 KNOWLEDGE_INDEX_HEADER = "# Knowledge index"
 # Not a rule for the agent — a signal for us: past this the index costs too
 # much to inject whole, and it's time to build per-turn retrieval instead.
-KNOWLEDGE_INDEX_SEARCH_THRESHOLD_TOKENS = 3000
+# Raised 3000 -> 5000 on 2026-11-10 at Rinkesh's request: he wants the index
+# to grow further before we decide retrieval is needed, so the signal should
+# fire on real cost, not on a line we picked when the layer was young.
+KNOWLEDGE_INDEX_SEARCH_THRESHOLD_TOKENS = 5000
 
 
 def _parse_knowledge_page(path: str) -> dict:
