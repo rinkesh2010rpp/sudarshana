@@ -905,7 +905,13 @@ def _status_reconcile_zombies(d):
         rec = d.get(k, {}) or {}
         if _status_is_zombie(rec):
             rec["ended"] = rec.get("ended") or now
-            rec["outcome"] = rec.get("outcome") or "zombie"
+            # Unconditional, and deliberately so: a record with `ended` set is
+            # never a zombie, so no honest outcome can be overwritten here.
+            # The old `rec.get("outcome") or "zombie"` could never fire —
+            # _status_turn_start writes outcome="running", which is truthy, so
+            # a reconciled death kept saying "running" and the panel showed a
+            # crashed newest turn as still running.
+            rec["outcome"] = "zombie"
             rec["summary"] = rec.get("summary") or "mid-run death (stale > TTL); closed by reconciliation"
             d[k] = rec
             closed.append((k, rec))
