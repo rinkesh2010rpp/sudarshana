@@ -783,8 +783,16 @@ def _send_telegram(text: str) -> None:
 # mid-run. Unique per-turn keys make concurrent turns safe.
 STATUS_DICT_NAME = "sudarshana-status"
 STATUS_HISTORY_LIMIT = 50
-# Closed turn:* records kept; older ones are pruned at turn-end.
-STATUS_RECORDS_KEEP = 100
+# Closed turn:* records are pruned at turn-end by the timestamp in their key.
+# The overview verdict covers 24 h, so 36 h of records is margin — and it is
+# the record count that costs, not the store size: every read of this Dict is
+# one gRPC message per entry (~8 ms warm), so 102 records made the panel's
+# verdict ~1 s and every turn's bookkeeping ~9 s. At ~1.2 turns/hour, 36 h is
+# ~44 records, which brings both down with no new code path and no new race.
+STATUS_RECORDS_TTL_SECONDS = 36 * 3600
+# Belt-and-braces cap for a burst of turns, applied oldest-first by key after
+# the age prune. Never the primary rule: the panel needs 24 h, not N records.
+STATUS_RECORDS_KEEP = 60
 # An unclosed record older than this can't be a live turn — it's a zombie from a
 # turn that died before _status_turn_end, and must not be handed `current`.
 # This is the turn cap itself (record_timeout=1500), not a round 30 minutes: with
@@ -905,6 +913,51 @@ def _status_reconcile_zombies(d):
 
 
 @_status_guard
+def _status_prune(d, keep_key: str = ""):
+    """Delete turn:* records older than STATUS_RECORDS_TTL_SECONDS, then cap
+    what is left at STATUS_RECORDS_KEEP (oldest first).
+
+    Decided entirely from the timestamp in each key, so the sweep costs one
+    d.keys() and no per-record read — the old version asked every record
+    "are you closed?" with a d.get(), i.e. one gRPC message per record on
+    every turn end. Nothing unclosed is pruned silently: this runs after
+    _status_reconcile_zombies in _status_turn_end, so a record past the TTL
+    has already been closed as a death, and the running turn's own record is
+    kept regardless."""
+    keys = d.keys() or []
+    now = time.time()
+    turn_keys = sorted(
+        k
+        for k in keys
+        if isinstance(k, str) and k.startswith("turn:") and k != keep_key
+    )
+    stale = []
+    for k in turn_keys:
+        started = _status_parse_ts(k[len("turn:"):])
+        if started is None:
+            continue
+        if (now - started) > STATUS_RECORDS_TTL_SECONDS:
+            stale.append(k)
+    live = [k for k in turn_keys if k not in stale]
+    excess = len(live) - STATUS_RECORDS_KEEP
+    if excess > 0:
+        # The cap reads only the few records it would delete — and only to keep
+        # the one guarantee the age rule can't make on its own: an unclosed
+        # record is a mid-run death, and deleting it would erase the evidence
+        # (the old count-only prune never dropped one either). Under the cap
+        # this branch does zero reads; it is a burst backstop, not the rule.
+        for k in live[:excess]:
+            if (d.get(k, {}) or {}).get("ended") is not None:
+                stale.append(k)
+    for k in stale:
+        try:
+            del d[k]
+        except Exception as e:  # noqa: BLE001
+            print(f"[status] prune step failed (non-fatal): {type(e).__name__}: {e}")
+    return len(stale)
+
+
+@_status_guard
 def _status_other_running(d, exclude_key: str):
     """Most recent turn:* record (excluding exclude_key) that is genuinely still
     running: ended=None AND started within the staleness TTL. ISO-8601 keys sort
@@ -955,19 +1008,8 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
     # Before deciding who gets `current`, so a zombie isn't taken for a live turn.
     _status_reconcile_zombies(d)
 
-    # Prune old closed records; never unclosed ones (mid-run death evidence).
-    closed_keys = sorted(
-        k
-        for k in (d.keys() or [])
-        if isinstance(k, str) and k.startswith("turn:") and k != turn_key
-        and (d.get(k, {}) or {}).get("ended") is not None
-    )
-    if len(closed_keys) > STATUS_RECORDS_KEEP:
-        try:
-            for k in closed_keys[: len(closed_keys) - STATUS_RECORDS_KEEP]:
-                del d[k]
-        except Exception as e:  # noqa: BLE001
-            print(f"[status] prune step failed (non-fatal): {type(e).__name__}: {e}")
+    # Prune records the overview no longer needs: by age, from the key alone.
+    _status_prune(d, turn_key)
 
     current = d.get("current", {}) or {}
     if current.get("_turn_key") == turn_key:
