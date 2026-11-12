@@ -1390,10 +1390,16 @@ class Sudarshana:
         # Second dedup gate (the webhook holds the first). Method calls are
         # serialised by this class's single container, so two copies of one
         # update cannot both pass here — not even the pair that races past the
-        # webhook's claim.
-        if update_id is not None and _telegram_claim(update_id, "run"):
-            print(f"[telegram] duplicate update_id {update_id} — no turn started")
-            return
+        # webhook's claim. That serialisation is why this gate is the real
+        # guarantee: read-then-write here cannot interleave with another copy.
+        if update_id is not None:
+            if _telegram_seen(update_id, "run"):
+                print(f"[telegram] duplicate update_id {update_id} — no turn started")
+                return
+            # Recorded before the turn so a crash mid-turn can't re-run it.
+            # Both helpers swallow Dict errors: this turn was already acked to
+            # Telegram, so raising here would discard the message silently.
+            _telegram_record(update_id, "run")
 
         # Rinkesh's external-agent controls run here, never through the model.
         if text.strip().lower().split()[:1] == ["/agents"]:
@@ -1456,28 +1462,52 @@ class Sudarshana:
 # then this doubled name is what keeps messages from 404ing after deploy.
 TELEGRAM_WEBHOOK_LABEL = "sudarshana-sudarshana-telegram-webhook"
 # Dedup state: a rolling window of recent update_ids per role, in one Dict
-# entry each. "webhook" means the request was accepted; "run" means a turn was
+# entry each. "webhook" means the request was spawned; "run" means a turn was
 # started. Separate roles so the two gates can't consume each other's claim.
 TELEGRAM_CLAIM_DICT_NAME = "sudarshana-telegram-claims"
 TELEGRAM_CLAIM_WINDOW = 200
 
 
-def _telegram_claim(update_id: int, role: str) -> bool:
-    """Record `update_id` for `role`; return True if it was already recorded.
+def _telegram_seen(update_id: int, role: str) -> bool:
+    """True if `update_id` is already recorded for `role`. Advisory only.
 
-    One read and one write of one bounded list, so cost doesn't grow with
-    traffic. Two copies of an update arriving within the same instant can both
-    read before either writes; that window is why process_message holds a
-    second claim — turns are serialised by the class's single container.
+    If the Dict can't be read this answers False — treat the update as new and
+    print why. A claim that fails must never drop a real message; the cost of
+    being wrong that way is one extra turn, the cost of the other way is a
+    message that no retry can ever recover.
+
+    Correctness against duplicates does not rest here. This read and the write
+    in `_telegram_record` are two round trips, so two webhook containers can
+    interleave and lose one id. The guarantee is the "run" gate in
+    `process_message`, where calls are serialised by the class's single
+    container and read-then-write cannot interleave with another copy of
+    itself. This gate only saves a spawn.
     """
-    d = modal.Dict.from_name(TELEGRAM_CLAIM_DICT_NAME, create_if_missing=True)
-    key = f"seen:{role}"
-    seen = list(d.get(key) or [])
-    if update_id in seen:
-        return True
-    seen.append(update_id)
-    d.put(key, seen[-TELEGRAM_CLAIM_WINDOW:])
-    return False
+    try:
+        d = modal.Dict.from_name(TELEGRAM_CLAIM_DICT_NAME, create_if_missing=True)
+        seen = list(d.get(f"seen:{role}") or [])
+    except Exception as e:  # noqa: BLE001 — a Dict outage must not 500 the webhook
+        print(f"[telegram] claim read failed (role={role}): {e!r} — treating as new")
+        return False
+    return update_id in seen
+
+
+def _telegram_record(update_id: int, role: str) -> None:
+    """Best-effort: remember `update_id` for `role` in one bounded list.
+
+    Never raises — a Dict outage means a resend may re-run the update, which
+    the "run" gate still stops from becoming a second turn *if it can read the
+    Dict*, and which at worst costs one extra turn. Losing the message would be
+    worse.
+    """
+    try:
+        d = modal.Dict.from_name(TELEGRAM_CLAIM_DICT_NAME, create_if_missing=True)
+        key = f"seen:{role}"
+        seen = [i for i in (d.get(key) or []) if i != update_id]
+        seen.append(update_id)
+        d.put(key, seen[-TELEGRAM_CLAIM_WINDOW:])
+    except Exception as e:  # noqa: BLE001
+        print(f"[telegram] claim write failed (role={role}): {e!r} — continuing")
 
 
 @app.function(
@@ -1485,10 +1515,21 @@ def _telegram_claim(update_id: int, role: str) -> bool:
     secrets=[modal.Secret.from_dotenv()],
     # Short: this function's whole job is to ack and spawn.
     timeout=60,
+    # Unbounded, a burst of retries from Telegram would each spin up a
+    # full-image container. Four acks at a time is far more than this needs.
+    max_containers=4,
 )
 @modal.fastapi_endpoint(method="POST", label=TELEGRAM_WEBHOOK_LABEL)
 def telegram_webhook(payload: dict):
-    """Ack Telegram fast, then spawn the turn. Never runs the model itself."""
+    """Ack Telegram fast, then spawn the turn. Never runs the model itself.
+
+    Error policy: a payload problem is answered 200 (a retry cannot help, and a
+    failing status makes Telegram retry the same update forever); anything that
+    could still succeed on a retry — a failed spawn, a missing secret — is
+    answered 5xx, so the update is kept rather than discarded. Dedup-Dict
+    failures are answered 200 because by then the update has been accepted and
+    the turn is already queued; there is nothing left to retry.
+    """
     message = (payload or {}).get("message") or {}
     text = message.get("text")
     if not text:
@@ -1497,8 +1538,13 @@ def telegram_webhook(payload: dict):
 
     allowed_user_id = os.environ.get("TELEGRAM_ALLOWED_USER_ID")
     if not allowed_user_id:
-        print("[telegram] TELEGRAM_ALLOWED_USER_ID is unset — dropping the update")
-        return {"ok": True}
+        # Misconfiguration, not a bad update. Answer 5xx on purpose: a 200 here
+        # would tell Telegram the update is delivered and every message would
+        # be discarded silently. This way they queue until the secret is fixed.
+        print("[telegram] TELEGRAM_ALLOWED_USER_ID is unset — refusing the update")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=503, content={"ok": False, "error": "misconfigured"})
 
     sender_id = str((message.get("from") or {}).get("id", ""))
     if sender_id != allowed_user_id:
@@ -1507,13 +1553,18 @@ def telegram_webhook(payload: dict):
 
     update_id = (payload or {}).get("update_id")
     update_id = update_id if isinstance(update_id, int) else None
-    if update_id is not None and _telegram_claim(update_id, "webhook"):
+    if update_id is not None and _telegram_seen(update_id, "webhook"):
         print(f"[telegram] duplicate update_id {update_id} — acked, not spawned")
         return {"ok": True, "duplicate": True}
 
-    # .spawn() returns immediately so Telegram gets its ack; the turn itself
-    # queues behind whatever the agent container is already running.
+    # Spawn FIRST, record second. If .spawn raises, nothing has been recorded,
+    # so Telegram's retry of this same update runs instead of being dismissed
+    # as a duplicate — which would lose the message for good, since Telegram
+    # treats our 5xx as "try again" and would have already been told the update
+    # was seen. The reverse order has no such recovery.
     Sudarshana().process_message.spawn(text, update_id)
+    if update_id is not None:
+        _telegram_record(update_id, "webhook")
     return {"ok": True}
 
 

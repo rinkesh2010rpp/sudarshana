@@ -48,13 +48,18 @@ def mod(monkeypatch):
         def spawn(self, text, update_id=None):
             spawned.append((text, update_id))
 
+    spawner = _Spawn()
+
     class _Sudarshana:
+        # One shared spawner: the webhook builds a fresh handle per call, so a
+        # test has to be able to reach the object those handles delegate to.
         def __init__(self):
-            self.process_message = _Spawn()
+            self.process_message = spawner
 
     monkeypatch.setattr(main, "Sudarshana", _Sudarshana)
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "4242")
     main.spawned = spawned
+    main.spawner = spawner
     main.webhook = main.telegram_webhook.get_raw_f()
     return main
 
@@ -113,7 +118,64 @@ def test_claim_window_is_bounded(mod):
 
 
 def test_the_two_gates_do_not_consume_each_others_claim(mod):
-    """The webhook claims "webhook"; the turn claims "run" for the same id."""
-    assert mod._telegram_claim(5555, "webhook") is False
-    assert mod._telegram_claim(5555, "run") is False
-    assert mod._telegram_claim(5555, "run") is True
+    """The webhook records "webhook"; the turn records "run" for the same id."""
+    mod._telegram_record(5555, "webhook")
+    assert mod._telegram_seen(5555, "webhook") is True
+    assert mod._telegram_seen(5555, "run") is False
+    mod._telegram_record(5555, "run")
+    assert mod._telegram_seen(5555, "run") is True
+
+
+def test_a_failed_spawn_loses_nothing(mod):
+    """The bug Rinkesh caught: record first and a failed spawn eats the message.
+
+    Telegram retries only if we answer 5xx; if we had already recorded the
+    update_id, every retry would be dismissed as a duplicate and the message
+    would be gone for good.
+    """
+    mod.webhook(_update(31, "hi"))
+
+    def _boom(text, update_id=None):
+        raise RuntimeError("no capacity")
+
+    mod.spawner.spawn = _boom
+    with pytest.raises(RuntimeError):
+        mod.webhook(_update(32, "important"))
+
+    # Nothing was recorded, so Telegram's retry is not treated as a duplicate.
+    assert mod._telegram_seen(32, "webhook") is False
+    assert STORE[("sudarshana-telegram-claims", "seen:webhook")] == [31]
+
+    del mod.spawner.spawn
+    assert mod.webhook(_update(32, "important")) == {"ok": True}
+    assert mod.spawned[-1] == ("important", 32)
+
+
+def test_a_dict_outage_does_not_break_the_webhook(mod, monkeypatch):
+    """A Dict error must not become a 500, and must not drop the message."""
+    def _down(cls, name, create_if_missing=False):
+        raise RuntimeError("dict unavailable")
+
+    monkeypatch.setattr(modal.Dict, "from_name", classmethod(_down))
+    assert mod.webhook(_update(40, "still arrives")) == {"ok": True}
+    assert mod.spawned == [("still arrives", 40)]
+
+
+def test_a_dict_outage_cannot_kill_a_turn_that_was_already_acked(mod, monkeypatch):
+    """Same outage, from inside process_message: the webhook already said ok,
+    so raising here would discard the message with nothing left to retry."""
+    def _down(cls, name, create_if_missing=False):
+        raise RuntimeError("dict unavailable")
+
+    monkeypatch.setattr(modal.Dict, "from_name", classmethod(_down))
+    assert mod._telegram_seen(41, "run") is False
+    mod._telegram_record(41, "run")  # must not raise
+
+
+def test_unset_allowed_user_is_a_5xx_not_a_silent_drop(mod, monkeypatch):
+    """A missing secret is misconfiguration: keep the update, don't discard it."""
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_ID", raising=False)
+    response = mod.webhook(_update(50, "hello"))
+    assert response.status_code == 503
+    assert mod.spawned == []
+

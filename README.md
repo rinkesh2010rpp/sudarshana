@@ -32,6 +32,12 @@ Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ─
   repeat without spawning. `process_message` holds a second claim for the same
   id: turns are serialised by the single container, so even the pair that races
   past the webhook can't both run.
+- **The id is recorded after the spawn, not before.** A spawn that raises
+  answers 5xx so Telegram retries; recording first would make that retry look
+  like a duplicate and lose the message for good. Claim failures never raise
+  either — a Dict outage costs at most one extra turn, a dropped message costs
+  everything. The webhook's gate is an optimisation; the serialised "run" gate
+  is the guarantee.
 - **Triggers call `spawn()` and return right away.** A webhook that waited for
   the work got retried by Telegram, and a cron wrapper that waited got
   preempted and retried. Both started duplicate runs.
