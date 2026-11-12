@@ -19,17 +19,33 @@ Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ─
                                                                   final message ──► Telegram
 ```
 
-- **One container (`max_containers=1`).** Telegram and hourly turns
-  queue, so two of them never write `state.md` or the day's log at the same
-  time. A turn can run for up to 1500 s.
-- **Triggers and the webhook call `spawn()` and return right away.** A webhook
-  that waited for the work got retried by Telegram, and a cron wrapper that
-  waited got preempted and retried. Both started duplicate runs.
+- **One container (`max_containers=1`) for the turns.** Telegram and hourly
+  turns queue, so two of them never write `state.md` or the day's log at the
+  same time. A turn can run for up to 1500 s.
+- **The webhook is not in that container.** `telegram_webhook` is its own
+  function — no Volume, no model — so it acks in milliseconds even mid-turn.
+  As a method it shared the single container, a delivery that arrived during a
+  long turn waited past Telegram's delivery timeout, and each resend started
+  another turn (one message became four on 2026-11-11).
+- **Resent updates are dropped by `update_id`.** The webhook records each id
+  in a rolling window in the `sudarshana-telegram-claims` Dict and acks a
+  repeat without spawning. `process_message` holds a second claim for the same
+  id: turns are serialised by the single container, so even the pair that races
+  past the webhook can't both run.
+- **The id is recorded after the spawn, not before.** A spawn that raises
+  answers 5xx so Telegram retries; recording first would make that retry look
+  like a duplicate and lose the message for good. Claim failures never raise
+  either — a Dict outage costs at most one extra turn, a dropped message costs
+  everything. The webhook's gate is an optimisation; the serialised "run" gate
+  is the guarantee.
+- **Triggers call `spawn()` and return right away.** A webhook that waited for
+  the work got retried by Telegram, and a cron wrapper that waited got
+  preempted and retried. Both started duplicate runs.
 - **Python delivers the reply, not a tool call.** `_invoke` always sends the
   agent's final message to Telegram and prints the full trace to the Modal logs.
 - **Only `TELEGRAM_ALLOWED_USER_ID` can talk to it.** Messages from anyone else
-  are dropped without a reply. `/agents …` commands go straight to the A2A
-  controls and never reach the model.
+  are dropped without a reply. `/agents …` commands are handled inside
+  `process_message` and never reach the model.
 - **What the cycles do is set by prompt, not code:** `SYSTEM_PROMPT`,
   `SYSTEM_PROMPT` and `HOURLY_TASK` in `main.py`.
 
@@ -104,7 +120,10 @@ The UTF-8 variables are needed on Windows. Without them, `modal deploy` crashes
 while printing its success checkmark.
 
 The deployed webhook URL stays the same across deploys, so you only need to
-point Telegram at it once (or again if it changes):
+point Telegram at it once (or again if it changes). The label
+`TELEGRAM_WEBHOOK_LABEL` in `main.py` is pinned to the slug the endpoint had
+when it was a class method, so moving it out of the class did not change the
+URL and Telegram needed no re-registration:
 
 ```bash
 python agent/set_webhook.py https://<workspace>--sudarshana-sudarshana-telegram-webhook.modal.run
