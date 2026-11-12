@@ -2,11 +2,12 @@
 Sudarshana — a message- and schedule-triggered agent with unsandboxed
 shell + git access to its own repo.
 
-Telegram posts to a Modal webhook, which verifies the sender, spawns the
-real work (returning immediately so Telegram doesn't retry and
-double-invoke), and runs the message through a LangChain "deep agent": a
-model with write_todos plus a LocalShellBackend rooted at a persistent
-Modal Volume (file tools + execute_command).
+Telegram posts to a Modal webhook — its own lightweight function, not a
+method — which verifies the sender, drops updates it has already seen
+(Telegram resends anything it thinks timed out), spawns the real work and
+returns immediately, and runs the message through a LangChain "deep
+agent": a model with write_todos plus a LocalShellBackend rooted at a
+persistent Modal Volume (file tools + execute_command).
 
 Continuity comes from files the agent maintains on the Volume:
 VISION.md, ROADMAP.md, actions/<id>.md, logs/<date>.md.
@@ -21,14 +22,15 @@ unconditionally, and the full message trace is printed to the modal logs.
 
 External A2A agents (find, register, call at runtime) come from the
 a2a-hotplug package; Rinkesh controls them with /agents on Telegram.
-Two public web endpoints share the app: status-api (read-only turn
-status) and inbox-api (the visitor inbox). See README.md.
+The web endpoints share the app: telegram-webhook (Telegram's door),
+status-api (read-only turn status), inbox-api (the visitor inbox) and
+control-api (`/control`). See README.md.
 
-The agent is built once per container in Sudarshana.setup(); both
-telegram_webhook and hourly_checkin reuse that instance. hourly_trigger
-is a bare wrapper because Modal only accepts schedule= on
-@app.function(), not @modal.method(). Change the hourly behaviour via
-HOURLY_TASK / the prompt, not code.
+The agent is built once per container in Sudarshana.setup();
+process_message (spawned by telegram_webhook) and hourly_checkin reuse
+that instance. hourly_trigger is a bare wrapper because Modal only
+accepts schedule= on @app.function(), not @modal.method(). Change the
+hourly behaviour via HOURLY_TASK / the prompt, not code.
 
     modal serve agent/main.py     # temporary URL
     modal deploy agent/main.py    # stable URL
@@ -1381,33 +1383,22 @@ class Sudarshana:
         _send_telegram(_final_message(msgs))
         return result
 
-    @modal.fastapi_endpoint(method="POST")
-    def telegram_webhook(self, payload: dict):
-        message = payload.get("message")
-        if not message or "text" not in message:
-            # Ignore non-text updates (edits, button taps, other update types).
-            return {"ok": True}
+    @modal.method()
+    def process_message(self, text: str, update_id: int | None = None):
+        import time
 
-        allowed_user_id = os.environ["TELEGRAM_ALLOWED_USER_ID"]
-        sender_id = str(message["from"]["id"])
-
-        if sender_id != allowed_user_id:
-            # Silently drop — the bot is reachable by anyone who finds it.
-            return {"ok": True}
+        # Second dedup gate (the webhook holds the first). Method calls are
+        # serialised by this class's single container, so two copies of one
+        # update cannot both pass here — not even the pair that races past the
+        # webhook's claim.
+        if update_id is not None and _telegram_claim(update_id, "run"):
+            print(f"[telegram] duplicate update_id {update_id} — no turn started")
+            return
 
         # Rinkesh's external-agent controls run here, never through the model.
-        if message["text"].strip().lower().split()[:1] == ["/agents"]:
-            _send_telegram(_agents_command(self.a2a, message["text"]))
-            return {"ok": True}
-
-        # .spawn() returns immediately so Telegram gets a fast ack; awaiting
-        # the work here caused retry-storm double-invokes on slow tasks.
-        self.process_message.spawn(message["text"])
-        return {"ok": True}
-
-    @modal.method()
-    def process_message(self, text: str):
-        import time
+        if text.strip().lower().split()[:1] == ["/agents"]:
+            _send_telegram(_agents_command(self.a2a, text))
+            return
 
         started = time.monotonic()
         print(f"[timing] process_message started: {text[:200]!r}")
@@ -1446,6 +1437,84 @@ class Sudarshana:
             "hourly turn finished",
         )
         volume.commit()
+
+
+# --- Telegram intake ---------------------------------------------------------
+# The webhook lives OUTSIDE the Sudarshana class on purpose. As a method it
+# shared the class's single container (max_containers=1), so a delivery that
+# arrived mid-turn waited out the whole turn; Telegram gave up on the HTTP
+# request and resent the update, and each resend started another turn — one
+# message became four identical turns on 2026-11-11. Here it mounts no Volume,
+# never touches the model, and answers in milliseconds; the container limit
+# stays on the class, where the turns are.
+#
+# The label is pinned to the slug the old method endpoint had — the URL
+# Telegram is already registered against (`getWebhookInfo` on 2026-11-11:
+# https://rinkesh2010rpp--sudarshana-sudarshana-telegram-webhook.modal.run,
+# last error "Read timeout expired" at 21:14 PST, mid-turn). A clean rename is
+# a separate change that must include re-running agent/set_webhook.py; until
+# then this doubled name is what keeps messages from 404ing after deploy.
+TELEGRAM_WEBHOOK_LABEL = "sudarshana-sudarshana-telegram-webhook"
+# Dedup state: a rolling window of recent update_ids per role, in one Dict
+# entry each. "webhook" means the request was accepted; "run" means a turn was
+# started. Separate roles so the two gates can't consume each other's claim.
+TELEGRAM_CLAIM_DICT_NAME = "sudarshana-telegram-claims"
+TELEGRAM_CLAIM_WINDOW = 200
+
+
+def _telegram_claim(update_id: int, role: str) -> bool:
+    """Record `update_id` for `role`; return True if it was already recorded.
+
+    One read and one write of one bounded list, so cost doesn't grow with
+    traffic. Two copies of an update arriving within the same instant can both
+    read before either writes; that window is why process_message holds a
+    second claim — turns are serialised by the class's single container.
+    """
+    d = modal.Dict.from_name(TELEGRAM_CLAIM_DICT_NAME, create_if_missing=True)
+    key = f"seen:{role}"
+    seen = list(d.get(key) or [])
+    if update_id in seen:
+        return True
+    seen.append(update_id)
+    d.put(key, seen[-TELEGRAM_CLAIM_WINDOW:])
+    return False
+
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_dotenv()],
+    # Short: this function's whole job is to ack and spawn.
+    timeout=60,
+)
+@modal.fastapi_endpoint(method="POST", label=TELEGRAM_WEBHOOK_LABEL)
+def telegram_webhook(payload: dict):
+    """Ack Telegram fast, then spawn the turn. Never runs the model itself."""
+    message = (payload or {}).get("message") or {}
+    text = message.get("text")
+    if not text:
+        # Ignore non-text updates (edits, button taps, other update types).
+        return {"ok": True}
+
+    allowed_user_id = os.environ.get("TELEGRAM_ALLOWED_USER_ID")
+    if not allowed_user_id:
+        print("[telegram] TELEGRAM_ALLOWED_USER_ID is unset — dropping the update")
+        return {"ok": True}
+
+    sender_id = str((message.get("from") or {}).get("id", ""))
+    if sender_id != allowed_user_id:
+        # Silently drop — the bot is reachable by anyone who finds it.
+        return {"ok": True}
+
+    update_id = (payload or {}).get("update_id")
+    update_id = update_id if isinstance(update_id, int) else None
+    if update_id is not None and _telegram_claim(update_id, "webhook"):
+        print(f"[telegram] duplicate update_id {update_id} — acked, not spawned")
+        return {"ok": True, "duplicate": True}
+
+    # .spawn() returns immediately so Telegram gets its ack; the turn itself
+    # queues behind whatever the agent container is already running.
+    Sudarshana().process_message.spawn(text, update_id)
+    return {"ok": True}
 
 
 @app.function(image=image)
