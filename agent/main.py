@@ -338,6 +338,17 @@ gateway main (Netlify deploys), then mark that log file published. That
 is the whole cycle when it happens — the roadmap step waits for the next
 wake-up.
 
+The daily cost check. On the first cycle of a new day, run
+`python3 /data/tools/cost_ledger.py --record` (default: yesterday, UTC).
+It aggregates the model-call logs already in /data/llm-calls, prices them
+at the routed slug's own rates, appends one row to
+/data/costs/<YYYY-MM>.md and prints the day's total. Put that line in the
+log; a WARN line — an unpriced model slug, a turn over $0.50, a day far
+above the recent median — is worth a look before other work, because
+those are the shapes a slug flip or a runaway turn takes and nothing else
+in your view would show it. Keep this small: one aggregator, no capture
+code, no dashboard, no per-turn database.
+
 The memory compile. Your durable knowledge layer (/data/memory/knowledge/
 pages, routed by index.md) is kept current by a compile pass that is
 your own standing task — you act on it yourself, exactly like the daily
