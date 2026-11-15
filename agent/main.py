@@ -1067,7 +1067,11 @@ def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
 CHECKPOINT_DB_PATH = os.path.join(VOLUME_PATH, "checkpoints.db")
 CONVERSATION_THREAD = {"configurable": {"thread_id": "sudarshana"}}
 # Max graph steps per turn; also quoted in the Telegram message when hit.
-RECURSION_LIMIT = 200
+# ~4 steps per model call. 200 (~50 calls) was hit by ~1 in 3 turns on
+# 11-13..11-14, mostly while writing notes after the work landed; those turns
+# were 97% unique tool calls, i.e. real work, not loops. 300 (~75 calls)
+# still stops a runaway.
+RECURSION_LIMIT = 300
 # Returned by _invoke() when a turn hit the step cap instead of finishing, so
 # callers can close the turn with an honest outcome rather than "done".
 STEP_LIMIT = "step-limit"
