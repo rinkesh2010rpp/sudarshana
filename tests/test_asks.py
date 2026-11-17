@@ -1,10 +1,11 @@
 """The ask list: ask_rinkesh / resolve_ask and the per-turn note.
 
-Runs the real `agent/main.py` helpers against an in-memory stand-in for
-`modal.Dict` and a recording stand-in for the Telegram send. No network.
+Runs the real `agent/main.py` helpers against a temp asks.json and a
+recording stand-in for the Telegram send. No network, no Modal.
 
-Why: what the agent needed from Rinkesh lived as a hand-copied "his:" line in
-state.md and went stale (PR #64 was still listed days after it merged). These
+Why: what the agent needed from Rinkesh lived in hand-kept lists and went
+stale (PR #64 in state.md's "his:" line, PR #61 in asks.json, each listed days
+after it merged). These
 tests pin the properties that fix that: an ask is recorded only once he has
 been sent it, it closes by an explicit outcome or by lapsing, and a lapse is
 reported once rather than every hour.
@@ -12,6 +13,8 @@ reported once rather than every hour.
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import json
 
 import pytest
 
@@ -35,7 +38,7 @@ class _FakeDict:
 
 
 @pytest.fixture()
-def mod(monkeypatch):
+def mod(monkeypatch, tmp_path):
     STORE.clear()
     monkeypatch.setattr(
         modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _FakeDict(name))
@@ -43,7 +46,18 @@ def mod(monkeypatch):
     sys.modules.pop("main", None)
     import main
 
+    monkeypatch.setattr(main, "ASKS_PATH", str(tmp_path / "memory" / "asks.json"))
     return main
+
+
+def _file(mod):
+    with open(mod.ASKS_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write(mod, data):
+    Path(mod.ASKS_PATH).parent.mkdir(parents=True, exist_ok=True)
+    Path(mod.ASKS_PATH).write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
 
 
 @pytest.fixture()
@@ -157,9 +171,52 @@ def test_closed_history_is_bounded(mod, sent):
     assert asks[0]["status"] == "open"
 
 
-def test_context_fails_open(mod, monkeypatch):
-    def broken():
-        raise RuntimeError("dict unavailable")
-
-    monkeypatch.setattr(mod, "_asks_store", broken)
+def test_context_fails_open(mod):
+    _write(mod, "{not json")
     assert "could not be read" in mod._asks_context(now=T0)
+
+
+def test_malformed_file_blocks_sending(mod, sent):
+    _write(mod, "{not json")
+    res = _ask(mod, sent)
+    assert not res["ok"] and "nothing sent" in res["error"]
+    assert sent == []
+    assert not mod._ask_resolve("abcd", "x", now=T0)["ok"]
+
+
+def test_file_has_what_control_reads(mod, sent):
+    """/api/control/overview serves data["asks"] as-is and reads id, ask,
+    detail, asked_at from each — so open asks only, in those fields."""
+    keep = _ask(mod, sent, q="Keep?", options="A / B")["id"]
+    gone = _ask(mod, sent, q="Gone?")["id"]
+    mod._ask_resolve(gone, "done another way", status="dropped", now=T0)
+    data = _file(mod)
+    assert [a["id"] for a in data["asks"]] == [keep]
+    [a] = data["asks"]
+    assert a["ask"] == "Keep?" and a["asked_at"] == T0.isoformat()
+    assert a["detail"] == "it's blocking the deploy Options: A / B"
+    assert [c["id"] for c in data["closed"]] == [gone]
+    assert "do not edit by hand" in data["_what"]
+
+
+def test_hand_written_asks_are_adopted_and_lapse(mod, sent):
+    """The file as the agent kept it before the tools: no status, no expiry."""
+    _write(mod, {
+        "_what": "The agent maintains this each cycle.",
+        "asks": [
+            {"id": "overview-latency", "ask": "Merge + deploy PR #61", "detail": "long story",
+             "asked_at": "2026-11-10T01:00:00-08:00"},
+            {"id": "fresh", "ask": "Pick a colour", "detail": "",
+             "asked_at": (T0 - timedelta(hours=2)).isoformat()},
+            {"ask": "no timestamp"},
+            "not a dict",
+        ],
+    })
+    ctx = mod._asks_context(now=T0)
+    assert "[overview-latency] Merge + deploy PR #61" in ctx and "lapsed" in ctx
+    assert "[fresh] asked 2h ago" in ctx
+    data = _file(mod)
+    assert [a["id"] for a in data["asks"]] == ["fresh"]
+    assert data["closed"][0]["id"] == "overview-latency"
+    assert data["closed"][0]["detail"] == "long story"
+    assert mod._ask_resolve("fresh", "blue", now=T0)["ok"]
