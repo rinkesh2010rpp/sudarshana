@@ -108,6 +108,17 @@ with Rinkesh, treat it as needing his input rather than your own
 judgment. When you are unsure whether something is reversible or
 in-bounds, act as if it is not.
 
+When you need something from Rinkesh — a decision, an approval, a merge,
+anything only he can do — ask with ask_rinkesh: one question, why it is
+blocked on him, and the options if there are any. He gets it on Telegram as
+its own message. The open asks, shown to you every turn, are the one list of
+what you need from him: don't keep a separate "his:" list in state.md, your
+logs or your messages, and don't repeat an open ask. When he answers, or the
+need goes away (the PR was merged, the work moved on), close it with
+resolve_ask. An ask nobody re-confirms lapses by itself; ask again only if
+it is still truly blocking, and say what changed. Ask rarely — only what is
+actually waiting on him.
+
 
 THE WORLD YOU OPERATE IN
 
@@ -408,7 +419,8 @@ HOURLY_TASK = (
     "current initiative in /data/ROADMAP.md — one step, then stop and leave "
     "the rest for the next wake-up. If that initiative is still awaiting "
     "Rinkesh's approval, keep to light research only — no in-depth work, no "
-    "code — and it's fine to just remind him you need a decision. If nothing "
+    "code — and make sure the decision is an open ask (ask_rinkesh) rather "
+    "than reminding him in your message. If nothing "
     "is queued at all, put a short proposal to Rinkesh rather than starting it. "
     "Whatever you did this cycle, end by appending a line to today's "
     "/data/logs/<date>.md. If the cycle's injected 'Visitor inbox intake' "
@@ -784,6 +796,203 @@ def _send_telegram(text: str) -> None:
             json={"chat_id": chat_id, "text": chunk},
             timeout=10,
         )
+
+
+# --- asks: what the agent needs from Rinkesh ----------------------------------
+# Code owns this list so it can't go stale the way a hand-copied "his:" line in
+# state.md did (PR #64 was carried as an open ask for days after it merged).
+# ask_rinkesh sends one Telegram message and records the ask; resolve_ask closes
+# it; an ask nobody re-confirms expires by itself. A modal.Dict rather than a
+# Volume file so a read-only endpoint (e.g. /control) can show it later.
+ASKS_DICT_NAME = "sudarshana-asks"
+ASK_DEFAULT_DAYS = 3
+ASK_MAX_DAYS = 14
+# Asking is meant to be rare; a cap forces closing or dropping old asks first.
+ASK_MAX_OPEN = 3
+# Closed asks kept for the record, newest last.
+ASK_KEEP_CLOSED = 50
+ASK_RESOLVE_STATUSES = {"answered", "dropped"}
+
+
+def _asks_store():
+    return modal.Dict.from_name(ASKS_DICT_NAME, create_if_missing=True)
+
+
+def _asks_load() -> list:
+    return list(_asks_store().get("asks", []) or [])
+
+
+def _asks_save(asks: list) -> None:
+    open_ = [a for a in asks if a["status"] == "open"]
+    closed = [a for a in asks if a["status"] != "open"][-ASK_KEEP_CLOSED:]
+    _asks_store().put("asks", open_ + closed)
+
+
+def _utcnow():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(s: str):
+    from datetime import datetime
+
+    return datetime.fromisoformat(s)
+
+
+def _age(delta) -> str:
+    secs = int(delta.total_seconds())
+    if secs < 3600:
+        return f"{max(secs // 60, 0)}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def _asks_expire(asks: list, now) -> list:
+    """Mark open asks past their expiry as expired, in place. Returns them."""
+    expired = []
+    for a in asks:
+        if a["status"] == "open" and _parse_ts(a["expires"]) <= now:
+            a["status"] = "expired"
+            a["closed"] = now.isoformat()
+            a["outcome"] = "expired with no answer or re-confirmation"
+            a["expiry_reported"] = False
+            expired.append(a)
+    return expired
+
+
+def _ask_create(question: str, why: str, options: str = "", expires_days: int = ASK_DEFAULT_DAYS,
+                now=None, send=None) -> dict:
+    """Record a new ask and send it to Rinkesh. Nothing is stored unless the
+    message actually went out, so the list never shows an ask he never saw."""
+    import secrets
+    from datetime import timedelta
+
+    question, why, options = (question or "").strip(), (why or "").strip(), (options or "").strip()
+    if not question:
+        return {"ok": False, "error": "question is empty"}
+    if not why:
+        return {"ok": False, "error": "say why you need this from him (why=...)"}
+    try:
+        days = int(expires_days)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"expires_days must be a whole number, got {expires_days!r}"}
+    days = min(max(days, 1), ASK_MAX_DAYS)
+
+    now = now or _utcnow()
+    asks = _asks_load()
+    _asks_expire(asks, now)
+    open_ = [a for a in asks if a["status"] == "open"]
+    for a in open_:
+        if a["question"].strip().lower() == question.lower():
+            return {"ok": False, "error": f"already open as [{a['id']}] — don't ask twice"}
+    if len(open_) >= ASK_MAX_OPEN:
+        ids = ", ".join(f"[{a['id']}]" for a in open_)
+        return {
+            "ok": False,
+            "error": f"{len(open_)} asks already open ({ids}), the cap is {ASK_MAX_OPEN}. "
+            "Resolve or drop one with resolve_ask first.",
+        }
+
+    taken = {a["id"] for a in asks}
+    ask_id = secrets.token_hex(2)
+    while ask_id in taken:
+        ask_id = secrets.token_hex(2)
+
+    text = f"Sudarshana needs you [ask {ask_id}]\n\n{question}\n\nWhy: {why}"
+    if options:
+        text += f"\nOptions: {options}"
+    text += f"\n\nReply here. If it's still unanswered in {days} day(s), it lapses unless I re-ask."
+    try:
+        (send or _send_telegram)(text)
+    except Exception as e:  # noqa: BLE001 — report, don't crash the turn
+        return {"ok": False, "error": f"Telegram send failed, ask not recorded: {e}"}
+
+    record = {
+        "id": ask_id,
+        "question": question,
+        "why": why,
+        "options": options,
+        "status": "open",
+        "created": now.isoformat(),
+        "expires": (now + timedelta(days=days)).isoformat(),
+    }
+    asks.append(record)
+    _asks_save(asks)
+    return {"ok": True, "id": ask_id, "expires": record["expires"]}
+
+
+def _ask_resolve(ask_id: str, outcome: str, status: str = "answered", now=None) -> dict:
+    """Close one open ask with what came of it."""
+    ask_id = (ask_id or "").strip().strip("[]").removeprefix("ask ").strip()
+    outcome = (outcome or "").strip()
+    if status not in ASK_RESOLVE_STATUSES:
+        return {"ok": False, "error": f"status must be one of {sorted(ASK_RESOLVE_STATUSES)}"}
+    if not outcome:
+        return {"ok": False, "error": "say what came of it (outcome=...)"}
+    now = now or _utcnow()
+    asks = _asks_load()
+    _asks_expire(asks, now)
+    for a in asks:
+        if a["id"] != ask_id:
+            continue
+        if a["status"] != "open":
+            return {"ok": False, "error": f"[{ask_id}] is already {a['status']}"}
+        a["status"] = status
+        a["outcome"] = outcome
+        a["closed"] = now.isoformat()
+        _asks_save(asks)
+        return {"ok": True, "id": ask_id, "status": status}
+    return {"ok": False, "error": f"no ask with id [{ask_id}]"}
+
+
+def _asks_context(now=None) -> str:
+    """Per-call note listing open asks and any that just lapsed. Empty when
+    there are none, so a quiet cycle costs nothing. Each lapsed ask is
+    reported once. Fails open: a store error must not cost the turn."""
+    try:
+        return _asks_context_unsafe(now)
+    except Exception as e:  # noqa: BLE001
+        print(f"[asks] context unavailable: {e!r}")
+        return "(Open asks to Rinkesh: the list could not be read this turn.)"
+
+
+def _asks_context_unsafe(now=None) -> str:
+    now = now or _utcnow()
+    asks = _asks_load()
+    _asks_expire(asks, now)
+    open_ = [a for a in asks if a["status"] == "open"]
+    lapsed = [a for a in asks if a["status"] == "expired" and not a.get("expiry_reported", True)]
+    if not open_ and not lapsed:
+        _asks_save(asks)  # persists any expiry marks
+        return ""
+    lines = []
+    if open_:
+        lines.append(
+            f"Open asks to Rinkesh ({len(open_)}/{ASK_MAX_OPEN}). He has each one on "
+            "Telegram already; don't repeat them in your messages. This is the whole "
+            "list of what you need from him."
+        )
+        for a in open_:
+            age = _age(now - _parse_ts(a["created"]))
+            left = _age(_parse_ts(a["expires"]) - now)
+            lines.append(f"  [{a['id']}] asked {age} ago, lapses in {left}: {a['question']}")
+        lines.append(
+            "If his message answers one, or the need has gone away, close it: "
+            "resolve_ask(ask_id, outcome, status='answered'|'dropped')."
+        )
+    if lapsed:
+        lines.append("Asks that lapsed with no answer (now closed):")
+        for a in lapsed:
+            lines.append(f"  [{a['id']}] {a['question']}")
+            a["expiry_reported"] = True
+        lines.append(
+            "If one is still truly blocking, ask_rinkesh again and say what changed; "
+            "otherwise let it go."
+        )
+    _asks_save(asks)
+    return "\n".join(lines)
 
 
 # --- status-center: deterministic event writer + read-only API ---------------
@@ -1216,7 +1425,35 @@ class Sudarshana:
             return f"failed: {res.get('error', 'unknown')}"
 
         inbox_tools = [inbox_review, inbox_set_status]
-        search_tools = [*search_tools, *inbox_tools]
+
+        @tool
+        def ask_rinkesh(question: str, why: str, options: str = "", expires_days: int = ASK_DEFAULT_DAYS) -> str:
+            """Ask Rinkesh for something only he can give — a decision, an
+            approval, a merge, an action on his side. Sends him one Telegram
+            message right away and tracks it as an open ask until you close it
+            with resolve_ask or it lapses (expires_days, default 3, max 14).
+            One question per ask, short enough to answer from a phone. why= is
+            the one-line reason it's blocked on him; options= lists the choices
+            if there are any (put your recommendation first). At most 3 asks
+            can be open at once. Returns the ask id, or why it wasn't sent."""
+            res = _ask_create(question, why, options=options, expires_days=expires_days)
+            if res.get("ok"):
+                return f"sent: [{res['id']}], open until {res['expires']}"
+            return f"not sent: {res['error']}"
+
+        @tool
+        def resolve_ask(ask_id: str, outcome: str, status: str = "answered") -> str:
+            """Close an open ask to Rinkesh. status='answered' when he answered
+            it; status='dropped' when you no longer need it (it got done
+            another way, the work moved on, it was wrong to ask). outcome= is
+            one line: what he said, or why it's no longer needed."""
+            res = _ask_resolve(ask_id, outcome, status=status)
+            if res.get("ok"):
+                return f"closed: [{res['id']}] {res['status']}"
+            return f"failed: {res['error']}"
+
+        ask_tools = [ask_rinkesh, resolve_ask]
+        search_tools = [*search_tools, *inbox_tools, *ask_tools]
 
         # Production runs on OpenRouter (USE_OPENROUTER=1, OPENROUTER_MODEL /
         # OPENROUTER_API_KEY). The else branch targets the self-hosted Qwen
@@ -1361,6 +1598,10 @@ class Sudarshana:
                 # Visitor inbox items, every cycle; adds nothing when idle.
                 *([] if not (_icc := _inbox_intake_context()) else [
                     {"role": "system", "content": f"Visitor inbox intake:\n{_icc}"}
+                ]),
+                # Open asks to Rinkesh, every turn; adds nothing when none.
+                *([] if not (_acx := _asks_context()) else [
+                    {"role": "system", "content": _acx}
                 ]),
                 {"role": "user", "content": message},
             ]
