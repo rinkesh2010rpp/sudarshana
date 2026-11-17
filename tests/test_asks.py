@@ -5,16 +5,15 @@ recording stand-in for the Telegram send. No network, no Modal.
 
 Why: what the agent needed from Rinkesh lived in hand-kept lists and went
 stale (PR #64 in state.md's "his:" line, PR #61 in asks.json, each listed days
-after it merged). These
-tests pin the properties that fix that: an ask is recorded only once he has
-been sent it, it closes by an explicit outcome or by lapsing, and a lapse is
-reported once rather than every hour.
+after it merged). These tests pin the properties that fix that: an ask is
+recorded only once he has been sent it, and committed to the Volume at once
+(not at turn end, which a dying turn never reaches); it closes by an explicit
+outcome or by lapsing; and a lapse is reported once rather than every hour.
 """
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
 import json
+from pathlib import Path
 
 import pytest
 
@@ -47,6 +46,14 @@ def mod(monkeypatch, tmp_path):
     import main
 
     monkeypatch.setattr(main, "ASKS_PATH", str(tmp_path / "memory" / "asks.json"))
+    main.COMMITS = []
+
+    class _Volume:
+        def commit(self):
+            # Record what a commit would persist: the file as it is right now.
+            main.COMMITS.append(Path(main.ASKS_PATH).read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(main, "volume", _Volume())
     return main
 
 
@@ -220,3 +227,41 @@ def test_hand_written_asks_are_adopted_and_lapse(mod, sent):
     assert data["closed"][0]["id"] == "overview-latency"
     assert data["closed"][0]["detail"] == "long story"
     assert mod._ask_resolve("fresh", "blue", now=T0)["ok"]
+
+
+def test_every_write_is_committed_at_once(mod, sent):
+    """A turn that dies after ask_rinkesh never reaches its turn-end commit."""
+    ask_id = _ask(mod, sent)["id"]
+    assert len(mod.COMMITS) == 1 and ask_id in mod.COMMITS[0]
+    mod._ask_resolve(ask_id, "yes", now=T0)
+    assert len(mod.COMMITS) == 2 and '"answered"' in mod.COMMITS[1]
+
+
+def test_refused_or_failed_asks_commit_nothing(mod, sent):
+    def boom(_):
+        raise RuntimeError("telegram down")
+
+    mod._ask_create("Q?", "why", now=T0, send=boom)
+    mod._ask_create("", "why", now=T0, send=sent.append)
+    assert mod.COMMITS == []
+
+
+def test_quiet_turns_do_not_commit(mod, sent):
+    assert mod._asks_context(now=T0) == ""
+    _ask(mod, sent)
+    n = len(mod.COMMITS)
+    mod._asks_context(now=T0 + timedelta(hours=1))  # open ask, nothing changed
+    assert len(mod.COMMITS) == n
+    mod._asks_context(now=T0 + timedelta(days=4))  # lapses: one write
+    mod._asks_context(now=T0 + timedelta(days=4, hours=1))  # already reported
+    assert len(mod.COMMITS) == n + 1
+
+
+def test_commit_failure_keeps_the_ask(mod, sent, monkeypatch):
+    class _Down:
+        def commit(self):
+            raise RuntimeError("volume busy")
+
+    monkeypatch.setattr(mod, "volume", _Down())
+    res = _ask(mod, sent)
+    assert res["ok"] and _file(mod)["asks"][0]["id"] == res["id"]

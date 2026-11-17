@@ -886,7 +886,11 @@ def _asks_load() -> list:
 
 
 def _asks_save(asks: list) -> None:
-    """Write atomically, so a crash mid-write can't leave /control a torn file."""
+    """Write atomically, so a crash mid-write can't leave /control a torn file,
+    then commit the Volume at once. Waiting for the turn-end commit loses the
+    record if the turn dies after the Telegram message went out (timeout,
+    crash): he has the ask, the panel never shows it, and the next turn asks
+    again. Same reason _inbox_set_status commits mid-turn."""
     import json
 
     open_ = [a for a in asks if a["status"] == "open"]
@@ -896,6 +900,10 @@ def _asks_save(asks: list) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"_what": ASKS_WHAT, "asks": open_, "closed": closed}, f, indent=1, ensure_ascii=False)
     os.replace(tmp, ASKS_PATH)
+    try:
+        volume.commit()
+    except Exception as e:  # noqa: BLE001 — the turn-end commit still carries it
+        print(f"[asks] volume commit failed, relying on the turn-end commit: {e!r}")
 
 
 def _utcnow():
@@ -1042,8 +1050,9 @@ def _asks_context_unsafe(now=None) -> str:
     _asks_expire(asks, now)
     open_ = [a for a in asks if a["status"] == "open"]
     lapsed = [a for a in asks if a["status"] == "expired" and not a.get("expiry_reported", True)]
+    # Anything that expired just now is in `lapsed`, so with none there is
+    # nothing new to write — and no reason to commit the Volume every turn.
     if not open_ and not lapsed:
-        _asks_save(asks)  # persists any expiry marks
         return ""
     lines = []
     if open_:
@@ -1069,7 +1078,7 @@ def _asks_context_unsafe(now=None) -> str:
             "If one is still truly blocking, ask_rinkesh again and say what changed; "
             "otherwise let it go."
         )
-    _asks_save(asks)
+        _asks_save(asks)  # the expiry and its reported-once mark
     return "\n".join(lines)
 
 
