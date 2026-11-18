@@ -121,6 +121,12 @@ actually waiting on him. The list lives in /data/memory/asks.json, which
 /control shows him; those two tools own it, so read it if you like but
 never edit it by hand.
 
+End every turn — hourly or his message — with report_status: what you are
+doing, why (in terms of what he asked for), and where the initiative stands
+(done, left, the finish line, the next step). It is how he keeps track of
+you: /control shows the latest report, and flags it when a run finishes
+without one. Each report replaces the last, so give the whole picture.
+
 
 THE WORLD YOU OPERATE IN
 
@@ -1082,6 +1088,111 @@ def _asks_context_unsafe(now=None) -> str:
     return "\n".join(lines)
 
 
+# --- now: what I'm doing, why, and where things stand -------------------------
+# One small record Rinkesh can read on /control at any time, answering: what
+# is it doing, why, where are we. ("Does it need me" is asks.json, which code
+# already owns.) state.md was meant to be this, but it is free prose the agent
+# rewrites when it remembers to — it sat 12 hours stale on 11-17. So the
+# agent reports through a tool at the end of every turn, code stamps the time
+# and the turn it belongs to, and /control can tell a fresh report from one
+# a later turn forgot to replace.
+NOW_PATH = os.path.join(VOLUME_PATH, "memory", "now.json")
+NOW_WHAT = (
+    "What Sudarshana is doing, why, and where things stand — served by "
+    "/api/control/now. Written only by the report_status tool; do not edit by hand."
+)
+NOW_TEXT_MAX = 400
+NOW_ITEM_MAX = 160
+NOW_LIST_MAX = 8
+
+
+def _now_clean_list(items) -> list:
+    if isinstance(items, str):
+        items = [items]
+    out = []
+    for it in items or []:
+        s = " ".join(str(it).split())
+        if s:
+            out.append(s[:NOW_ITEM_MAX])
+    return out[:NOW_LIST_MAX]
+
+
+def _now_report(doing: str, why: str, project: str = "", done_when: str = "",
+                done=None, left=None, next_step: str = "", now=None) -> dict:
+    """Validate and write now.json. Returns {"ok": True, ...} or {"ok": False,
+    "error": ...}. Commits the Volume at once, like the asks, so a turn that
+    dies after reporting still leaves the report behind."""
+    import json
+    import re
+
+    doing = " ".join(str(doing or "").split())
+    why = " ".join(str(why or "").split())
+    if not doing:
+        return {"ok": False, "error": "doing= is required: one sentence on what this turn did or is doing"}
+    if not why:
+        return {"ok": False, "error": "why= is required: the reason, in terms of what Rinkesh asked for"}
+    project = str(project or "").strip()
+    if project.endswith(".md"):
+        project = project[:-3]
+    if project and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}", project):
+        return {"ok": False, "error": "project= must be an /data/actions file name (e.g. gateway-ui-craft), or empty"}
+
+    turn_started = None
+    try:
+        cur = _status_dict().get("current", {}) or {}
+        if str(cur.get("state") or "").startswith("running"):
+            turn_started = cur.get("since")
+    except Exception as e:  # noqa: BLE001 — the report still lands, just unlinked
+        print(f"[now] couldn't read the current turn: {e!r}")
+
+    rec = {
+        "_what": NOW_WHAT,
+        "reported_at": (now or _utcnow()).isoformat(timespec="seconds"),
+        "turn_started": turn_started,
+        "doing": doing[:NOW_TEXT_MAX],
+        "why": why[:NOW_TEXT_MAX],
+        "project": project,
+        "done_when": " ".join(str(done_when or "").split())[:NOW_TEXT_MAX],
+        "done": _now_clean_list(done),
+        "left": _now_clean_list(left),
+        "next": " ".join(str(next_step or "").split())[:NOW_TEXT_MAX],
+    }
+    os.makedirs(os.path.dirname(NOW_PATH), exist_ok=True)
+    tmp = NOW_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, NOW_PATH)
+    try:
+        volume.commit()
+    except Exception as e:  # noqa: BLE001 — the turn-end commit still carries it
+        print(f"[now] volume commit failed, relying on the turn-end commit: {e!r}")
+    return {"ok": True, **rec}
+
+
+def _now_freshness(rec: dict | None, turns: list) -> dict:
+    """Is the report current? Compares it with the turn records (sorted by
+    `started`). A report belongs to the turn it was written in; if a later
+    turn has *finished* without writing one, the report describes an older
+    turn and the panel must say so rather than present it as now."""
+    if not rec:
+        return {"fresh": False, "reason": "no report yet"}
+    reported = _status_parse_ts(rec.get("reported_at"))
+    own_start = _status_parse_ts(rec.get("turn_started")) if rec.get("turn_started") else None
+    missed = 0
+    for t in turns or []:
+        start = _status_parse_ts(t.get("started"))
+        if start is None or t.get("ended") is None:
+            continue  # a running turn hasn't had its chance to report yet
+        if own_start is not None and start <= own_start:
+            continue
+        if own_start is None and reported is not None and start <= reported:
+            continue
+        missed += 1
+    if missed:
+        return {"fresh": False, "reason": f"{missed} later run(s) finished without reporting", "missed_runs": missed}
+    return {"fresh": True, "reason": None, "missed_runs": 0}
+
+
 # --- status-center: deterministic event writer + read-only API ---------------
 # A named modal.Dict shared by the writer (agent containers) and the public,
 # read-only API (mounts no volume). State:
@@ -1539,7 +1650,32 @@ class Sudarshana:
                 return f"closed: [{res['id']}] {res['status']}"
             return f"failed: {res['error']}"
 
-        ask_tools = [ask_rinkesh, resolve_ask]
+        @tool
+        def report_status(doing: str, why: str, project: str = "", done_when: str = "",
+                          done: list[str] | None = None, left: list[str] | None = None,
+                          next_step: str = "") -> str:
+            """Tell Rinkesh where things stand. He reads this on /control at
+            any time to see what you are doing, why, and how far along you
+            are. Call it ONCE, as the last thing in EVERY turn — hourly or
+            his message — after the work and the log line. Each call replaces
+            the last report, so write the whole picture, not a diff.
+            doing= one plain sentence: what this turn did, or what is under
+            way. why= the reason in terms of what Rinkesh asked for (quote
+            his words when you can), not your internal bookkeeping.
+            project= the /data/actions file name of the initiative this
+            serves (e.g. "gateway-ui-craft"), or "" for none. done_when= that
+            initiative's finish line in one line. done= / left= short items:
+            the steps finished and the steps remaining toward done_when.
+            next_step= what the next turn will do, or "waiting on Rinkesh"
+            when it is blocked on an open ask. Plain words; no file paths or
+            commit hashes unless he needs them to act."""
+            res = _now_report(doing, why, project=project, done_when=done_when,
+                              done=done, left=left, next_step=next_step)
+            if res.get("ok"):
+                return f"reported at {res['reported_at']}"
+            return f"not reported: {res['error']}"
+
+        ask_tools = [ask_rinkesh, resolve_ask, report_status]
         search_tools = [*search_tools, *inbox_tools, *ask_tools]
 
         # Production runs on OpenRouter (USE_OPENROUTER=1, OPENROUTER_MODEL /
@@ -3438,6 +3574,74 @@ def control_api():
             # None when my logs are readable; a short reason otherwise, so an
             # empty timeline never passes for "nothing happened".
             "recent_work_error": work_err,
+        }
+
+    # --- now: the four questions he asks when he checks in ------------------
+    # What are you doing, why, where are we, do you need me. The first three
+    # come from memory/now.json (written by report_status at the end of each
+    # turn); the fourth from asks.json. Activity comes from the turn records,
+    # not the report, so "running right now" is never the agent's own claim.
+    NOW_FILE = NOW_PATH  # one home for the path
+
+    def _now_record():
+        """Return (record, error). Missing file is (None, None): no report yet,
+        which the panel says plainly. Unreadable is an error, never None-as-empty."""
+        import json as _json
+
+        try:
+            raw = _read_text(NOW_FILE)
+        except Exception:  # noqa: BLE001
+            return None, "couldn't read now.json"
+        if raw is None or not raw.strip():
+            return None, None
+        try:
+            data = _json.loads(raw)
+        except ValueError:
+            return None, "now.json is not valid JSON"
+        if not isinstance(data, dict):
+            return None, "now.json is not an object"
+        data.pop("_what", None)
+        return data, None
+
+    @web_app.get("/api/control/now")
+    def now_view(user: dict = Depends(_owner)):
+        _audit(user, "now")
+        recs, records_err = _turn_records()
+        recs = recs or []
+        try:
+            cur = _status_dict().get("current", {}) or {}
+        except Exception:  # noqa: BLE001
+            cur = {}
+            records_err = records_err or "the status store didn't answer"
+        finished = [r for r in recs if r.get("ended") is not None]
+        last = finished[-1] if finished else None
+        state = str(cur.get("state") or "unknown")
+        report, report_err = _now_record()
+        asks_ok, asks_err = _asks()
+        return {
+            "ok": True,
+            "generated_at": _status_ts(),
+            "activity": {
+                # running-hourly / running-telegram / idle — from code, not the agent
+                "state": state,
+                "running": state.startswith("running"),
+                "since": cur.get("since"),
+                "last_run": None if last is None else {
+                    "kind": str(last.get("state") or "").replace("running-", ""),
+                    "started": last.get("started"),
+                    "ended": last.get("ended"),
+                    "outcome": last.get("outcome"),
+                },
+                "records_error": records_err,
+            },
+            # doing, why, project, done_when, done[], left[], next, reported_at
+            "report": report,
+            "report_error": report_err,
+            # fresh=False when later runs finished without reporting; the panel
+            # shows the report anyway, labelled as out of date, with the reason.
+            "freshness": None if records_err else _now_freshness(report, recs),
+            "needs_you": asks_ok,
+            "needs_you_error": asks_err,
         }
 
     return web_app
