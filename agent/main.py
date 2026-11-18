@@ -1104,8 +1104,6 @@ REPORT_LIST_MAX = 8
 
 
 def _report_clean_list(items) -> list:
-    if isinstance(items, str):
-        items = [items]
     out = []
     for it in items or []:
         s = " ".join(str(it).split())
