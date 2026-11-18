@@ -1154,10 +1154,11 @@ def _report_save(doing: str, why: str, project: str = "", done_when: str = "",
 
 
 def _report_latest(turns: list) -> dict:
-    """From turn records sorted by `started`: the latest report, the run it
-    came from, and whether it is current. A run still in progress hasn't had
-    its chance to report and is skipped; every finished run after the report
-    that has none is counted as missed."""
+    """From turn records sorted by `started`: the latest report, flattened,
+    plus `run` (the run that wrote it), `fresh` and `missed_runs`. A run
+    still in progress hasn't had its chance to report and is skipped; every
+    finished run after the report that has none is counted as missed. With
+    no report in the records: {"run": None, "fresh": False, "missed_runs": n}."""
     missed = 0
     for t in reversed(turns or []):
         if t.get("ended") is None:
@@ -1165,7 +1166,7 @@ def _report_latest(turns: list) -> dict:
         rep = t.get("report")
         if rep:
             return {
-                "report": rep,
+                **rep,
                 "run": {
                     "kind": str(t.get("state") or "").replace("running-", ""),
                     "started": t.get("started"),
@@ -1176,7 +1177,7 @@ def _report_latest(turns: list) -> dict:
                 "missed_runs": missed,
             }
         missed += 1
-    return {"report": None, "run": None, "fresh": False, "missed_runs": missed}
+    return {"run": None, "fresh": False, "missed_runs": missed}
 
 
 # --- status-center: deterministic event writer + read-only API ---------------
@@ -3564,10 +3565,12 @@ def control_api():
             "recent_work_error": work_err,
             # What I'm doing, why, and where the work stands: the latest
             # report_status, read from the same turn records as `health`.
-            # {report, run, fresh, missed_runs}; fresh=False when finished
-            # runs since it didn't report — the panel shows it as out of date
-            # rather than as now. None when the records couldn't be read.
-            "now": None if records_err else _report_latest(recs),
+            # {doing, why, project, done_when, done, left, next, reported_at,
+            # run, fresh, missed_runs}; fresh=False when finished runs since
+            # didn't report — the panel shows it as out of date rather than as
+            # current. run=None when no run has reported. None when the records
+            # couldn't be read.
+            "report": None if records_err else _report_latest(recs),
         }
 
     return web_app

@@ -122,15 +122,15 @@ def _turn(started, report=None, ended="x"):
 def test_latest_is_fresh_when_the_last_finished_run_reported(mod):
     turns = [_turn("1", {"doing": "a"}), _turn("2", {"doing": "b"}), _turn("3", ended=None)]
     out = mod._report_latest(turns)
-    assert out["fresh"] and out["report"]["doing"] == "b" and out["run"]["kind"] == "hourly"
+    assert out["fresh"] and out["doing"] == "b" and out["run"]["kind"] == "hourly"
 
 
 def test_latest_counts_finished_runs_that_did_not_report(mod):
     turns = [_turn("1", {"doing": "a"}), _turn("2"), _turn("3")]
     out = mod._report_latest(turns)
-    assert not out["fresh"] and out["missed_runs"] == 2 and out["report"]["doing"] == "a"
+    assert not out["fresh"] and out["missed_runs"] == 2 and out["doing"] == "a"
 
 
 def test_latest_with_no_report_at_all(mod):
     out = mod._report_latest([_turn("1")])
-    assert out["report"] is None and not out["fresh"] and out["missed_runs"] == 1
+    assert out["run"] is None and "doing" not in out and not out["fresh"] and out["missed_runs"] == 1
