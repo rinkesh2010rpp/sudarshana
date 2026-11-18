@@ -1112,9 +1112,13 @@ def _report_clean_list(items) -> list:
     return out[:REPORT_LIST_MAX]
 
 
-def _report_save(doing: str, why: str, project: str = "", done_when: str = "",
+def _report_save(turn_key: str, doing: str, why: str, project: str = "", done_when: str = "",
                  done=None, left=None, next_step: str = "") -> dict:
-    """Validate the report and write it onto the running turn's record.
+    """Validate the report and write it onto `turn_key`'s record — the turn
+    making the call, handed in by the caller. Not current._turn_key: that is
+    whichever turn started last, so when two turns overlap (a redeploy, where
+    the old container finishes a run while the new one starts) the earlier
+    turn's report would land on the later turn's record.
     Returns {"ok": True, "report": ...} or {"ok": False, "error": ...}."""
     import re
 
@@ -1142,12 +1146,11 @@ def _report_save(doing: str, why: str, project: str = "", done_when: str = "",
     }
     try:
         d = _status_dict()
-        key = (d.get("current", {}) or {}).get("_turn_key")
-        rec = d.get(key) if key else None
+        rec = d.get(turn_key) if turn_key else None
         if not rec:
             return {"ok": False, "error": "no running turn to attach the report to"}
         rec["report"] = report
-        d.put(key, rec)
+        d.put(turn_key, rec)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"status store write failed: {type(e).__name__}"}
     return {"ok": True, "report": report}
@@ -1656,7 +1659,8 @@ class Sudarshana:
             next_step= what the next turn will do, or "waiting on Rinkesh"
             when it is blocked on an open ask. Plain words; no file paths or
             commit hashes unless he needs them to act."""
-            res = _report_save(doing, why, project=project, done_when=done_when,
+            res = _report_save(getattr(self, "_turn_key", None), doing, why,
+                               project=project, done_when=done_when,
                                done=done, left=left, next_step=next_step)
             if res.get("ok"):
                 return f"reported at {res['report']['reported_at']}"
@@ -1793,8 +1797,14 @@ class Sudarshana:
             backend=backend,
         )
 
-    def _invoke(self, message: str, trigger: str):
+    def _invoke(self, message: str, trigger: str, turn_key: str | None = None):
         from langgraph.errors import GraphRecursionError
+
+        # The turn this call belongs to, for report_status. An attribute on
+        # this instance, not current._turn_key: inputs in this container run
+        # one at a time, while `current` is shared across containers and
+        # names whichever turn started last.
+        self._turn_key = turn_key
 
         invoke_input = {
             "messages": [
@@ -1878,7 +1888,7 @@ class Sudarshana:
         # Before any model work, so a turn that dies mid-run leaves a trace.
         _turn_key = _status_turn_start("running-telegram")
 
-        result = self._invoke(text, "telegram")
+        result = self._invoke(text, "telegram", _turn_key)
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(
@@ -1900,7 +1910,7 @@ class Sudarshana:
 
         _turn_key = _status_turn_start("running-hourly")
         _a2a_keep_alive()
-        result = self._invoke(HOURLY_TASK, "hourly")
+        result = self._invoke(HOURLY_TASK, "hourly", _turn_key)
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(

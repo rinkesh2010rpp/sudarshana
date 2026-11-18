@@ -60,16 +60,18 @@ def mod(monkeypatch):
     return main
 
 
-def _report(mod, **kw):
+def _report(mod, key=None, **kw):
+    if key is None:
+        key = (STORE.get("current") or {}).get("_turn_key")
     args = {"doing": "Fixing line_measure", "why": 'He said "close it, one bug first"'}
     args.update(kw)
-    return mod._report_save(**args)
+    return mod._report_save(key, **args)
 
 
 def test_report_requires_doing_and_why(mod):
     key = mod._status_turn_start("running-hourly")
-    assert not mod._report_save("", "because")["ok"]
-    assert not mod._report_save("fixing", "  ")["ok"]
+    assert not mod._report_save(key, "", "because")["ok"]
+    assert not mod._report_save(key, "fixing", "  ")["ok"]
     assert "report" not in STORE[key]
 
 
@@ -80,8 +82,29 @@ def test_report_rejects_a_path_as_project(mod):
 
 
 def test_report_needs_a_running_turn(mod):
-    res = _report(mod)
+    res = _report(mod, key="")
     assert not res["ok"] and "no running turn" in res["error"]
+    assert not _report(mod, key="turn:never-started")["ok"]
+
+
+def test_overlapping_turns_each_keep_their_own_report(mod, monkeypatch):
+    # A redeploy: the old container's turn is still running when the new one
+    # starts, so `current` names the later turn. Each report must still land
+    # on the turn that wrote it, and neither turn may show as missed.
+    times = iter(["2026-11-17T21:00:00+00:00", "2026-11-17T21:00:30+00:00"])
+    monkeypatch.setattr(mod, "_status_ts", lambda: next(times, "2026-11-17T21:05:00+00:00"))
+    early = mod._status_turn_start("running-hourly")
+    late = mod._status_turn_start("running-telegram")
+    assert STORE["current"]["_turn_key"] == late
+    assert _report(mod, key=early, doing="hourly work")["ok"]
+    assert _report(mod, key=late, doing="answering his message")["ok"]
+    assert STORE[early]["report"]["doing"] == "hourly work"
+    assert STORE[late]["report"]["doing"] == "answering his message"
+    mod._status_turn_end(early, "done")
+    mod._status_turn_end(late, "done")
+    turns = sorted((v for k, v in STORE.items() if k.startswith("turn:")), key=lambda r: r["started"])
+    out = mod._report_latest(turns)
+    assert out["fresh"] and out["missed_runs"] == 0 and out["doing"] == "answering his message"
 
 
 def test_report_lands_on_the_running_turn_and_survives_turn_end(mod):
