@@ -121,6 +121,12 @@ actually waiting on him. The list lives in /data/memory/asks.json, which
 /control shows him; those two tools own it, so read it if you like but
 never edit it by hand.
 
+End every turn — hourly or his message — with report_status: what you are
+doing, why (in terms of what he asked for), and where the initiative stands
+(done, left, the finish line, the next step). It is how he keeps track of
+you: /control shows the latest report, and flags it when a run finishes
+without one. Each report replaces the last, so give the whole picture.
+
 
 THE WORLD YOU OPERATE IN
 
@@ -1082,6 +1088,101 @@ def _asks_context_unsafe(now=None) -> str:
     return "\n".join(lines)
 
 
+# --- report: what I'm doing, why, and where things stand ----------------------
+# Rinkesh reads this on /control to see what the agent is doing, why, and how
+# far along the work is ("does it need me" is asks.json). state.md was meant to
+# answer that but is prose the agent rewrites when it remembers; it sat 12
+# hours stale on 11-17. So the agent reports through a tool at the end of every
+# turn, and the report is stored ON that turn's record in the status Dict —
+# the same record /control's overview already reads. A report therefore
+# always knows which run it came from, and a finished run with no report is
+# visible as exactly that. Turn records are private: the public status API
+# serves only `current` and `history`, never turn:* records.
+REPORT_TEXT_MAX = 400
+REPORT_ITEM_MAX = 160
+REPORT_LIST_MAX = 8
+
+
+def _report_clean_list(items) -> list:
+    out = []
+    for it in items or []:
+        s = " ".join(str(it).split())
+        if s:
+            out.append(s[:REPORT_ITEM_MAX])
+    return out[:REPORT_LIST_MAX]
+
+
+def _report_save(turn_key: str, doing: str, why: str, project: str = "", done_when: str = "",
+                 done=None, left=None, next_step: str = "") -> dict:
+    """Validate the report and write it onto `turn_key`'s record — the turn
+    making the call, handed in by the caller. Not current._turn_key: that is
+    whichever turn started last, so when two turns overlap (a redeploy, where
+    the old container finishes a run while the new one starts) the earlier
+    turn's report would land on the later turn's record.
+    Returns {"ok": True, "report": ...} or {"ok": False, "error": ...}."""
+    import re
+
+    doing = " ".join(str(doing or "").split())
+    why = " ".join(str(why or "").split())
+    if not doing:
+        return {"ok": False, "error": "doing= is required: one sentence on what this turn did or is doing"}
+    if not why:
+        return {"ok": False, "error": "why= is required: the reason, in terms of what Rinkesh asked for"}
+    project = str(project or "").strip()
+    if project.endswith(".md"):
+        project = project[:-3]
+    if project and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}", project):
+        return {"ok": False, "error": "project= must be an /data/actions file name (e.g. gateway-ui-craft), or empty"}
+
+    report = {
+        "reported_at": _status_ts(),
+        "doing": doing[:REPORT_TEXT_MAX],
+        "why": why[:REPORT_TEXT_MAX],
+        "project": project,
+        "done_when": " ".join(str(done_when or "").split())[:REPORT_TEXT_MAX],
+        "done": _report_clean_list(done),
+        "left": _report_clean_list(left),
+        "next": " ".join(str(next_step or "").split())[:REPORT_TEXT_MAX],
+    }
+    try:
+        d = _status_dict()
+        rec = d.get(turn_key) if turn_key else None
+        if not rec:
+            return {"ok": False, "error": "no running turn to attach the report to"}
+        rec["report"] = report
+        d.put(turn_key, rec)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"status store write failed: {type(e).__name__}"}
+    return {"ok": True, "report": report}
+
+
+def _report_latest(turns: list) -> dict:
+    """From turn records sorted by `started`: the latest report, flattened,
+    plus `run` (the run that wrote it), `fresh` and `missed_runs`. A run
+    still in progress hasn't had its chance to report and is skipped; every
+    finished run after the report that has none is counted as missed. With
+    no report in the records: {"run": None, "fresh": False, "missed_runs": n}."""
+    missed = 0
+    for t in reversed(turns or []):
+        if t.get("ended") is None:
+            continue
+        rep = t.get("report")
+        if rep:
+            return {
+                **rep,
+                "run": {
+                    "kind": str(t.get("state") or "").replace("running-", ""),
+                    "started": t.get("started"),
+                    "ended": t.get("ended"),
+                    "outcome": t.get("outcome"),
+                },
+                "fresh": missed == 0,
+                "missed_runs": missed,
+            }
+        missed += 1
+    return {"run": None, "fresh": False, "missed_runs": missed}
+
+
 # --- status-center: deterministic event writer + read-only API ---------------
 # A named modal.Dict shared by the writer (agent containers) and the public,
 # read-only API (mounts no volume). State:
@@ -1539,7 +1640,33 @@ class Sudarshana:
                 return f"closed: [{res['id']}] {res['status']}"
             return f"failed: {res['error']}"
 
-        ask_tools = [ask_rinkesh, resolve_ask]
+        @tool
+        def report_status(doing: str, why: str, project: str = "", done_when: str = "",
+                          done: list[str] | None = None, left: list[str] | None = None,
+                          next_step: str = "") -> str:
+            """Tell Rinkesh where things stand. He reads this on /control at
+            any time to see what you are doing, why, and how far along you
+            are. Call it ONCE, as the last thing in EVERY turn — hourly or
+            his message — after the work and the log line. Each call replaces
+            the last report, so write the whole picture, not a diff.
+            doing= one plain sentence: what this turn did, or what is under
+            way. why= the reason in terms of what Rinkesh asked for (quote
+            his words when you can), not your internal bookkeeping.
+            project= the /data/actions file name of the initiative this
+            serves (e.g. "gateway-ui-craft"), or "" for none. done_when= that
+            initiative's finish line in one line. done= / left= short items:
+            the steps finished and the steps remaining toward done_when.
+            next_step= what the next turn will do, or "waiting on Rinkesh"
+            when it is blocked on an open ask. Plain words; no file paths or
+            commit hashes unless he needs them to act."""
+            res = _report_save(getattr(self, "_turn_key", None), doing, why,
+                               project=project, done_when=done_when,
+                               done=done, left=left, next_step=next_step)
+            if res.get("ok"):
+                return f"reported at {res['report']['reported_at']}"
+            return f"not reported: {res['error']}"
+
+        ask_tools = [ask_rinkesh, resolve_ask, report_status]
         search_tools = [*search_tools, *inbox_tools, *ask_tools]
 
         # Production runs on OpenRouter (USE_OPENROUTER=1, OPENROUTER_MODEL /
@@ -1670,8 +1797,14 @@ class Sudarshana:
             backend=backend,
         )
 
-    def _invoke(self, message: str, trigger: str):
+    def _invoke(self, message: str, trigger: str, turn_key: str | None = None):
         from langgraph.errors import GraphRecursionError
+
+        # The turn this call belongs to, for report_status. An attribute on
+        # this instance, not current._turn_key: inputs in this container run
+        # one at a time, while `current` is shared across containers and
+        # names whichever turn started last.
+        self._turn_key = turn_key
 
         invoke_input = {
             "messages": [
@@ -1755,7 +1888,7 @@ class Sudarshana:
         # Before any model work, so a turn that dies mid-run leaves a trace.
         _turn_key = _status_turn_start("running-telegram")
 
-        result = self._invoke(text, "telegram")
+        result = self._invoke(text, "telegram", _turn_key)
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(
@@ -1777,7 +1910,7 @@ class Sudarshana:
 
         _turn_key = _status_turn_start("running-hourly")
         _a2a_keep_alive()
-        result = self._invoke(HOURLY_TASK, "hourly")
+        result = self._invoke(HOURLY_TASK, "hourly", _turn_key)
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(
@@ -3259,7 +3392,10 @@ def control_api():
         return _datetime.fromtimestamp(ts, PACIFIC).date().isoformat()
 
     def _turn_records():
-        """The turn records, plus a reason string when they cannot be read.
+        """(turn records, `current`, error) from ONE read of the status Dict.
+        `current` lives in the same Dict, so it comes from this fetch too: a
+        second get() was an extra round trip, and could describe a different
+        moment than the records it sat beside.
 
         Returning a bare `[]` on a Dict read failure made "I can see no turns"
         indistinguishable from "I cannot see my own records": the panel would
@@ -3273,15 +3409,19 @@ def control_api():
             # it fails as a unit rather than half-reading.
             items = list(_status_dict().items() or [])
         except Exception:  # noqa: BLE001
-            return None, "the status store didn't answer"
+            return None, {}, "the status store didn't answer"
         recs = []
+        cur = {}
         for k, rec in items:
+            if k == "current" and isinstance(rec, dict):
+                cur = rec
+                continue
             if not (isinstance(k, str) and k.startswith("turn:")):
                 continue
             if isinstance(rec, dict) and rec.get("started"):
                 recs.append(rec)
         recs.sort(key=lambda r: str(r.get("started")))
-        return recs, None
+        return recs, cur, None
 
     def _asks():
         """Return (asks, error). An unreadable or malformed asks.json is NOT an
@@ -3397,17 +3537,12 @@ def control_api():
     @web_app.get("/api/control/overview")
     def overview(user: dict = Depends(_owner)):
         _audit(user, "overview")
-        recs, records_err = _turn_records()
+        recs, cur, records_err = _turn_records()
         recs = recs or []
         now_ts = _time.time()
         last = recs[-1] if recs else None
         today = _local_date(_status_ts())
         errors = _count_errors(recs, now_ts)
-        try:
-            cur = _status_dict().get("current", {}) or {}
-        except Exception:  # noqa: BLE001
-            cur = {}
-            records_err = records_err or "the status store didn't answer"
         asks_ok, asks_err = _asks()
         work_ok, work_err = _recent_work()
         return {
@@ -3438,6 +3573,14 @@ def control_api():
             # None when my logs are readable; a short reason otherwise, so an
             # empty timeline never passes for "nothing happened".
             "recent_work_error": work_err,
+            # What I'm doing, why, and where the work stands: the latest
+            # report_status, read from the same turn records as `health`.
+            # {doing, why, project, done_when, done, left, next, reported_at,
+            # run, fresh, missed_runs}; fresh=False when finished runs since
+            # didn't report — the panel shows it as out of date rather than as
+            # current. run=None when no run has reported. None when the records
+            # couldn't be read.
+            "report": None if records_err else _report_latest(recs),
         }
 
     return web_app
