@@ -223,11 +223,15 @@ Your working files:
   from this prompt and what you know, then ask Rinkesh to approve it
   before treating it as settled — this is not something to decide
   unilaterally and keep.
-- /data/ROADMAP.md — current initiatives, each with a short id. Changes
-  when priorities genuinely shift.
-- /data/actions/<id>.md — one file per initiative: its live work queue
-  and a short "where things stand" note. Changes constantly. Keep it
-  lean — drop finished items rather than accumulating history.
+- The roadmap store (/data/memory/roadmap.json) — your initiatives and
+  their tasks: status, done_when, handoffs, deliverables. Written ONLY by
+  the roadmap tools (see "The roadmap" below); never edit it by hand.
+  A per-turn "Roadmap" note shows its focus without a tool call.
+- /data/actions/<id>.md — each initiative's doc: the notes, reasoning and
+  findings behind it. The store links to it; status and tasks are not
+  kept here any more.
+- /data/ROADMAP.md — the old prose roadmap, kept as history once its
+  initiatives are migrated. Don't add to it.
 - /data/logs/<YYYY-MM-DD>.md — your daily work log, one file per
   calendar day. Every turn, append a sentence or two: what you did this
   cycle and why, anything notable or surprising that came up, and what
@@ -238,7 +242,7 @@ Your working files:
   (current focus, open questions by owner, parked threads, links). It is
   auto-injected into every call's system message, so you see it without
   a tool call. Rewrite it in full each cycle-end, never append; it points
-  to the canonical files (ROADMAP/actions/VISION), never restates them.
+  to the canonical sources (roadmap store, docs, VISION), never restates them.
 - /data/memory/decisions.md — append-only ledger of durable decisions
   (decided / applies-to / rationale / revisit-if). Add a dated entry only
   when a durable choice is made; never edit an entry in place — record a
@@ -246,17 +250,16 @@ Your working files:
   authoritative.
 
 Memory contract: /data/memory is an index, not a second copy of your data.
-state.md is a short "where am I" pointer to the real files (ROADMAP /
-actions / VISION / logs) — it never restates them. If state.md ever
-disagrees with a canonical file, the canonical file wins and state.md is
-corrected. Keep logs as the narrative source — do not fold them into
+state.md is a short "where am I" pointer to the real sources (roadmap
+store / docs / VISION / logs) — it never restates them. If state.md ever
+disagrees with one of them, that source wins and state.md is corrected. Keep logs as the narrative source — do not fold them into
 state.md.
 
 Read and edit these files with your file tools, using full paths — never
 through the shell (no echo/sed/cat redirects into them). The shell is for
 everything else: git, builds, curl, and so on. Use write_todos to break down the
 step you are on right now — that is fine to lose at end of turn; the
-action files are what has to survive.
+roadmap (tasks and handoffs) and the docs are what has to survive.
 
 
 HOW TO WORK
@@ -265,10 +268,38 @@ Nobody queues your work. Deciding what is most valuable to do next,
 toward the horizons above, is the job — not something to wait for.
 
 Each cycle: a direct request from Rinkesh still open in the conversation
-outranks self-directed work. If there is none, go to /data/ROADMAP.md, find the
-initiative that matters most right now, and read only that initiative's
-action file — not all of them. Do one real, finished thing. Update that
-action file to reflect it.
+outranks self-directed work. If there is none, work the FOCUS initiative
+in the injected Roadmap note: its current task, starting from the
+handoff. Read that initiative's doc if you need its notes — not all of
+them. Do one real, finished thing, then record it (below).
+
+The roadmap. Roadmap -> initiatives -> tasks, kept by tools so status
+never goes stale:
+- An initiative is an outcome: objective, done_when, a doc at
+  /data/actions/<id>.md, and a cap on cycles (max_cycles). New ones
+  start 'proposed' (create_initiative); only Rinkesh's yes makes one
+  active (update_initiative status='active' approval=<his words>).
+- A task is one deliverable of about 1-3 cycles, with its own done_when
+  (add_task). One task is 'doing' at a time. Bigger than 3 cycles: split.
+- Every cycle you work a task: before you stop, update_task with a
+  handoff= — the one or two lines the next cycle needs first. Finished:
+  status='done' with deliverables= (the PR, file or run it produced).
+- Waiting on Rinkesh: ask_rinkesh, then set the task or initiative to
+  'waiting' with blocked_on='ask:<id>'. resolve_ask puts it back to work
+  by itself, so the next cycle moves on to other work meanwhile.
+- report_status(project=<initiative id>) counts the cycle. At the cap the
+  initiative blocks itself (round-limit): put where it stands to Rinkesh
+  with ask_rinkesh — continue (he raises the cap), change course, or drop.
+- Notes, reasoning and findings go in the doc, never in the store.
+
+Migrating from ROADMAP.md (once, while the Roadmap note says the store is
+empty): create each open initiative from /data/ROADMAP.md and its action
+file — active ones as 'active' with approval= the words of his that
+adopted it, proposals as 'proposed', with their remaining steps as tasks.
+Keep each existing action file as its doc; trim the status and queue out
+of it, since the store holds them now. Closed and declined initiatives
+stay where they are as history; don't recreate them. Spread it over
+cycles if it's large, most important first.
 
 Visitor inbox (P5). Every cycle, if the injected "Visitor inbox intake"
 note lists any received item, run your policy check on it: each is
@@ -304,8 +335,8 @@ files.
 Prefer small, self-contained increments. Each wake-up is short and
 starts cold; long multi-step runs in a single turn are where cost and
 loops get out of hand. If a request just arrived and is not broken down
-yet, splitting it into small checklist items in the action file — and
-doing the first — is a complete cycle on its own.
+yet, splitting it into tasks (add_task) — and starting the first — is
+a complete cycle on its own.
 
 Delegate context-heavy work to the sub-agent. Hand off long-context
 tasks — broad or long web searches, multi-page literature digs — to the
@@ -322,13 +353,13 @@ than it saves.
 When nothing is queued, that is the signal to do the most valuable thing
 toward the vision, not to stop:
 
-- If an initiative stalled only because its next steps were never
-  written down, break down the next chunk and continue.
+- If the focus initiative has no open tasks but isn't done, add the next
+  ones (add_task) and start the first.
 - If the roadmap has no open work, reflect on /data/VISION.md and work
   out what would move it forward — the most valuable thing to build,
-  learn, or fix. Write it up concretely: a proposed initiative with a
-  short id, why it matters, and the first few steps; add it to the
-  roadmap, create its action file, and put the proposal to Rinkesh.
+  learn, or fix. Write it up concretely: create_initiative with a short
+  id, why it matters in its doc, and the first few tasks; then put the
+  proposal to Rinkesh with ask_rinkesh.
   While waiting for his answer, light research is fine — but do not go
   in depth, or start building, without approval. A reminder to get a
   decision is also fine.
@@ -372,8 +403,8 @@ The memory compile. Your durable knowledge layer (/data/memory/knowledge/
 pages, routed by index.md) is kept current by a compile pass that is
 your own standing task — you act on it yourself, exactly like the daily
 blog, so it advances even while Rinkesh is busy or away. When a cycle
-has no higher-priority work (no open request from Rinkesh, and no real
-step to work on the active initiative in /data/ROADMAP.md — being
+has no higher-priority work (no open request from Rinkesh, and no
+FOCUS initiative in the Roadmap note with a task to work — being
 blocked on Rinkesh's approval is fine, the compile does not wait on
 him), check the marker /data/memory/knowledge/.last-compiled: if any
 closed log (/data/logs/<date>.md dated before today) is dated after the
@@ -423,12 +454,13 @@ HOURLY_TASK = (
     "This is your scheduled hourly wake-up. If it's the first cycle of a new "
     "day, do the Daily blog first (see your instructions) and that's the whole "
     "cycle. Otherwise: if Rinkesh has an open request in the conversation, "
-    "handle that before anything else; if not, work the next single step of the "
-    "current initiative in /data/ROADMAP.md — one step, then stop and leave "
-    "the rest for the next wake-up. If that initiative is still awaiting "
-    "Rinkesh's approval, keep to light research only — no in-depth work, no "
-    "code — and make sure the decision is an open ask (ask_rinkesh) rather "
-    "than reminding him in your message. If nothing "
+    "handle that before anything else; if not, work the FOCUS initiative's "
+    "current task from the injected Roadmap note, starting from its handoff — "
+    "one step, then update_task with a handoff for the next wake-up and stop. "
+    "If the Roadmap note says the store is empty, migrating /data/ROADMAP.md "
+    "into it is this cycle's work. A proposed initiative gets light research "
+    "only — no in-depth work, no code — and its decision should be an open ask "
+    "(ask_rinkesh) rather than a reminder in your message. If nothing "
     "is queued at all, put a short proposal to Rinkesh rather than starting it. "
     "Whatever you did this cycle, end by appending a line to today's "
     "/data/logs/<date>.md. If the cycle's injected 'Visitor inbox intake' "
@@ -1035,7 +1067,9 @@ def _ask_resolve(ask_id: str, outcome: str, status: str = "answered", now=None) 
         a["outcome"] = outcome
         a["closed"] = now.isoformat()
         _asks_save(asks)
-        return {"ok": True, "id": ask_id, "status": status}
+        # Anything on the roadmap that waited on this ask goes back to work.
+        resumed = _roadmap_on_ask_closed(ask_id, status, outcome, now=now)
+        return {"ok": True, "id": ask_id, "status": status, "resumed": resumed}
     return {"ok": False, "error": f"no ask with id [{ask_id}]"}
 
 
@@ -1181,6 +1215,650 @@ def _report_latest(turns: list) -> dict:
             }
         missed += 1
     return {"run": None, "fresh": False, "missed_runs": missed}
+
+
+# --- roadmap: initiatives and their tasks, owned by code ----------------------
+# ROADMAP.md grew to ~1,100 lines of prose where an initiative's status was the
+# word in its heading ("Active", "Declined"), and /control could only serve the
+# file raw. Every cycle also began by reading it to decide what to work on.
+# So the structure moves into a store only the roadmap tools write:
+#   roadmap -> initiatives (objective, done_when, status, doc, round cap)
+#           -> tasks (title, done_when, status, handoff, deliverables)
+# The prose stays in each initiative's doc, /data/actions/<id>.md, which the
+# record links to. The same records feed the per-turn "Roadmap" note (what to
+# work on) and /api/control/roadmap (what Rinkesh sees), so the two can't
+# drift. Turns run one at a time in one container, so a plain file is safe,
+# as with asks.json.
+ROADMAP_PATH = os.path.join(VOLUME_PATH, "memory", "roadmap.json")
+ACTIONS_DIR = os.path.join(VOLUME_PATH, "actions")
+ACTIONS_ARCHIVE_DIR = os.path.join(ACTIONS_DIR, "archive")
+ROADMAP_WHAT = (
+    "Sudarshana's roadmap: initiatives and their tasks, served by "
+    "/api/control/roadmap. Written only by the roadmap tools — do not edit by hand."
+)
+INITIATIVE_STATUSES = ("proposed", "active", "waiting", "blocked", "done", "declined")
+INITIATIVE_OPEN = ("proposed", "active", "waiting", "blocked")
+# Allowed moves. Closed states are final: reopening means a new initiative.
+INITIATIVE_MOVES = {
+    "proposed": {"active", "declined"},
+    "active": {"waiting", "blocked", "done", "declined"},
+    "waiting": {"active", "blocked", "declined"},
+    "blocked": {"active", "declined"},
+    "done": set(),
+    "declined": set(),
+}
+TASK_STATUSES = ("todo", "doing", "waiting", "blocked", "done", "dropped")
+TASK_OPEN = ("todo", "doing", "waiting", "blocked")
+TASK_MOVES = {
+    "todo": {"doing", "dropped"},
+    "doing": {"todo", "waiting", "blocked", "done", "dropped"},
+    "waiting": {"doing", "blocked", "dropped"},
+    "blocked": {"doing", "dropped"},
+    "done": set(),
+    "dropped": set(),
+}
+# Cycles an initiative may take before it stops and goes back to Rinkesh.
+ROADMAP_DEFAULT_MAX_CYCLES = 12
+ROADMAP_MAX_CYCLES_CAP = 100
+ROADMAP_TEXT_MAX = 400
+ROADMAP_HANDOFF_MAX = 600
+ROADMAP_LIST_MAX = 20
+ROADMAP_TASKS_MAX = 40
+ROADMAP_ID_RE = r"[a-z0-9][a-z0-9-]{0,59}"
+
+
+def _rm_text(s, cap: int = ROADMAP_TEXT_MAX) -> str:
+    return " ".join(str(s or "").split())[:cap]
+
+
+def _roadmap_load() -> list:
+    """All initiatives. A missing file is an empty roadmap; an unreadable or
+    malformed one raises, so "no initiatives" and "the store is broken" can't
+    look the same (the rule asks.json follows)."""
+    import json
+
+    try:
+        with open(ROADMAP_PATH, encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return []
+    if not raw.strip():
+        return []
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not isinstance(data.get("initiatives"), list):
+        raise ValueError("roadmap.json has no initiatives list")
+    return [it for it in data["initiatives"] if isinstance(it, dict) and it.get("id")]
+
+
+def _roadmap_save(items: list) -> None:
+    """Atomic write, then commit the Volume at once (a turn that dies later
+    must not lose a status change it already reported)."""
+    import json
+
+    os.makedirs(os.path.dirname(ROADMAP_PATH), exist_ok=True)
+    tmp = ROADMAP_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"_what": ROADMAP_WHAT, "initiatives": items}, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, ROADMAP_PATH)
+    try:
+        volume.commit()
+    except Exception as e:  # noqa: BLE001 — the turn-end commit still carries it
+        print(f"[roadmap] volume commit failed, relying on the turn-end commit: {e!r}")
+
+
+def _rm_sorted(items: list) -> list:
+    """Roadmap order: open before closed, then priority (lower first), then age."""
+    return sorted(
+        items,
+        key=lambda i: (
+            i.get("status") not in INITIATIVE_OPEN,
+            int(i.get("priority") or 0),
+            str(i.get("created") or ""),
+        ),
+    )
+
+
+def _rm_find(items: list, initiative_id: str):
+    initiative_id = str(initiative_id or "").strip().removesuffix(".md")
+    for it in items:
+        if it["id"] == initiative_id:
+            return it
+    return None
+
+
+def _rm_task(it: dict, task_id: str):
+    task_id = str(task_id or "").strip()
+    for t in it.get("tasks") or []:
+        if t["id"] == task_id:
+            return t
+    return None
+
+
+def _rm_open_ask_ids() -> set:
+    try:
+        return {a["id"] for a in _asks_load() if a["status"] == "open"}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _rm_check_blocked_on(blocked_on: str):
+    """None if fine, else an error. 'ask:<id>' must name an open ask, so an
+    item can't wait on something Rinkesh was never sent."""
+    if not blocked_on:
+        return "say what it waits on: blocked_on='ask:<id>' (an open ask) or a short description"
+    if blocked_on.startswith("ask:"):
+        ask_id = blocked_on[4:].strip().strip("[]")
+        if ask_id not in _rm_open_ask_ids():
+            return f"no open ask [{ask_id}] — send it with ask_rinkesh first"
+    return None
+
+
+def _rm_check_paths(paths, field: str):
+    """Clean list of links/deliverables, or (None, error). /data paths must
+    exist; URLs are taken as given."""
+    out = []
+    for p in paths or []:
+        p = str(p or "").strip()
+        if not p:
+            continue
+        if p.startswith(("http://", "https://")):
+            out.append(p[:ROADMAP_TEXT_MAX])
+            continue
+        if not p.startswith(VOLUME_PATH + "/") or ".." in p.split("/"):
+            return None, f"{field}: {p!r} is neither a URL nor a {VOLUME_PATH}/ path"
+        if not os.path.exists(p):
+            return None, f"{field}: {p} does not exist"
+        out.append(p)
+    return out[:ROADMAP_LIST_MAX], None
+
+
+def _rm_doc_path(initiative_id: str) -> str:
+    # /data paths are POSIX; built by hand so they match what the tools check.
+    return f"{ACTIONS_DIR}/{initiative_id}.md"
+
+
+def _rm_ensure_doc(it: dict) -> None:
+    """Create the initiative's doc if it doesn't exist yet. An existing file
+    (an initiative from before this store) is kept as it is."""
+    path = it["doc"]
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            f"# {it['id']} — {it['title']}\n\n"
+            f"**Objective.** {it['objective']}\n\n"
+            f"**Done when.** {it['done_when']}\n\n"
+            "Status and tasks live in the roadmap store (roadmap_view); this file "
+            "holds the notes, reasoning and findings.\n\n## Notes\n"
+        )
+
+
+def _rm_archive_doc(it: dict, now) -> None:
+    """Move a closed initiative's doc to actions/archive/ and repoint `doc`,
+    so the link stays valid. Never overwrites an existing archive file."""
+    src = it.get("doc") or ""
+    if not src or not os.path.isfile(src) or os.path.dirname(src) == ACTIONS_ARCHIVE_DIR:
+        return
+    os.makedirs(ACTIONS_ARCHIVE_DIR, exist_ok=True)
+    dst = f"{ACTIONS_ARCHIVE_DIR}/{os.path.basename(src)}"
+    if os.path.exists(dst):
+        dst = f"{ACTIONS_ARCHIVE_DIR}/{it['id']}-{now.strftime('%Y-%m-%d')}.md"
+        n = 2
+        while os.path.exists(dst):
+            dst = f"{ACTIONS_ARCHIVE_DIR}/{it['id']}-{now.strftime('%Y-%m-%d')}-{n}.md"
+            n += 1
+    os.replace(src, dst)
+    it["doc"] = dst
+
+
+def _rm_cap(value, default: int):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return min(max(n, 1), ROADMAP_MAX_CYCLES_CAP) if n else default
+
+
+def _initiative_create(initiative_id: str, title: str, objective: str, done_when: str,
+                       asked_by: str = "", status: str = "proposed", priority: int = 0,
+                       max_cycles: int = ROADMAP_DEFAULT_MAX_CYCLES, approval: str = "",
+                       links=None, now=None) -> dict:
+    import re
+
+    now = now or _utcnow()
+    initiative_id = str(initiative_id or "").strip().removesuffix(".md")
+    if not re.fullmatch(ROADMAP_ID_RE, initiative_id):
+        return {"ok": False, "error": "id must be short lower-kebab-case, e.g. gate-axe"}
+    title, objective, done_when = _rm_text(title), _rm_text(objective), _rm_text(done_when)
+    asked_by, approval = _rm_text(asked_by), _rm_text(approval)
+    if not title or not objective or not done_when:
+        return {"ok": False, "error": "title, objective and done_when are all required"}
+    if status not in ("proposed", "active"):
+        return {"ok": False, "error": "a new initiative starts as 'proposed' (or 'active' with approval=)"}
+    if status == "active" and not approval:
+        return {"ok": False, "error": "starting it active needs approval= — Rinkesh's own words approving it"}
+    cap = _rm_cap(max_cycles, ROADMAP_DEFAULT_MAX_CYCLES)
+    if cap is None:
+        return {"ok": False, "error": f"max_cycles must be a whole number, got {max_cycles!r}"}
+    try:
+        prio = int(priority or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"priority must be a whole number, got {priority!r}"}
+    links, err = _rm_check_paths(links, "links")
+    if err:
+        return {"ok": False, "error": err}
+    try:
+        items = _roadmap_load()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"can't read {ROADMAP_PATH} ({e}); nothing changed"}
+    if _rm_find(items, initiative_id):
+        return {"ok": False, "error": f"initiative {initiative_id} already exists"}
+    ts = now.isoformat()
+    it = {
+        "id": initiative_id,
+        "title": title,
+        "objective": objective,
+        "done_when": done_when,
+        "asked_by": asked_by,
+        "status": status,
+        "priority": prio,
+        "doc": _rm_doc_path(initiative_id),
+        "links": links,
+        "cycles_used": 0,
+        "max_cycles": cap,
+        "blocked_on": "",
+        "blocked_reason": None,
+        "approval": approval if status == "active" else "",
+        "created": ts,
+        "updated": ts,
+        "closed": None,
+        "outcome": "",
+        "tasks": [],
+    }
+    _rm_ensure_doc(it)
+    items.append(it)
+    _roadmap_save(items)
+    return {"ok": True, "initiative": it}
+
+
+def _initiative_update(initiative_id: str, status: str = "", title: str = "", objective: str = "",
+                       done_when: str = "", priority=None, max_cycles=None, blocked_on: str = "",
+                       reason: str = "", approval: str = "", outcome: str = "", links=None,
+                       now=None) -> dict:
+    now = now or _utcnow()
+    try:
+        items = _roadmap_load()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"can't read {ROADMAP_PATH} ({e}); nothing changed"}
+    it = _rm_find(items, initiative_id)
+    if not it:
+        return {"ok": False, "error": f"no initiative {initiative_id!r}"}
+    if it["status"] not in INITIATIVE_OPEN:
+        return {"ok": False, "error": f"{it['id']} is {it['status']} — closed initiatives don't change"}
+    approval, reason, outcome = _rm_text(approval), _rm_text(reason), _rm_text(outcome)
+    blocked_on = _rm_text(blocked_on)
+
+    if max_cycles is not None:
+        cap = _rm_cap(max_cycles, it["max_cycles"])
+        if cap is None:
+            return {"ok": False, "error": f"max_cycles must be a whole number, got {max_cycles!r}"}
+        # Raising your own cap is what the cap exists to stop.
+        if cap > it["max_cycles"] and not approval:
+            return {"ok": False, "error": "raising max_cycles needs approval= — Rinkesh's own words"}
+    if priority is not None:
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"priority must be a whole number, got {priority!r}"}
+    if links is not None:
+        links, err = _rm_check_paths(links, "links")
+        if err:
+            return {"ok": False, "error": err}
+
+    status = str(status or "").strip()
+    if status and status != it["status"]:
+        if status not in INITIATIVE_STATUSES:
+            return {"ok": False, "error": f"status must be one of {list(INITIATIVE_STATUSES)}"}
+        if status not in INITIATIVE_MOVES[it["status"]]:
+            allowed = sorted(INITIATIVE_MOVES[it["status"]])
+            return {"ok": False, "error": f"{it['id']} can't go {it['status']} -> {status}; allowed: {allowed}"}
+        if it["status"] == "proposed" and status == "active" and not approval:
+            return {"ok": False, "error": "adopting a proposal needs approval= — Rinkesh's own words approving it"}
+        hit_cap = (it.get("blocked_reason") or {}).get("code") == "round-limit"
+        if it["status"] == "blocked" and hit_cap and status == "active":
+            new_cap = it["max_cycles"] if max_cycles is None else _rm_cap(max_cycles, it["max_cycles"])
+            if not approval or new_cap <= int(it.get("cycles_used") or 0):
+                return {"ok": False, "error": "it hit its cycle cap: resuming needs approval= and a higher max_cycles="}
+        if status == "waiting":
+            err = _rm_check_blocked_on(blocked_on)
+            if err:
+                return {"ok": False, "error": err}
+        if status == "blocked" and not reason:
+            return {"ok": False, "error": "say why it's blocked (reason=...)"}
+        if status in ("done", "declined") and not outcome:
+            return {"ok": False, "error": "say what came of it (outcome=...)"}
+
+    # All checks passed — apply.
+    for field, val in (("title", title), ("objective", objective), ("done_when", done_when)):
+        if _rm_text(val):
+            it[field] = _rm_text(val)
+    if priority is not None:
+        it["priority"] = priority
+    if max_cycles is not None:
+        it["max_cycles"] = _rm_cap(max_cycles, it["max_cycles"])
+    if links is not None:
+        it["links"] = links
+    if approval:
+        it["approval"] = approval
+    if status and status != it["status"]:
+        it["status"] = status
+        it["blocked_on"] = blocked_on if status == "waiting" else ""
+        it["blocked_reason"] = {"code": "manual", "message": reason} if status == "blocked" else None
+        if status in ("done", "declined"):
+            it["closed"] = now.isoformat()
+            it["outcome"] = outcome
+            _rm_archive_doc(it, now)
+    it["updated"] = now.isoformat()
+    _roadmap_save(items)
+    return {"ok": True, "initiative": it}
+
+
+def _task_add(initiative_id: str, title: str, done_when: str, position=None, now=None) -> dict:
+    now = now or _utcnow()
+    title, done_when = _rm_text(title), _rm_text(done_when)
+    if not title or not done_when:
+        return {"ok": False, "error": "title and done_when are both required"}
+    try:
+        items = _roadmap_load()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"can't read {ROADMAP_PATH} ({e}); nothing changed"}
+    it = _rm_find(items, initiative_id)
+    if not it:
+        return {"ok": False, "error": f"no initiative {initiative_id!r}"}
+    if it["status"] not in INITIATIVE_OPEN:
+        return {"ok": False, "error": f"{it['id']} is {it['status']} — closed initiatives don't change"}
+    tasks = it.setdefault("tasks", [])
+    if sum(1 for t in tasks if t["status"] in TASK_OPEN) >= ROADMAP_TASKS_MAX:
+        return {"ok": False, "error": f"{it['id']} already has {ROADMAP_TASKS_MAX} open tasks — finish or drop some"}
+    n = 1 + max((int(t["id"][1:]) for t in tasks if t["id"][1:].isdigit()), default=0)
+    ts = now.isoformat()
+    task = {
+        "id": f"t{n}",
+        "title": title,
+        "done_when": done_when,
+        "status": "todo",
+        "handoff": "",
+        "deliverables": [],
+        "blocked_on": "",
+        "blocked_reason": "",
+        "cycles": 0,
+        "created": ts,
+        "updated": ts,
+        "closed": None,
+    }
+    try:
+        pos = None if position is None or position == "" else int(position)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"position must be a whole number, got {position!r}"}
+    if pos is None:
+        tasks.append(task)
+    else:
+        tasks.insert(max(pos - 1, 0), task)
+    it["updated"] = ts
+    _roadmap_save(items)
+    return {"ok": True, "task": task, "initiative": it["id"]}
+
+
+def _task_update(initiative_id: str, task_id: str, status: str = "", title: str = "",
+                 done_when: str = "", handoff: str = "", deliverables=None,
+                 blocked_on: str = "", reason: str = "", now=None) -> dict:
+    now = now or _utcnow()
+    try:
+        items = _roadmap_load()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"can't read {ROADMAP_PATH} ({e}); nothing changed"}
+    it = _rm_find(items, initiative_id)
+    if not it:
+        return {"ok": False, "error": f"no initiative {initiative_id!r}"}
+    task = _rm_task(it, task_id)
+    if not task:
+        return {"ok": False, "error": f"{it['id']} has no task {task_id!r}"}
+    if task["status"] not in TASK_OPEN:
+        return {"ok": False, "error": f"{it['id']}/{task['id']} is {task['status']} — closed tasks don't change"}
+    blocked_on, reason = _rm_text(blocked_on), _rm_text(reason)
+    new_deliverables, err = _rm_check_paths(deliverables, "deliverables")
+    if err:
+        return {"ok": False, "error": err}
+
+    status = str(status or "").strip()
+    if status and status != task["status"]:
+        if status not in TASK_STATUSES:
+            return {"ok": False, "error": f"status must be one of {list(TASK_STATUSES)}"}
+        if status not in TASK_MOVES[task["status"]]:
+            allowed = sorted(TASK_MOVES[task["status"]])
+            return {"ok": False, "error": f"{task['id']} can't go {task['status']} -> {status}; allowed: {allowed}"}
+        if status == "doing":
+            if it["status"] != "active":
+                return {"ok": False, "error": f"{it['id']} is {it['status']} — tasks start only on an active initiative"}
+            busy = [t["id"] for t in it["tasks"] if t["status"] == "doing" and t is not task]
+            if busy:
+                return {"ok": False, "error": f"{busy[0]} is already doing — one task at a time; move it first"}
+        if status == "waiting":
+            err = _rm_check_blocked_on(blocked_on)
+            if err:
+                return {"ok": False, "error": err}
+        if status == "blocked" and not reason:
+            return {"ok": False, "error": "say why it's blocked (reason=...)"}
+        if status == "done" and not (new_deliverables or task["deliverables"]):
+            return {"ok": False, "error": "a done task names what it produced: deliverables=[URL or /data path]"}
+        if status in ("done", "dropped") and not (_rm_text(handoff) or reason):
+            return {"ok": False, "error": "say what came of it (handoff= for done, reason= for dropped)"}
+
+    for field, val in (("title", title), ("done_when", done_when)):
+        if _rm_text(val):
+            task[field] = _rm_text(val)
+    if _rm_text(handoff, ROADMAP_HANDOFF_MAX):
+        task["handoff"] = _rm_text(handoff, ROADMAP_HANDOFF_MAX)
+    for d in new_deliverables:
+        if d not in task["deliverables"]:
+            task["deliverables"].append(d)
+    task["deliverables"] = task["deliverables"][-ROADMAP_LIST_MAX:]
+    if status and status != task["status"]:
+        task["status"] = status
+        task["blocked_on"] = blocked_on if status == "waiting" else ""
+        task["blocked_reason"] = reason if status in ("blocked", "dropped") else ""
+        if status in ("done", "dropped"):
+            task["closed"] = now.isoformat()
+    task["updated"] = it["updated"] = now.isoformat()
+    _roadmap_save(items)
+    return {"ok": True, "task": task, "initiative": it["id"]}
+
+
+def _roadmap_count_cycle(initiative_id: str, turn_key: str, now=None):
+    """One cycle of work on `initiative_id`, counted once per turn (called from
+    report_status). At the cap the initiative blocks itself with code
+    round-limit: the cap is enforced here, not left to the model. Returns a
+    short note for the report_status result, or ""."""
+    now = now or _utcnow()
+    try:
+        items = _roadmap_load()
+    except Exception as e:  # noqa: BLE001
+        print(f"[roadmap] cycle not counted: {e!r}")
+        return ""
+    it = _rm_find(items, initiative_id)
+    if not it or it["status"] != "active" or (turn_key and it.get("last_turn") == turn_key):
+        return ""
+    it["cycles_used"] = int(it.get("cycles_used") or 0) + 1
+    it["last_turn"] = turn_key
+    for t in it.get("tasks") or []:
+        if t["status"] == "doing":
+            t["cycles"] = int(t.get("cycles") or 0) + 1
+    note = f"{it['id']}: cycle {it['cycles_used']}/{it['max_cycles']}"
+    if it["cycles_used"] >= it["max_cycles"]:
+        it["status"] = "blocked"
+        it["blocked_reason"] = {
+            "code": "round-limit",
+            "message": f"used all {it['max_cycles']} cycles without reaching done_when",
+        }
+        note += " — cap reached, now BLOCKED (round-limit); put it to Rinkesh with ask_rinkesh"
+    it["updated"] = now.isoformat()
+    _roadmap_save(items)
+    return note
+
+
+def _roadmap_on_ask_closed(ask_id: str, status: str, outcome: str, now=None) -> list:
+    """An ask closed: whatever waited on it goes back to work, with what came
+    of it as the handoff. Returns the ids that resumed."""
+    now = now or _utcnow()
+    try:
+        items = _roadmap_load()
+    except Exception as e:  # noqa: BLE001
+        print(f"[roadmap] ask {ask_id} closed, waiters not resumed: {e!r}")
+        return []
+    key = f"ask:{ask_id}"
+    resumed = []
+    note = _rm_text(f"ask [{ask_id}] {status}: {outcome}", ROADMAP_HANDOFF_MAX)
+    for it in items:
+        if it["status"] == "waiting" and it.get("blocked_on") == key:
+            it["status"], it["blocked_on"] = "active", ""
+            it["updated"] = now.isoformat()
+            resumed.append(it["id"])
+        for t in it.get("tasks") or []:
+            if t["status"] == "waiting" and t.get("blocked_on") == key:
+                t["status"], t["blocked_on"], t["handoff"] = "doing", "", note
+                t["updated"] = it["updated"] = now.isoformat()
+                resumed.append(f"{it['id']}/{t['id']}")
+    if resumed:
+        _roadmap_save(items)
+    return resumed
+
+
+def _roadmap_focus(items: list):
+    """The initiative this cycle should work on: the first active one in
+    roadmap order (waiting/blocked ones are skipped), or None."""
+    for it in _rm_sorted(items):
+        if it["status"] == "active":
+            return it
+    return None
+
+
+def _rm_task_line(t: dict) -> str:
+    line = f"  {t['id']} [{t['status']}] {t['title']} — done when: {t['done_when']}"
+    if t.get("blocked_on"):
+        line += f" (waiting on {t['blocked_on']})"
+    if t.get("blocked_reason") and t["status"] == "blocked":
+        line += f" (blocked: {t['blocked_reason']})"
+    return line
+
+
+def _roadmap_context(now=None) -> str:
+    """Per-turn note: the focus initiative with its current task and handoff,
+    then one line for every other open initiative. Fails open."""
+    try:
+        return _roadmap_context_unsafe(now)
+    except Exception as e:  # noqa: BLE001
+        print(f"[roadmap] context unavailable: {e!r}")
+        return "(Roadmap: the store could not be read this turn — check /data/memory/roadmap.json.)"
+
+
+def _roadmap_context_unsafe(now=None) -> str:
+    items = _roadmap_load()
+    if not items:
+        return (
+            "Roadmap: the store is empty. Until it holds your initiatives, "
+            "/data/ROADMAP.md is still where they are — migrate them (see 'The roadmap' "
+            "in your instructions) as this cycle's work."
+        )
+    open_ = [i for i in _rm_sorted(items) if i["status"] in INITIATIVE_OPEN]
+    if not open_:
+        return "Roadmap: no open initiatives. Propose one (create_initiative) and put it to Rinkesh."
+    lines = ["Roadmap (from the roadmap store; roadmap_view for detail):"]
+    focus = _roadmap_focus(items)
+    if focus:
+        lines.append(
+            f"FOCUS — {focus['id']}: {focus['title']} "
+            f"(cycle {focus['cycles_used'] + 1}/{focus['max_cycles']}, doc {focus['doc']})"
+        )
+        lines.append(f"  Objective: {focus['objective']}")
+        lines.append(f"  Done when: {focus['done_when']}")
+        tasks = [t for t in focus.get("tasks") or [] if t["status"] in TASK_OPEN]
+        cur = next((t for t in tasks if t["status"] == "doing"), None) or \
+            next((t for t in tasks if t["status"] == "todo"), None)
+        if cur:
+            lines.append(f"  Current task: {_rm_task_line(cur).strip()}")
+            if cur.get("handoff"):
+                lines.append(f"  Handoff from last cycle: {cur['handoff']}")
+        else:
+            lines.append("  No open tasks: add the next ones (add_task) or close it if done_when is met.")
+        rest = [t for t in tasks if t is not cur][:4]
+        if rest:
+            lines.append("  Queue:")
+            lines.extend(_rm_task_line(t) for t in rest)
+    for it in open_:
+        if it is focus:
+            continue
+        line = f"- {it['id']} [{it['status']}] {it['title']}"
+        if it["status"] == "waiting":
+            line += f" — waiting on {it['blocked_on']}"
+        elif it["status"] == "blocked":
+            br = it.get("blocked_reason") or {}
+            line += f" — blocked ({br.get('code', '?')}): {br.get('message', '')}"
+        elif it["status"] == "proposed":
+            line += " — awaiting Rinkesh's approval: light research only"
+        lines.append(line)
+    if not focus:
+        lines.append("No active initiative to work on: every open one is waiting, blocked or proposed.")
+    return "\n".join(lines)
+
+
+def _roadmap_view(initiative_id: str = "") -> str:
+    """Text view for the model: the whole roadmap, or one initiative in full."""
+    try:
+        items = _roadmap_load()
+    except Exception as e:  # noqa: BLE001
+        return f"can't read {ROADMAP_PATH}: {e}"
+    if initiative_id:
+        it = _rm_find(items, initiative_id)
+        if not it:
+            return f"no initiative {initiative_id!r}"
+        lines = [
+            f"{it['id']} [{it['status']}] {it['title']} (priority {it['priority']}, "
+            f"cycle {it['cycles_used']}/{it['max_cycles']})",
+            f"Objective: {it['objective']}",
+            f"Done when: {it['done_when']}",
+            f"Doc: {it['doc']}",
+        ]
+        if it.get("asked_by"):
+            lines.append(f"Asked by: {it['asked_by']}")
+        if it.get("blocked_on"):
+            lines.append(f"Waiting on: {it['blocked_on']}")
+        if it.get("blocked_reason"):
+            lines.append(f"Blocked: {it['blocked_reason']}")
+        if it.get("links"):
+            lines.append("Links: " + ", ".join(it["links"]))
+        if it.get("outcome"):
+            lines.append(f"Outcome: {it['outcome']}")
+        lines.append("Tasks:")
+        for t in it.get("tasks") or []:
+            lines.append(_rm_task_line(t))
+            if t.get("handoff"):
+                lines.append(f"      handoff: {t['handoff']}")
+            if t.get("deliverables"):
+                lines.append("      deliverables: " + ", ".join(t["deliverables"]))
+        if not it.get("tasks"):
+            lines.append("  (none)")
+        return "\n".join(lines)
+    if not items:
+        return "The roadmap store is empty."
+    lines = []
+    for it in _rm_sorted(items):
+        open_tasks = sum(1 for t in it.get("tasks") or [] if t["status"] in TASK_OPEN)
+        lines.append(
+            f"{it['id']} [{it['status']}] p{it['priority']} {it['title']} — "
+            f"{open_tasks} open task(s), cycle {it['cycles_used']}/{it['max_cycles']}"
+        )
+    return "\n".join(lines)
 
 
 # --- status-center: deterministic event writer + read-only API ---------------
@@ -1521,7 +2199,7 @@ class Sudarshana:
             system_prompt=(
                 "--- where I am right now (from /data/memory/state.md, "
                 "refreshed each cycle; the canonical files "
-                "ROADMAP/actions/VISION/logs always win on disagreement) "
+                "roadmap store/docs/VISION/logs always win on disagreement) "
                 "---\n{agent_memory}"
             ),
         )
@@ -1637,7 +2315,10 @@ class Sudarshana:
             one line: what he said, or why it's no longer needed."""
             res = _ask_resolve(ask_id, outcome, status=status)
             if res.get("ok"):
-                return f"closed: [{res['id']}] {res['status']}"
+                out = f"closed: [{res['id']}] {res['status']}"
+                if res.get("resumed"):
+                    out += "; back to work: " + ", ".join(res["resumed"])
+                return out
             return f"failed: {res['error']}"
 
         @tool
@@ -1652,8 +2333,9 @@ class Sudarshana:
             doing= one plain sentence: what this turn did, or what is under
             way. why= the reason in terms of what Rinkesh asked for (quote
             his words when you can), not your internal bookkeeping.
-            project= the /data/actions file name of the initiative this
-            serves (e.g. "gateway-ui-craft"), or "" for none. done_when= that
+            project= the roadmap id of the initiative this turn worked on
+            (e.g. "gate-axe"), or "" for none; naming it counts this turn
+            as one of its cycles. done_when= that
             initiative's finish line in one line. done= / left= short items:
             the steps finished and the steps remaining toward done_when.
             next_step= what the next turn will do, or "waiting on Rinkesh"
@@ -1663,11 +2345,113 @@ class Sudarshana:
                                project=project, done_when=done_when,
                                done=done, left=left, next_step=next_step)
             if res.get("ok"):
-                return f"reported at {res['report']['reported_at']}"
+                out = f"reported at {res['report']['reported_at']}"
+                if res["report"]["project"]:
+                    note = _roadmap_count_cycle(res["report"]["project"], getattr(self, "_turn_key", None))
+                    if note:
+                        out += f"; {note}"
+                return out
             return f"not reported: {res['error']}"
 
         ask_tools = [ask_rinkesh, resolve_ask, report_status]
-        search_tools = [*search_tools, *inbox_tools, *ask_tools]
+
+        # The roadmap: initiatives and their tasks. These tools are the only
+        # writers of /data/memory/roadmap.json; the prose lives in each
+        # initiative's doc (/data/actions/<id>.md).
+
+        def _rm_fail(res: dict) -> str:
+            return f"failed: {res.get('error', 'unknown')}"
+
+        @tool
+        def roadmap_view(initiative_id: str = "") -> str:
+            """Read the roadmap. With no id: every initiative, one line each
+            (status, priority, open tasks, cycles used). With an id: that
+            initiative in full — objective, done_when, doc, every task with
+            its handoff and deliverables."""
+            return _roadmap_view(initiative_id)
+
+        @tool
+        def create_initiative(id: str, title: str, objective: str, done_when: str,
+                              asked_by: str = "", status: str = "proposed", priority: int = 0,
+                              max_cycles: int = ROADMAP_DEFAULT_MAX_CYCLES, approval: str = "",
+                              links: list[str] | None = None) -> str:
+            """Add an initiative to the roadmap. id= short lower-kebab-case
+            (e.g. "gate-axe"). objective= the outcome in one or two
+            sentences; done_when= the finish line, checkable. asked_by=
+            Rinkesh's words if he asked for it. It starts 'proposed' — put it
+            to him with ask_rinkesh; only his yes makes it active. To start it
+            active right away (he asked for it), pass status='active' and
+            approval= his own words. priority= lower runs first (0 default).
+            max_cycles= cycles before it stops and comes back to him (default
+            12). links= extra /data paths or URLs. Creates the doc
+            /data/actions/<id>.md if it doesn't exist; write your notes there.
+            Add its tasks with add_task."""
+            res = _initiative_create(id, title, objective, done_when, asked_by=asked_by,
+                                     status=status, priority=priority, max_cycles=max_cycles,
+                                     approval=approval, links=links)
+            if not res.get("ok"):
+                return _rm_fail(res)
+            it = res["initiative"]
+            return f"created {it['id']} [{it['status']}], doc {it['doc']}"
+
+        @tool
+        def update_initiative(id: str, status: str = "", title: str = "", objective: str = "",
+                              done_when: str = "", priority: int | None = None,
+                              max_cycles: int | None = None, blocked_on: str = "", reason: str = "",
+                              approval: str = "", outcome: str = "",
+                              links: list[str] | None = None) -> str:
+            """Change an initiative. Status moves allowed: proposed -> active
+            (needs approval= Rinkesh's words) | declined; active -> waiting
+            (needs blocked_on='ask:<id>' or what it waits on) | blocked (needs
+            reason=) | done | declined; waiting -> active | blocked | declined;
+            blocked -> active | declined. done/declined need outcome= and are
+            final; the doc moves to /data/actions/archive/. Raising max_cycles,
+            or resuming one that hit its cap, needs approval=. An initiative
+            waiting on an ask goes back to active by itself when resolve_ask
+            closes that ask. links= replaces the list."""
+            res = _initiative_update(id, status=status, title=title, objective=objective,
+                                     done_when=done_when, priority=priority, max_cycles=max_cycles,
+                                     blocked_on=blocked_on, reason=reason, approval=approval,
+                                     outcome=outcome, links=links)
+            if not res.get("ok"):
+                return _rm_fail(res)
+            it = res["initiative"]
+            return f"ok: {it['id']} [{it['status']}], doc {it['doc']}"
+
+        @tool
+        def add_task(initiative_id: str, title: str, done_when: str, position: int | None = None) -> str:
+            """Add a task to an initiative: one deliverable that takes about
+            1-3 cycles (bigger than that, split it). done_when= what proves it
+            finished. position= 1-based place in the queue (default: last).
+            Tasks run in queue order, one 'doing' at a time."""
+            res = _task_add(initiative_id, title, done_when, position=position)
+            if not res.get("ok"):
+                return _rm_fail(res)
+            return f"added {res['initiative']}/{res['task']['id']}"
+
+        @tool
+        def update_task(initiative_id: str, task_id: str, status: str = "", title: str = "",
+                        done_when: str = "", handoff: str = "", deliverables: list[str] | None = None,
+                        blocked_on: str = "", reason: str = "") -> str:
+            """Change a task. Status moves allowed: todo -> doing | dropped;
+            doing -> todo | waiting (needs blocked_on=) | blocked (needs
+            reason=) | done | dropped; waiting/blocked -> doing | dropped. Only
+            one task per initiative is 'doing', and only on an active
+            initiative. done needs deliverables= (URLs or existing /data paths
+            it produced) and a handoff=; dropped needs reason=. handoff= one or
+            two lines the NEXT cycle reads first — set it every cycle you work
+            the task, even if it's not done. deliverables= are added to the
+            list."""
+            res = _task_update(initiative_id, task_id, status=status, title=title,
+                               done_when=done_when, handoff=handoff, deliverables=deliverables,
+                               blocked_on=blocked_on, reason=reason)
+            if not res.get("ok"):
+                return _rm_fail(res)
+            t = res["task"]
+            return f"ok: {res['initiative']}/{t['id']} [{t['status']}]"
+
+        roadmap_tools = [roadmap_view, create_initiative, update_initiative, add_task, update_task]
+        search_tools = [*search_tools, *inbox_tools, *ask_tools, *roadmap_tools]
 
         # Production runs on OpenRouter (USE_OPENROUTER=1, OPENROUTER_MODEL /
         # OPENROUTER_API_KEY). The else branch targets the self-hosted Qwen
@@ -1823,6 +2607,8 @@ class Sudarshana:
                 *([] if not (_acx := _asks_context()) else [
                     {"role": "system", "content": _acx}
                 ]),
+                # The roadmap's focus initiative, current task and handoff.
+                {"role": "system", "content": _roadmap_context()},
                 {"role": "user", "content": message},
             ]
         }
@@ -3367,6 +4153,80 @@ def control_api():
             raise HTTPException(status_code=404, detail="no such action file")
         _audit(user, f"read_action {action_id}")
         return {"id": action_id, **doc}
+
+    # --- roadmap: initiatives -> tasks, from the store the roadmap tools own --
+    # Served as records, not prose: the panel renders status, tasks and the
+    # doc link without parsing anything. `doc_exists` is checked here so a
+    # doc deleted from the shell shows as missing, not as a dead link.
+    def _roadmap_payload(it: dict) -> dict:
+        with _VolumeRead():
+            doc_exists = _os.path.isfile(it.get("doc") or "")
+        tasks = it.get("tasks") or []
+        return {
+            **{k: v for k, v in it.items() if k not in ("tasks", "last_turn")},
+            "doc_exists": doc_exists,
+            "tasks": tasks,
+            "tasks_open": sum(1 for t in tasks if t.get("status") in TASK_OPEN),
+            "tasks_done": sum(1 for t in tasks if t.get("status") == "done"),
+        }
+
+    def _roadmap_read():
+        """(initiatives in roadmap order, error or None)."""
+        try:
+            with _VolumeRead():
+                items = _roadmap_load()
+        except Exception as e:  # noqa: BLE001
+            return [], f"can't read the roadmap store: {type(e).__name__}"
+        return _rm_sorted(items), None
+
+    @web_app.get("/api/control/roadmap")
+    def read_roadmap(user: dict = Depends(_owner)):
+        _audit(user, "read_roadmap")
+        items, err = _roadmap_read()
+        focus = _roadmap_focus(items) if items else None
+        return {
+            "initiatives": [_roadmap_payload(it) for it in items],
+            # The initiative the next cycle works on, by the same rule the
+            # agent's per-turn note uses.
+            "focus": focus["id"] if focus else None,
+            # None when readable; a short reason otherwise, so an empty
+            # roadmap never passes for "the store is broken".
+            "error": err,
+        }
+
+    @web_app.get("/api/control/roadmap/{initiative_id}")
+    def read_initiative(initiative_id: str, user: dict = Depends(_owner)):
+        if not _re.fullmatch(ROADMAP_ID_RE, initiative_id or ""):
+            raise HTTPException(status_code=400, detail="invalid initiative id")
+        items, err = _roadmap_read()
+        if err:
+            raise HTTPException(status_code=503, detail=err)
+        it = _rm_find(items, initiative_id)
+        if not it:
+            raise HTTPException(status_code=404, detail="no such initiative")
+        _audit(user, f"read_initiative {initiative_id}")
+        return _roadmap_payload(it)
+
+    @web_app.get("/api/control/roadmap/{initiative_id}/doc")
+    def read_initiative_doc(initiative_id: str, user: dict = Depends(_owner)):
+        if not _re.fullmatch(ROADMAP_ID_RE, initiative_id or ""):
+            raise HTTPException(status_code=400, detail="invalid initiative id")
+        items, err = _roadmap_read()
+        if err:
+            raise HTTPException(status_code=503, detail=err)
+        it = _rm_find(items, initiative_id)
+        if not it:
+            raise HTTPException(status_code=404, detail="no such initiative")
+        # The doc path comes from the store, so confine it to the two
+        # directories the tools write docs to before reading it.
+        path = _os.path.realpath(it.get("doc") or "")
+        if _os.path.dirname(path) not in (_os.path.realpath(ACTION_DIR), _os.path.realpath(ACTIONS_ARCHIVE_DIR)):
+            raise HTTPException(status_code=400, detail="doc path outside the actions directory")
+        doc = _read_capped(path)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="doc missing")
+        _audit(user, f"read_initiative_doc {initiative_id}")
+        return {"id": initiative_id, "doc": it["doc"], **doc}
 
     # --- overview: the three questions the /control page actually asks ------
     # Everything above serves *files*; a person reading the panel has three
