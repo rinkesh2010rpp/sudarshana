@@ -1707,9 +1707,29 @@ def _roadmap_count_cycle(initiative_id: str, turn_key: str, now=None):
     return note
 
 
+def _rm_handoff_append(old: str, note: str) -> str:
+    """The earlier handoff, then `note`, within the cap. When it doesn't fit,
+    the start of the old handoff is trimmed, never the new note."""
+    old = _rm_text(old, ROADMAP_HANDOFF_MAX)
+    if not old:
+        return note
+    room = ROADMAP_HANDOFF_MAX - len(note) - 3
+    if room <= 0:
+        return note
+    if len(old) > room:
+        old = "…" + old[-(room - 1):]
+    return f"{old} | {note}"
+
+
 def _roadmap_on_ask_closed(ask_id: str, status: str, outcome: str, now=None) -> list:
     """An ask closed: whatever waited on it goes back to work, with what came
-    of it as the handoff. Returns the ids that resumed."""
+    of it added to the handoff. Returns the ids that resumed.
+
+    A task resumes as 'doing' only if its initiative has no other task doing:
+    while it waited, the agent was told to move on, and another task may have
+    started. Then it goes back to 'todo' at its place in the queue, keeping
+    the one-task-at-a-time rule (and cycles counted for one task, not two).
+    The earlier handoff is kept, with the ask's outcome after it."""
     now = now or _utcnow()
     try:
         items = _roadmap_load()
@@ -1726,9 +1746,13 @@ def _roadmap_on_ask_closed(ask_id: str, status: str, outcome: str, now=None) -> 
             resumed.append(it["id"])
         for t in it.get("tasks") or []:
             if t["status"] == "waiting" and t.get("blocked_on") == key:
-                t["status"], t["blocked_on"], t["handoff"] = "doing", "", note
+                # Re-checked per task, so two tasks waiting on one ask can't
+                # both come back as doing.
+                busy = any(o["status"] == "doing" for o in it["tasks"] if o is not t)
+                t["status"], t["blocked_on"] = ("todo" if busy else "doing"), ""
+                t["handoff"] = _rm_handoff_append(t.get("handoff"), note)
                 t["updated"] = it["updated"] = now.isoformat()
-                resumed.append(f"{it['id']}/{t['id']}")
+                resumed.append(f"{it['id']}/{t['id']}" + (" (queued: another task is doing)" if busy else ""))
     if resumed:
         _roadmap_save(items)
     return resumed

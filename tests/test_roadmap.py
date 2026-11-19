@@ -239,6 +239,57 @@ def test_resolving_the_ask_puts_waiters_back_to_work(mod):
     assert "he said go with B" in t["handoff"]
 
 
+def test_an_answered_ask_doesnt_make_a_second_doing_task(mod):
+    # The prompt tells the agent to move on while a task waits; if it did,
+    # the answer must not bring the old task back as a second "doing".
+    _active(mod)
+    mod._task_add("gate-axe", "A", "a done", now=T0)
+    mod._task_add("gate-axe", "B", "b done", now=T0)
+    mod._task_update("gate-axe", "t1", status="doing", now=T0)
+    ask_id = _ask(mod)
+    mod._task_update("gate-axe", "t1", status="waiting", blocked_on=f"ask:{ask_id}", now=T0)
+    assert mod._task_update("gate-axe", "t2", status="doing", now=T0)["ok"]
+    res = mod._ask_resolve(ask_id, "go with B", now=T0)
+    assert res["resumed"] == ["gate-axe/t1 (queued: another task is doing)"]
+    tasks = {t["id"]: t for t in _store(mod)[0]["tasks"]}
+    assert tasks["t1"]["status"] == "todo" and tasks["t2"]["status"] == "doing"
+    # ...so a cycle is counted for the one task actually in progress.
+    mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0)
+    tasks = {t["id"]: t for t in _store(mod)[0]["tasks"]}
+    assert tasks["t1"]["cycles"] == 0 and tasks["t2"]["cycles"] == 1
+
+
+def test_two_tasks_waiting_on_one_ask_resume_one_at_a_time(mod):
+    _active(mod)
+    for name in ("A", "B"):
+        mod._task_add("gate-axe", name, f"{name} done", now=T0)
+    ask_id = _ask(mod)
+    for tid in ("t1", "t2"):
+        mod._task_update("gate-axe", tid, status="doing", now=T0)
+        mod._task_update("gate-axe", tid, status="waiting", blocked_on=f"ask:{ask_id}", now=T0)
+    mod._ask_resolve(ask_id, "yes", now=T0)
+    statuses = [t["status"] for t in _store(mod)[0]["tasks"]]
+    assert statuses == ["doing", "todo"]
+
+
+def test_the_answer_is_added_to_the_handoff_not_written_over_it(mod):
+    _active(mod)
+    mod._task_add("gate-axe", "A", "a done", now=T0)
+    mod._task_update("gate-axe", "t1", status="doing", handoff="batch A green; rerun B with --only states", now=T0)
+    ask_id = _ask(mod)
+    mod._task_update("gate-axe", "t1", status="waiting", blocked_on=f"ask:{ask_id}", now=T0)
+    mod._ask_resolve(ask_id, "use axe 4.12", now=T0)
+    handoff = _store(mod)[0]["tasks"][0]["handoff"]
+    assert handoff.startswith("batch A green; rerun B with --only states | ")
+    assert handoff.endswith("use axe 4.12")
+
+
+def test_a_long_handoff_is_trimmed_from_the_front_not_the_answer(mod):
+    note = "ask [beef] answered: the answer"
+    out = mod._rm_handoff_append("x" * 1000, note)
+    assert len(out) <= mod.ROADMAP_HANDOFF_MAX and out.endswith(note) and out.startswith("…")
+
+
 def test_a_waiting_initiative_is_skipped_until_its_ask_closes(mod):
     _active(mod, "first", priority=0)
     _active(mod, "second", priority=1)
