@@ -49,7 +49,7 @@ class _FakeDict:
 
 
 @pytest.fixture()
-def mod(monkeypatch):
+def mod(monkeypatch, tmp_path):
     STORE.clear()
     monkeypatch.setattr(
         modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _FakeDict(name))
@@ -57,7 +57,30 @@ def mod(monkeypatch):
     sys.modules.pop("main", None)
     import main
 
+    root = tmp_path.as_posix()
+    monkeypatch.setattr(main, "VOLUME_PATH", root)
+    monkeypatch.setattr(main, "ROADMAP_PATH", f"{root}/memory/roadmap.json")
+    monkeypatch.setattr(main, "ACTIONS_DIR", f"{root}/actions")
+    monkeypatch.setattr(main, "ACTIONS_ARCHIVE_DIR", f"{root}/actions/archive")
+
+    class _Volume:
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(main, "volume", _Volume())
     return main
+
+
+def _roadmap(mod):
+    """gate-axe with t1 done and t2 open; post-meta with no tasks."""
+    mod._initiative_create("gate-axe", "Replace what axe covers", "o", "full green run on axe", status="active")
+    mod._task_add("gate-axe", "Prove axe works", "planted defects named")
+    mod._task_add("gate-axe", "Build axe_stage.py", "fails on planted defect")
+    run = f"{mod.VOLUME_PATH}/run.txt"
+    open(run, "w").close()
+    mod._task_update("gate-axe", "t1", status="doing")
+    mod._task_update("gate-axe", "t1", status="done", deliverables=[run], handoff="t2 next")
+    mod._initiative_create("post-meta", "Posts share as themselves", "o", "each post previews itself")
 
 
 def _report(mod, key=None, **kw):
@@ -75,10 +98,50 @@ def test_report_requires_doing_and_why(mod):
     assert "report" not in STORE[key]
 
 
-def test_report_rejects_a_path_as_project(mod):
+def test_worked_on_is_checked_against_the_roadmap(mod):
+    # A free-text project could silently name nothing; now an unknown id is
+    # refused with the valid ones, so the agent corrects it in the same turn.
     mod._status_turn_start("running-hourly")
-    assert not _report(mod, project="../state")["ok"]
-    assert _report(mod, project="gateway-ui-craft.md")["report"]["project"] == "gateway-ui-craft"
+    _roadmap(mod)
+    res = _report(mod, worked_on=["gate_axe"])
+    assert not res["ok"] and "no initiative 'gate_axe'" in res["error"] and "gate-axe" in res["error"]
+    res = _report(mod, worked_on=["gate-axe/t9"])
+    assert not res["ok"] and "t1, t2" in res["error"]
+    assert not _report(mod, worked_on=["../state"])["ok"]
+    res = _report(mod, worked_on=["gate-axe/t2", "post-meta", "gate-axe/t2", "gate-axe.md"])
+    assert res["report"]["worked_on"] == ["gate-axe/t2", "post-meta", "gate-axe"]
+
+
+def test_a_turn_that_wasnt_roadmap_work_reports_with_no_ids(mod):
+    key = mod._status_turn_start("running-hourly")
+    assert _report(mod, doing="wrote the daily post")["ok"]
+    assert STORE[key]["report"]["worked_on"] == []
+
+
+def test_progress_is_filled_in_from_the_roadmap_not_typed(mod):
+    _roadmap(mod)
+    rep = mod._report_with_progress({"doing": "built it", "worked_on": ["gate-axe/t2", "post-meta"]},
+                                    mod._roadmap_load())
+    # The flat fields the /control page renders, from the first initiative.
+    assert rep["project"] == "gate-axe" and rep["done_when"] == "full green run on axe"
+    assert rep["done"] == ["Prove axe works"] and rep["left"] == ["Build axe_stage.py"]
+    d = rep["worked_on_detail"]
+    assert d[0]["task"] == {"id": "t2", "title": "Build axe_stage.py", "status": "todo"}
+    assert d[0]["tasks_done"] == 1 and d[0]["tasks_open"] == 1
+    assert d[1]["initiative"] == "post-meta" and "task" not in d[1]
+
+
+def test_an_id_gone_from_the_roadmap_shows_as_missing(mod):
+    rep = mod._report_with_progress({"doing": "x", "worked_on": ["gone/t1"]}, [])
+    assert rep["worked_on_detail"] == [{"ref": "gone/t1", "initiative": "gone", "missing": True}]
+    assert rep["project"] == "" and rep["done"] == [] and rep["left"] == []
+
+
+def test_an_old_report_keeps_the_fields_it_typed(mod):
+    _roadmap(mod)
+    old = {"doing": "x", "project": "gateway-ui-craft", "done": ["a"], "left": ["b"], "done_when": "w"}
+    rep = mod._report_with_progress(old, mod._roadmap_load())
+    assert rep["project"] == "gateway-ui-craft" and rep["done"] == ["a"] and rep["done_when"] == "w"
 
 
 def test_report_needs_a_running_turn(mod):
@@ -109,20 +172,15 @@ def test_overlapping_turns_each_keep_their_own_report(mod, monkeypatch):
 
 def test_report_lands_on_the_running_turn_and_survives_turn_end(mod):
     key = mod._status_turn_start("running-hourly")
-    res = _report(
-        mod,
-        project="gateway-ui-craft",
-        done_when="gutter live and the full check green at four widths",
-        done=["gutter live", "  widths   added "],
-        left=["fix line_measure", "full check", ""],
-        next_step="full check",
-    )
+    _roadmap(mod)
+    res = _report(mod, worked_on=["gate-axe/t2"], next_step="  swap   structure-control ")
     assert res["ok"]
     mod._status_turn_end(key, "done", "hourly turn finished")
     rep = STORE[key]["report"]
     assert STORE[key]["ended"] is not None
-    assert rep["done"] == ["gutter live", "widths added"]
-    assert rep["left"] == ["fix line_measure", "full check"]
+    assert rep["worked_on"] == ["gate-axe/t2"] and rep["next"] == "swap structure-control"
+    # Only what the agent wrote is stored; progress is read from the roadmap.
+    assert not {"project", "done", "left", "done_when"} & set(rep)
     # Private: the public status API serves `history` and `current`, never the report.
     assert all("report" not in h for h in STORE["history"])
     assert "report" not in STORE["current"]
@@ -130,9 +188,8 @@ def test_report_lands_on_the_running_turn_and_survives_turn_end(mod):
 
 def test_report_caps_long_fields(mod):
     mod._status_turn_start("running-hourly")
-    rep = _report(mod, doing="d" * 5000, done=[str(i) for i in range(50)])["report"]
-    assert len(rep["doing"]) == mod.REPORT_TEXT_MAX
-    assert len(rep["done"]) == mod.REPORT_LIST_MAX
+    rep = _report(mod, doing="d" * 5000, next_step="n" * 5000)["report"]
+    assert len(rep["doing"]) == mod.REPORT_TEXT_MAX and len(rep["next"]) == mod.REPORT_TEXT_MAX
 
 
 def _turn(started, report=None, ended="x"):

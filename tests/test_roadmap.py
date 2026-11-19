@@ -6,14 +6,14 @@ network, no Modal.
 Why: ROADMAP.md had grown to ~1,100 lines where an initiative's status was a
 word in a heading, every cycle started by reading it, and /control could only
 serve it raw. These tests pin what the store adds: status moves are checked
-(nothing adopts itself without Rinkesh's words), every initiative links to a
-doc that exists and follows it into the archive, one task is in progress at a
-time with a handoff the next cycle reads, waiting on an ask resumes by itself
-when the ask closes, and the cycle cap is enforced in code.
+(nothing closed reopens, nothing waits on nothing), every initiative links to
+a doc that exists and follows it into the archive, and one task is in
+progress at a time with a handoff the next cycle reads. Statuses are the
+agent's own to manage: closing an ask changes nothing on the roadmap.
 """
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -72,7 +72,7 @@ def _new(mod, iid="gate-axe", **kw):
 
 
 def _active(mod, iid="gate-axe", **kw):
-    res = _new(mod, iid, status="active", approval='"Try axe-core"', **kw)
+    res = _new(mod, iid, status="active", **kw)
     assert res["ok"], res
     return res["initiative"]
 
@@ -119,15 +119,6 @@ def test_create_rejects_bad_ids_missing_fields_and_duplicates(mod):
     assert "already exists" in _new(mod)["error"]
 
 
-def test_nothing_goes_active_without_his_words(mod):
-    assert "approval" in _new(mod, status="active")["error"]
-    assert _new(mod)["ok"]
-    res = mod._initiative_update("gate-axe", status="active", now=T0)
-    assert not res["ok"] and "approval" in res["error"]
-    res = mod._initiative_update("gate-axe", status="active", approval='"yes, do it"', now=T0)
-    assert res["ok"] and res["initiative"]["approval"] == '"yes, do it"'
-
-
 def test_status_moves_are_checked(mod):
     _new(mod)
     res = mod._initiative_update("gate-axe", status="done", outcome="x", now=T0)
@@ -140,7 +131,7 @@ def test_blocked_needs_a_reason_and_closing_needs_an_outcome(mod):
     assert "reason" in mod._initiative_update("gate-axe", status="blocked", now=T0)["error"]
     assert "outcome" in mod._initiative_update("gate-axe", status="done", now=T0)["error"]
     res = mod._initiative_update("gate-axe", status="blocked", reason="Netlify down", now=T0)
-    assert res["initiative"]["blocked_reason"] == {"code": "manual", "message": "Netlify down"}
+    assert res["initiative"]["blocked_reason"] == "Netlify down"
 
 
 def test_closing_moves_the_doc_to_the_archive_and_keeps_the_link(mod):
@@ -190,7 +181,7 @@ def test_one_task_doing_at_a_time_and_only_on_an_active_initiative(mod):
     mod._task_add("gate-axe", "A", "a done", now=T0)
     mod._task_add("gate-axe", "B", "b done", now=T0)
     assert "active" in mod._task_update("gate-axe", "t1", status="doing", now=T0)["error"]
-    mod._initiative_update("gate-axe", status="active", approval="yes", now=T0)
+    mod._initiative_update("gate-axe", status="active", now=T0)
     assert mod._task_update("gate-axe", "t1", status="doing", now=T0)["ok"]
     res = mod._task_update("gate-axe", "t2", status="doing", now=T0)
     assert not res["ok"] and "t1 is already doing" in res["error"]
@@ -217,121 +208,53 @@ def test_handoff_is_kept_between_cycles(mod):
     assert "Handoff from last cycle: rerun batch B with --only states" in ctx
 
 
-# --- asks and the cycle cap ------------------------------------------------------
+# --- waiting, and the agent's own control of status -------------------------------
 
-def test_waiting_must_name_an_open_ask(mod):
+def test_the_agent_adopts_and_starts_initiatives_itself(mod):
+    # No approval field: the go-ahead rule lives in the prompt, not in code.
+    assert _new(mod)["ok"]
+    res = mod._initiative_update("gate-axe", status="active", now=T0)
+    assert res["ok"] and "approval" not in res["initiative"]
+    assert _new(mod, "post-meta", status="active")["ok"]
+
+
+def test_waiting_says_what_on_in_free_text(mod):
     _active(mod)
-    res = mod._initiative_update("gate-axe", status="waiting", blocked_on="ask:beef", now=T0)
-    assert not res["ok"] and "no open ask" in res["error"]
     assert "blocked_on" in mod._initiative_update("gate-axe", status="waiting", now=T0)["error"]
+    res = mod._initiative_update("gate-axe", status="waiting", blocked_on="ask 3f2a", now=T0)
+    assert res["ok"] and res["initiative"]["blocked_on"] == "ask 3f2a"
+    mod._task_add("gate-axe", "A", "a done", now=T0)
 
 
-def test_resolving_the_ask_puts_waiters_back_to_work(mod):
+def test_closing_an_ask_changes_nothing_on_the_roadmap(mod):
     _active(mod)
     mod._task_add("gate-axe", "A", "a done", now=T0)
-    mod._task_update("gate-axe", "t1", status="doing", now=T0)
+    mod._task_update("gate-axe", "t1", status="doing", handoff="keep this", now=T0)
     ask_id = _ask(mod)
-    assert mod._task_update("gate-axe", "t1", status="waiting", blocked_on=f"ask:{ask_id}", now=T0)["ok"]
-    res = mod._ask_resolve(ask_id, "he said go with B", now=T0)
-    assert res["resumed"] == ["gate-axe/t1"]
-    t = _store(mod)[0]["tasks"][0]
-    assert t["status"] == "doing" and t["blocked_on"] == ""
-    assert "he said go with B" in t["handoff"]
+    mod._task_update("gate-axe", "t1", status="waiting", blocked_on=f"ask {ask_id}", now=T0)
+    before = _store(mod)
+    res = mod._ask_resolve(ask_id, "use 4.12", now=T0)
+    assert res == {"ok": True, "id": ask_id, "status": "answered"}
+    assert _store(mod) == before
+    # The agent moves it on itself.
+    assert mod._task_update("gate-axe", "t1", status="doing", handoff="he said 4.12", now=T0)["ok"]
 
 
-def test_an_answered_ask_doesnt_make_a_second_doing_task(mod):
-    # The prompt tells the agent to move on while a task waits; if it did,
-    # the answer must not bring the old task back as a second "doing".
-    _active(mod)
-    mod._task_add("gate-axe", "A", "a done", now=T0)
-    mod._task_add("gate-axe", "B", "b done", now=T0)
-    mod._task_update("gate-axe", "t1", status="doing", now=T0)
-    ask_id = _ask(mod)
-    mod._task_update("gate-axe", "t1", status="waiting", blocked_on=f"ask:{ask_id}", now=T0)
-    assert mod._task_update("gate-axe", "t2", status="doing", now=T0)["ok"]
-    res = mod._ask_resolve(ask_id, "go with B", now=T0)
-    assert res["resumed"] == ["gate-axe/t1 (queued: another task is doing)"]
-    tasks = {t["id"]: t for t in _store(mod)[0]["tasks"]}
-    assert tasks["t1"]["status"] == "todo" and tasks["t2"]["status"] == "doing"
-    # ...so a cycle is counted for the one task actually in progress.
-    mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0)
-    tasks = {t["id"]: t for t in _store(mod)[0]["tasks"]}
-    assert tasks["t1"]["cycles"] == 0 and tasks["t2"]["cycles"] == 1
-
-
-def test_two_tasks_waiting_on_one_ask_resume_one_at_a_time(mod):
-    _active(mod)
-    for name in ("A", "B"):
-        mod._task_add("gate-axe", name, f"{name} done", now=T0)
-    ask_id = _ask(mod)
-    for tid in ("t1", "t2"):
-        mod._task_update("gate-axe", tid, status="doing", now=T0)
-        mod._task_update("gate-axe", tid, status="waiting", blocked_on=f"ask:{ask_id}", now=T0)
-    mod._ask_resolve(ask_id, "yes", now=T0)
-    statuses = [t["status"] for t in _store(mod)[0]["tasks"]]
-    assert statuses == ["doing", "todo"]
-
-
-def test_the_answer_is_added_to_the_handoff_not_written_over_it(mod):
-    _active(mod)
-    mod._task_add("gate-axe", "A", "a done", now=T0)
-    mod._task_update("gate-axe", "t1", status="doing", handoff="batch A green; rerun B with --only states", now=T0)
-    ask_id = _ask(mod)
-    mod._task_update("gate-axe", "t1", status="waiting", blocked_on=f"ask:{ask_id}", now=T0)
-    mod._ask_resolve(ask_id, "use axe 4.12", now=T0)
-    handoff = _store(mod)[0]["tasks"][0]["handoff"]
-    assert handoff.startswith("batch A green; rerun B with --only states | ")
-    assert handoff.endswith("use axe 4.12")
-
-
-def test_a_long_handoff_is_trimmed_from_the_front_not_the_answer(mod):
-    note = "ask [beef] answered: the answer"
-    out = mod._rm_handoff_append("x" * 1000, note)
-    assert len(out) <= mod.ROADMAP_HANDOFF_MAX and out.endswith(note) and out.startswith("…")
-
-
-def test_a_waiting_initiative_is_skipped_until_its_ask_closes(mod):
+def test_a_waiting_initiative_is_skipped_until_the_agent_resumes_it(mod):
     _active(mod, "first", priority=0)
     _active(mod, "second", priority=1)
-    ask_id = _ask(mod)
-    mod._initiative_update("first", status="waiting", blocked_on=f"ask:{ask_id}", now=T0)
+    mod._initiative_update("first", status="waiting", blocked_on="ask 3f2a", now=T0)
     ctx = mod._roadmap_context(now=T0)
-    assert "FOCUS — second" in ctx and f"first [waiting]" in ctx
-    mod._ask_resolve(ask_id, "yes", now=T0)
+    assert "FOCUS — second" in ctx and "first [waiting]" in ctx and "waiting on ask 3f2a" in ctx
+    assert "move it on yourself" in ctx
+    mod._initiative_update("first", status="active", now=T0)
     assert "FOCUS — first" in mod._roadmap_context(now=T0)
 
 
-def test_a_cycle_counts_once_per_turn(mod):
-    _active(mod)
-    mod._task_add("gate-axe", "A", "a done", now=T0)
-    mod._task_update("gate-axe", "t1", status="doing", now=T0)
-    assert "cycle 1/48" in mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0)
-    assert mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0) == ""
-    mod._roadmap_count_cycle("gate-axe", "turn:2", now=T0)
-    it = _store(mod)[0]
-    assert it["cycles_used"] == 2 and it["tasks"][0]["cycles"] == 2
-
-
-def test_the_cap_blocks_in_code_and_only_his_words_lift_it(mod):
-    _active(mod, max_cycles=2)
-    mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0)
-    note = mod._roadmap_count_cycle("gate-axe", "turn:2", now=T0)
-    assert "round-limit" in note
-    it = _store(mod)[0]
-    assert it["status"] == "blocked" and it["blocked_reason"]["code"] == "round-limit"
-    # Blocked initiatives don't count further cycles.
-    assert mod._roadmap_count_cycle("gate-axe", "turn:3", now=T0) == ""
-    assert not mod._initiative_update("gate-axe", status="active", approval="go on", now=T0)["ok"]
-    assert not mod._initiative_update("gate-axe", status="active", max_cycles=6, now=T0)["ok"]
-    res = mod._initiative_update("gate-axe", status="active", max_cycles=6, approval="6 more", now=T0)
-    assert res["ok"] and res["initiative"]["max_cycles"] == 6
-
-
-def test_raising_your_own_cap_needs_his_words(mod):
-    _active(mod)
-    assert "approval" in mod._initiative_update("gate-axe", max_cycles=60, now=T0)["error"]
-    assert mod._initiative_update("gate-axe", max_cycles=5, now=T0)["ok"]  # lowering is fine
-
+def test_no_cap_and_no_cycle_counting(mod):
+    it = _active(mod)
+    assert not {"max_cycles", "cycles_used"} & set(it)
+    assert not hasattr(mod, "_roadmap_count_cycle")
 
 # --- the per-turn note and a broken store ----------------------------------------
 
@@ -345,10 +268,11 @@ def test_focus_shows_objective_task_queue_and_cycle(mod):
     mod._task_add("gate-axe", "Build axe_stage.py", "fails on planted defect", now=T0)
     mod._task_add("gate-axe", "Swap structure-control", "green run", now=T0)
     ctx = mod._roadmap_context(now=T0)
-    assert "FOCUS — gate-axe" in ctx and "cycle 1/48" in ctx
+    focus_line = next(line for line in ctx.splitlines() if line.startswith("FOCUS"))
+    assert "gate-axe" in focus_line and "cycle" not in focus_line
     assert "Current task: t1 [todo] Build axe_stage.py" in ctx
     assert "t2 [todo] Swap structure-control" in ctx
-    assert "post-meta [proposed]" in ctx and "light research only" in ctx
+    assert "post-meta [proposed]" in ctx and "not yet approved" in ctx
 
 
 def test_a_broken_store_changes_nothing_and_the_note_fails_open(mod):

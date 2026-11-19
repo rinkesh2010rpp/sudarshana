@@ -33,6 +33,9 @@ class _FakeDict:
     def put(self, key, value):
         pass
 
+    def items(self):
+        return []
+
 
 class _Resp:
     status_code = 200
@@ -78,8 +81,8 @@ def env(monkeypatch, tmp_path):
 
 def test_roadmap_comes_as_records_in_order_with_the_focus(env):
     main, client = env
-    main._initiative_create("later", "Later", "o", "d", status="active", approval="yes", priority=2, now=T0)
-    main._initiative_create("first", "First", "o", "d", status="active", approval="yes", priority=1, now=T0)
+    main._initiative_create("later", "Later", "o", "d", status="active", priority=2, now=T0)
+    main._initiative_create("first", "First", "o", "d", status="active", priority=1, now=T0)
     main._task_add("first", "A", "a done", now=T0)
     body = client.get("/api/control/roadmap", headers=AUTH).json()
     assert body["error"] is None
@@ -131,3 +134,17 @@ def test_a_broken_store_is_an_error_not_an_empty_roadmap(env):
 def test_needs_the_owner(env):
     _, client = env
     assert client.get("/api/control/roadmap").status_code == 401
+
+
+def test_overview_report_gets_its_progress_from_the_roadmap(env, monkeypatch):
+    main, client = env
+    main._initiative_create("gate-axe", "Replace what axe covers", "o", "full green run", status="active", now=T0)
+    main._task_add("gate-axe", "Build axe_stage.py", "fails on planted defect", now=T0)
+    stored = {"doing": "built it", "why": "he asked", "worked_on": ["gate-axe/t1"], "next": "swap",
+              "run": {"kind": "hourly"}, "fresh": True, "missed_runs": 0}
+    monkeypatch.setattr(main, "_report_latest", lambda recs: dict(stored))
+    rep = client.get("/api/control/overview", headers=AUTH).json()["report"]
+    assert rep["project"] == "gate-axe" and rep["done_when"] == "full green run"
+    assert rep["left"] == ["Build axe_stage.py"] and rep["done"] == []
+    assert rep["worked_on_detail"][0]["task"]["title"] == "Build axe_stage.py"
+    assert rep["roadmap_error"] is None
