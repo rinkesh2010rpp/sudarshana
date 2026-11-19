@@ -1258,7 +1258,9 @@ TASK_MOVES = {
     "dropped": set(),
 }
 # Cycles an initiative may take before it stops and goes back to Rinkesh.
-ROADMAP_DEFAULT_MAX_CYCLES = 12
+# 48 is about two days of hourly wake-ups (a cycle is a turn that worked
+# on it, not a clock: days spent waiting on an ask don't use any).
+ROADMAP_DEFAULT_MAX_CYCLES = 48
 ROADMAP_MAX_CYCLES_CAP = 100
 ROADMAP_TEXT_MAX = 400
 ROADMAP_HANDOFF_MAX = 600
@@ -2407,7 +2409,7 @@ class Sudarshana:
             active right away (he asked for it), pass status='active' and
             approval= his own words. priority= lower runs first (0 default).
             max_cycles= cycles before it stops and comes back to him (default
-            12). links= extra /data paths or URLs. Creates the doc
+            48, about two days of hourly cycles). links= extra /data paths or URLs. Creates the doc
             /data/actions/<id>.md if it doesn't exist; write your notes there.
             Add its tasks with add_task."""
             res = _initiative_create(id, title, objective, done_when, asked_by=asked_by,

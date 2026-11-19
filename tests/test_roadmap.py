@@ -305,7 +305,7 @@ def test_a_cycle_counts_once_per_turn(mod):
     _active(mod)
     mod._task_add("gate-axe", "A", "a done", now=T0)
     mod._task_update("gate-axe", "t1", status="doing", now=T0)
-    assert "cycle 1/12" in mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0)
+    assert "cycle 1/48" in mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0)
     assert mod._roadmap_count_cycle("gate-axe", "turn:1", now=T0) == ""
     mod._roadmap_count_cycle("gate-axe", "turn:2", now=T0)
     it = _store(mod)[0]
@@ -329,7 +329,7 @@ def test_the_cap_blocks_in_code_and_only_his_words_lift_it(mod):
 
 def test_raising_your_own_cap_needs_his_words(mod):
     _active(mod)
-    assert "approval" in mod._initiative_update("gate-axe", max_cycles=40, now=T0)["error"]
+    assert "approval" in mod._initiative_update("gate-axe", max_cycles=60, now=T0)["error"]
     assert mod._initiative_update("gate-axe", max_cycles=5, now=T0)["ok"]  # lowering is fine
 
 
@@ -345,7 +345,7 @@ def test_focus_shows_objective_task_queue_and_cycle(mod):
     mod._task_add("gate-axe", "Build axe_stage.py", "fails on planted defect", now=T0)
     mod._task_add("gate-axe", "Swap structure-control", "green run", now=T0)
     ctx = mod._roadmap_context(now=T0)
-    assert "FOCUS — gate-axe" in ctx and "cycle 1/12" in ctx
+    assert "FOCUS — gate-axe" in ctx and "cycle 1/48" in ctx
     assert "Current task: t1 [todo] Build axe_stage.py" in ctx
     assert "t2 [todo] Swap structure-control" in ctx
     assert "post-meta [proposed]" in ctx and "light research only" in ctx
