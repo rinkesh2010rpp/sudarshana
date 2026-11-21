@@ -60,7 +60,8 @@ def mod(monkeypatch):
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "4242")
     main.spawned = spawned
     main.spawner = spawner
-    main.webhook = main.telegram_webhook.get_raw_f()
+    # .local runs the undecorated function; get_raw_f() is gone in modal 1.6.
+    main.webhook = main.telegram_webhook.local
     return main
 
 

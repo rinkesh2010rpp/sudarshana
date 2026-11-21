@@ -75,7 +75,8 @@ def env(monkeypatch, tmp_path):
             pass
 
     monkeypatch.setattr(main, "volume", _Volume())
-    app = main.control_api.get_raw_f()()
+    # .local() runs the undecorated function; get_raw_f() is gone in modal 1.6.
+    app = main.control_api.local()
     return main, TestClient(app)
 
 

@@ -12,6 +12,7 @@ turn-end write, and is flagged as out of date when later runs finish
 without one.
 """
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -154,8 +155,13 @@ def test_overlapping_turns_each_keep_their_own_report(mod, monkeypatch):
     # A redeploy: the old container's turn is still running when the new one
     # starts, so `current` names the later turn. Each report must still land
     # on the turn that wrote it, and neither turn may show as missed.
-    times = iter(["2026-11-17T21:00:00+00:00", "2026-11-17T21:00:30+00:00"])
-    monkeypatch.setattr(mod, "_status_ts", lambda: next(times, "2026-11-17T21:05:00+00:00"))
+    # Relative to now, not fixed dates: turn-end prunes records older than
+    # STATUS_RECORDS_TTL_SECONDS, so fixed dates turned this test red once
+    # they were 36 hours old (it pruned its own records mid-test).
+    base = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=10)
+    stamps = [(base + timedelta(seconds=s)).isoformat() for s in (0, 30, 300)]
+    times = iter(stamps[:2])
+    monkeypatch.setattr(mod, "_status_ts", lambda: next(times, stamps[2]))
     early = mod._status_turn_start("running-hourly")
     late = mod._status_turn_start("running-telegram")
     assert STORE["current"]["_turn_key"] == late
