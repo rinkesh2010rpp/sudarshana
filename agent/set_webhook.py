@@ -19,10 +19,23 @@ if len(sys.argv) != 2:
 
 url = sys.argv[1]
 token = os.environ["TELEGRAM_BOT_TOKEN"]
+secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+
+body = {"url": url}
+if secret:
+    # Telegram stamps this value into the X-Telegram-Bot-Api-Secret-Token header
+    # on every genuine delivery; the webhook rejects anything that doesn't match.
+    body["secret_token"] = secret
+else:
+    print(
+        "WARNING: TELEGRAM_WEBHOOK_SECRET is unset. The webhook will refuse every "
+        "update (503) until you set it here and re-run this script. Set a random "
+        "value in .env first."
+    )
 
 resp = requests.post(
     f"https://api.telegram.org/bot{token}/setWebhook",
-    json={"url": url},
+    json=body,
     timeout=10,
 )
 print(resp.status_code, resp.json())

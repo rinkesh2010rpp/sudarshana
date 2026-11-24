@@ -2551,6 +2551,9 @@ def _telegram_record(update_id: int, role: str) -> None:
         print(f"[telegram] claim write failed (role={role}): {e!r} — continuing")
 
 
+from fastapi import Header
+
+
 @app.function(
     image=image,
     secrets=[modal.Secret.from_dotenv()],
@@ -2561,8 +2564,20 @@ def _telegram_record(update_id: int, role: str) -> None:
     max_containers=4,
 )
 @modal.fastapi_endpoint(method="POST", label=TELEGRAM_WEBHOOK_LABEL)
-def telegram_webhook(payload: dict):
+def telegram_webhook(
+    payload: dict,
+    x_telegram_bot_api_secret_token: str = Header(default=""),
+):
     """Ack Telegram fast, then spawn the turn. Never runs the model itself.
+
+    Authenticity: the endpoint URL and the owner's numeric id are both
+    discoverable (the URL is derivable from the workspace + label, the id is not
+    secret), so the id check alone lets anyone who knows them POST a forged
+    update that spawns a real turn against the agent's shell. Telegram stamps
+    every genuine delivery with a shared secret in the
+    X-Telegram-Bot-Api-Secret-Token header (registered via set_webhook.py); we
+    reject anything whose header does not match *before* reading the body. See
+    TELEGRAM_WEBHOOK_SECRET in .env.example.
 
     Error policy: a payload problem is answered 200 (a retry cannot help, and a
     failing status makes Telegram retry the same update forever); anything that
@@ -2571,6 +2586,25 @@ def telegram_webhook(payload: dict):
     failures are answered 200 because by then the update has been accepted and
     the turn is already queued; there is nothing left to retry.
     """
+    import hmac
+
+    expected_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    if not expected_secret:
+        # Misconfiguration, not a bad update. Answer 5xx on purpose so Telegram
+        # queues and retries rather than every message being dropped while the
+        # secret is unset. Set it and re-run set_webhook.py; the queue drains.
+        print("[telegram] TELEGRAM_WEBHOOK_SECRET is unset — refusing the update")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=503, content={"ok": False, "error": "misconfigured"})
+
+    if not hmac.compare_digest(x_telegram_bot_api_secret_token or "", expected_secret):
+        # Not from our Telegram webhook (or a stale secret). Drop it silently
+        # with a 200: a prober learns nothing, and Telegram does not retry a
+        # genuinely-wrong secret forever. This is the check that stops forgeries.
+        print("[telegram] secret-token mismatch — dropped")
+        return {"ok": True}
+
     message = (payload or {}).get("message") or {}
     text = message.get("text")
     if not text:
@@ -2587,9 +2621,12 @@ def telegram_webhook(payload: dict):
 
         return JSONResponse(status_code=503, content={"ok": False, "error": "misconfigured"})
 
-    sender_id = str((message.get("from") or {}).get("id", ""))
+    # isinstance guard: a forged (or malformed) payload can send `from` as a
+    # non-object; `{}.get` on an int raised and returned 500 before this.
+    sender = message.get("from")
+    sender_id = str(sender.get("id", "")) if isinstance(sender, dict) else ""
     if sender_id != allowed_user_id:
-        # Silently drop — the bot is reachable by anyone who finds it.
+        # Silently drop — defence in depth behind the secret check above.
         return {"ok": True}
 
     update_id = (payload or {}).get("update_id")
