@@ -134,10 +134,13 @@ python agent/set_webhook.py https://<workspace>--sudarshana-sudarshana-telegram-
 ```
 
 `set_webhook.py` registers `TELEGRAM_WEBHOOK_SECRET` with Telegram as the
-webhook's `secret_token`. **Register the secret before deploying the webhook
-code that checks it** — otherwise the webhook answers every update `503` until
-the registered secret and the deployed one match. After changing the secret in
-`.env`, re-run `set_webhook.py`, then redeploy.
+webhook's `secret_token`. **Register the secret (step above) before deploying
+the code that checks it.** Two failure modes if the order slips: with the secret
+*unset* in the deployed env, the webhook answers every update `503` and Telegram
+queues them; with the secret *set* but not yet registered, Telegram sends the
+wrong token and genuine updates are dropped silently (`200`) rather than queued.
+So after changing the secret in `.env`, re-run `set_webhook.py` first, then
+redeploy, and send yourself a message to confirm delivery.
 
 `modal serve agent/main.py` runs a temporary copy with its own URL.
 
