@@ -45,7 +45,10 @@ Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ─
   agent's final message to Telegram and prints the full trace to the Modal logs.
 - **Only `TELEGRAM_ALLOWED_USER_ID` can talk to it.** Messages from anyone else
   are dropped without a reply. `/agents …` commands are handled inside
-  `process_message` and never reach the model.
+  `process_message` and never reach the model. The id check is defence in depth
+  behind `TELEGRAM_WEBHOOK_SECRET`: the webhook first rejects any request that
+  doesn't carry Telegram's secret-token header, so a forged update (the URL and
+  the id are both discoverable) never reaches the id check or the model.
 - **What the cycles do is set by prompt, not code:** `SYSTEM_PROMPT`,
   `SYSTEM_PROMPT` and `HOURLY_TASK` in `main.py`.
 
@@ -103,6 +106,7 @@ code reads these names:
 | Variable | Purpose |
 |---|---|
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_ID` | The bot, and the only user it answers |
+| `TELEGRAM_WEBHOOK_SECRET` | Shared secret proving a webhook request came from Telegram; forgeries are rejected before any work runs |
 | `USE_OPENROUTER`, `OPENROUTER_MODEL`, `OPENROUTER_API_KEY` | The production model. The key is also used by Jev. |
 | `LLM_MODEL`, `LLM_BASE_URL`, `LLM_API_KEY` | The fallback OpenAI-compatible endpoint |
 | `GITHUB_TOKEN` | Git push and `gh` from the agent's shell |
@@ -128,6 +132,12 @@ URL and Telegram needed no re-registration:
 ```bash
 python agent/set_webhook.py https://<workspace>--sudarshana-sudarshana-telegram-webhook.modal.run
 ```
+
+`set_webhook.py` registers `TELEGRAM_WEBHOOK_SECRET` with Telegram as the
+webhook's `secret_token`. **Register the secret before deploying the webhook
+code that checks it** — otherwise the webhook answers every update `503` until
+the registered secret and the deployed one match. After changing the secret in
+`.env`, re-run `set_webhook.py`, then redeploy.
 
 `modal serve agent/main.py` runs a temporary copy with its own URL.
 
