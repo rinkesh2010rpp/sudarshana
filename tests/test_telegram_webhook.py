@@ -19,6 +19,11 @@ import modal  # noqa: E402
 
 STORE = {}
 
+# The secret Telegram would send in the X-Telegram-Bot-Api-Secret-Token header.
+# The webhook wrapper below passes it by default so the sender/dedup cases keep
+# exercising that logic; the gate's own cases override it.
+_SECRET = "test-webhook-secret"
+
 
 class _FakeDict:
     def __init__(self, name):
@@ -58,10 +63,14 @@ def mod(monkeypatch):
 
     monkeypatch.setattr(main, "Sudarshana", _Sudarshana)
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "4242")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", _SECRET)
     main.spawned = spawned
     main.spawner = spawner
     # .local runs the undecorated function; get_raw_f() is gone in modal 1.6.
-    main.webhook = main.telegram_webhook.local
+    # The wrapper passes the matching secret-token header by default so the
+    # sender/dedup cases below reach that logic; pass `secret=` to test the gate.
+    _raw = main.telegram_webhook.local
+    main.webhook = lambda payload, secret=_SECRET: _raw(payload, secret)
     return main
 
 
@@ -90,6 +99,38 @@ def test_a_later_message_still_gets_through(mod):
 
 def test_other_senders_are_dropped_silently(mod):
     assert mod.webhook(_update(20, sender=1)) == {"ok": True}
+    assert mod.spawned == []
+
+
+def test_a_forged_update_without_the_secret_is_dropped(mod):
+    """The hole this gate closes: the URL and the id are both discoverable, so
+    a request that carries the right sender id but no secret must not spawn."""
+    assert mod.webhook(_update(23), secret="") == {"ok": True}
+    assert mod.spawned == []
+
+
+def test_a_wrong_secret_is_dropped(mod):
+    assert mod.webhook(_update(24), secret="not-the-secret") == {"ok": True}
+    assert mod.spawned == []
+
+
+def test_the_right_secret_lets_a_message_through(mod):
+    assert mod.webhook(_update(25), secret=_SECRET) == {"ok": True}
+    assert mod.spawned == [("hello", 25)]
+
+
+def test_unset_webhook_secret_is_a_5xx_not_a_silent_drop(mod, monkeypatch):
+    """A missing secret is misconfiguration: keep the update (Telegram retries),
+    don't run unauthenticated and don't discard the message."""
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
+    response = mod.webhook(_update(26))
+    assert response.status_code == 503
+    assert mod.spawned == []
+
+
+def test_a_non_object_from_does_not_raise(mod):
+    """A forged payload can send `from` as a bare value; it must drop, not 500."""
+    assert mod.webhook({"update_id": 27, "message": {"text": "hi", "from": 4242}}) == {"ok": True}
     assert mod.spawned == []
 
 
