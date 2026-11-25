@@ -295,3 +295,161 @@ def test_vault_survives_reload(tmp_path):
     v = Vault(path)
     reg(v, FakeSite((201, REGISTERED)))
     assert Vault(path).hosts["www.moltbook.com"]["key"] == KEY
+
+
+# --- recovery without a human ------------------------------------------------
+
+UUID = "3f2a9c4e-1b7d-4e8a-9f6b-2c5d8e1a7b30"
+NEW_KEY = "moltbook_sk_NEW9876543210zyxwvuZYXWVU"
+
+
+class AuthSite:
+    """Signup returns a key; other calls succeed only with the valid key."""
+
+    def __init__(self, signup_key=KEY, valid_key=KEY):
+        self.signup_key, self.valid_key = signup_key, valid_key
+        self.signups = 0
+
+    def __call__(self, method, host, port, path, headers, body):
+        if path.endswith("/register"):
+            self.signups += 1
+            return 201, {}, json.dumps({"agent": {"api_key": self.signup_key, "id": UUID}}).encode()
+        ok = headers.get("Authorization") == f"Bearer {self.valid_key}"
+        return (200 if ok else 401), {}, b'{"r": 1}'
+
+
+def test_wrong_field_recovers_by_itself(vault):
+    site = AuthSite()
+    assert reg(vault, site, {**RECIPE, "secret": "agent.id"})["status"] == "ok"
+    out = req(vault, site, url="https://www.moltbook.com/api/v1/x")
+    assert out["http_status"] == 401 and "rejected the key" in out["note"]
+    assert vault.hosts["www.moltbook.com"]["key_rejected"] is True
+
+    out = reg(vault, site, RECIPE)  # corrected path, no replace
+    assert out["status"] == "ok" and site.signups == 1  # site not contacted again
+    no_key_anywhere(out)
+    assert req(vault, site, url="https://www.moltbook.com/api/v1/x")["http_status"] == 200
+    assert "key_rejected" not in vault.hosts["www.moltbook.com"]
+
+
+def test_a_working_key_cannot_be_replaced(vault):
+    site = AuthSite()
+    reg(vault, site)
+    assert req(vault, site, url="https://www.moltbook.com/api/v1/x")["http_status"] == 200
+    assert reg(vault, site, {**RECIPE, "secret": "agent.id"})["status"] == "refused"
+    assert handle({"op": "register", "recipe": RECIPE, "replace": True}, vault,
+                  fetch=site, log=lambda *_: None)["status"] == "refused"
+    assert site.signups == 1 and vault.hosts["www.moltbook.com"]["key"] == KEY
+
+
+def test_swap_to_a_non_key_keeps_the_old_entry(vault):
+    site = AuthSite()
+    reg(vault, site, {**RECIPE, "secret": "agent.id"})
+    req(vault, site, url="https://www.moltbook.com/api/v1/x")  # 401
+    out = reg(vault, site, {**RECIPE, "secret": "agent.nope"})
+    assert out["status"] == "error" and "agent.api_key" in out["fields"]
+    assert vault.hosts["www.moltbook.com"]["key"] == UUID  # unchanged, still rejected
+
+
+def test_revoked_key_is_replaced_with_a_fresh_signup(vault):
+    site = AuthSite()
+    reg(vault, site)
+    site.valid_key = None  # the site revokes the key
+    assert req(vault, site, url="https://www.moltbook.com/api/v1/x")["http_status"] == 401
+    site.signup_key = site.valid_key = NEW_KEY
+    out = handle({"op": "register", "recipe": RECIPE, "replace": True}, vault,
+                 fetch=site, log=lambda *_: None)
+    assert out["status"] == "ok" and site.signups == 2
+    assert NEW_KEY not in json.dumps(out)
+    assert vault.hosts["www.moltbook.com"]["key"] == NEW_KEY
+    assert req(vault, site, url="https://www.moltbook.com/api/v1/x")["http_status"] == 200
+
+
+def test_needs_human_host_can_be_retried_with_replace(vault):
+    reg(vault, FakeSite(TimeoutError("read timed out")))
+    out = reg(vault, FakeSite())
+    assert out["status"] == "needs_human" and "replace: true" in out["hint"]
+    out = handle({"op": "register", "recipe": RECIPE, "replace": True}, vault,
+                 fetch=FakeSite((201, REGISTERED)), log=lambda *_: None)
+    assert out["status"] == "ok" and vault.hosts["www.moltbook.com"]["state"] == "active"
+
+
+def test_replace_must_be_a_real_boolean(vault):
+    # A string "true" is not consent to sign up again, even on a rejected key.
+    site = AuthSite()
+    reg(vault, site)
+    site.valid_key = None
+    req(vault, site, url="https://www.moltbook.com/api/v1/x")  # 401: key rejected
+    out = handle({"op": "register", "recipe": RECIPE, "replace": "true"}, vault,
+                 fetch=site, log=lambda *_: None)
+    assert out["status"] == "error" and site.signups == 1  # treated as a swap, no signup
+
+
+# --- pinned_fetch: what counts as "not sent" (no network) --------------------
+
+
+class FakeConn:
+    """Stands in for urllib3's HTTPSConnection."""
+    fail_connect = None
+    fail_response = None
+    requests = []
+
+    def __init__(self, host, **kw):
+        self.sock = None
+
+    def connect(self):
+        if FakeConn.fail_connect:
+            raise FakeConn.fail_connect
+
+    def request(self, method, path, body=None, headers=None, preload_content=True):
+        FakeConn.requests.append((method, path))
+
+    def getresponse(self):
+        if FakeConn.fail_response:
+            raise FakeConn.fail_response
+        class R:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+            def read(self, amt):
+                return b'{"ok": true}'
+        return R()
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def fake_conn(monkeypatch):
+    import urllib3.connection
+    FakeConn.fail_connect = FakeConn.fail_response = None
+    FakeConn.requests = []
+    monkeypatch.setattr(urllib3.connection, "HTTPSConnection", FakeConn)
+    return FakeConn
+
+
+PUBLIC = fake_resolver("93.184.215.14")
+
+
+def test_handshake_failure_is_not_sent(fake_conn):
+    import urllib3
+    fake_conn.fail_connect = urllib3.exceptions.SSLError("certificate verify failed")
+    with pytest.raises(NotSent):
+        core.pinned_fetch("POST", "www.moltbook.com", 443, "/r", {}, b"{}", resolver=PUBLIC)
+    assert fake_conn.requests == []
+
+
+def test_failure_after_sending_is_uncertain(fake_conn):
+    fake_conn.fail_response = TimeoutError("read timed out")
+    with pytest.raises(TimeoutError):
+        core.pinned_fetch("POST", "www.moltbook.com", 443, "/r", {}, b"{}", resolver=PUBLIC)
+    assert fake_conn.requests == [("POST", "/r")]
+
+
+def test_signup_with_failed_handshake_leaves_the_host_free(vault, fake_conn):
+    import urllib3
+    fake_conn.fail_connect = urllib3.exceptions.SSLError("certificate verify failed")
+    fetch = lambda *a: core.pinned_fetch(*a, resolver=PUBLIC)  # noqa: E731
+    assert reg(vault, fetch)["status"] == "error"
+    assert "www.moltbook.com" not in vault.hosts
+    fake_conn.fail_connect = None
+    assert reg(vault, FakeSite((201, REGISTERED)))["status"] == "ok"

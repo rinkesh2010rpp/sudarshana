@@ -134,34 +134,42 @@ def pinned_fetch(method: str, host: str, port: int, path: str,
                  headers: dict[str, str], body: bytes | None,
                  resolver=socket.getaddrinfo) -> tuple[int, dict[str, str], bytes]:
     """One HTTPS request to the checked address, certificate verified against
-    the hostname, no redirects, no retries, size-capped."""
+    the hostname, no redirects, no retries, size-capped.
+
+    The TCP connect and TLS handshake run as their own step. If either fails,
+    not one byte of the request was written, so it raises NotSent and the
+    caller may safely try again. Anything after that is uncertain."""
     import certifi
-    import urllib3
+    from urllib3.connection import HTTPSConnection
 
     ip = resolve_public(host, port, resolver)
-    pool = urllib3.HTTPSConnectionPool(
+    conn = HTTPSConnection(
         ip,
         port=port,
+        timeout=CONNECT_TIMEOUT_S,
         server_hostname=host,
         assert_hostname=host,
         cert_reqs="CERT_REQUIRED",
         ca_certs=certifi.where(),
-        timeout=urllib3.Timeout(connect=CONNECT_TIMEOUT_S, read=READ_TIMEOUT_S),
-        retries=False,
-        maxsize=1,
     )
     try:
-        r = pool.urlopen(
-            method, path, body=body, headers={**headers, "Host": host},
-            redirect=False, preload_content=False,
-        )
+        try:
+            conn.connect()
+        except Exception as e:
+            raise NotSent(f"could not connect ({type(e).__name__}); nothing was sent")
+        if conn.sock is not None:
+            conn.sock.settimeout(READ_TIMEOUT_S)
+        conn.request(method, path, body=body, headers={**headers, "Host": host},
+                     preload_content=False)
+        r = conn.getresponse()
         data = r.read(MAX_RESPONSE_BYTES + 1)
-        r.release_conn()
+        status = r.status
+        rheaders = {k.lower(): v for k, v in r.headers.items()}
     finally:
-        pool.close()
+        conn.close()
     if len(data) > MAX_RESPONSE_BYTES:
         raise ValueError("response too large")
-    return r.status, {k.lower(): v for k, v in r.headers.items()}, data
+    return status, rheaders, data
 
 
 # --- Redaction ---------------------------------------------------------------
@@ -296,15 +304,40 @@ def _headers(extra: dict[str, str] | None = None, json_body: bool = False) -> di
 # --- Operations --------------------------------------------------------------
 
 
+REPLACE_HINT = ("call register again with replace: true to sign up fresh; "
+                "if the earlier signup did go through, this may create a second account")
+
+
 def _needs_human(vault: Vault, host: str, reason: str) -> dict:
     entry = vault.hosts.setdefault(host, {})
     entry["state"] = "needs_human"
     entry["reason"] = reason
     vault.save()
-    return {"status": "needs_human", "reason": reason}
+    return {"status": "needs_human", "reason": reason, "hint": REPLACE_HINT}
 
 
-def register(recipe: Any, vault: Vault, fetch, log) -> dict:
+def _swap_key(host: str, entry: dict, recipe: dict, vault: Vault, log) -> dict:
+    """The site rejected the stored key: take the key at the newly named path
+    in the saved signup response. The site is not contacted."""
+    saved = entry.get("saved_response")
+    value = extract(saved, recipe["secret"]) if saved is not None else None
+    if not looks_like_key(value) or value == entry.get("key"):
+        return {
+            "status": "error",
+            "reason": "no different key at that path in the saved signup response; "
+                      "try another path, or register with replace: true to sign up again",
+            "fields": field_paths(saved) if saved is not None else [],
+        }
+    entry["key"] = value
+    entry["recipe"] = recipe
+    entry.pop("key_rejected", None)
+    vault.save()
+    log(f"[broker] register {host} swapped the key from the saved response")
+    return {"status": "ok",
+            "note": "key replaced from the saved signup response; the site was not contacted"}
+
+
+def register(recipe: Any, vault: Vault, fetch, log, replace: bool = False) -> dict:
     recipe = validate_recipe(recipe)
     host, port, path = parse_target(recipe["signup"]["url"])
     entry = vault.hosts.get(host)
@@ -312,12 +345,18 @@ def register(recipe: Any, vault: Vault, fetch, log) -> dict:
     if entry:
         state = entry.get("state")
         if state == "active":
-            raise Refused("this host already has a key")
-        if state == "needs_human":
-            return {"status": "needs_human", "reason": entry.get("reason", "")}
-        if state == "pending" and "saved_response" not in entry:
+            # A working key is never thrown away. Registering again is allowed
+            # only after the site has rejected the stored key.
+            if not entry.get("key_rejected"):
+                raise Refused("this host already has a working key")
+            if not replace:
+                return _swap_key(host, entry, recipe, vault, log)
+            # replace: fall through to a fresh signup
+        elif state == "needs_human" and not replace:
+            return {"status": "needs_human", "reason": entry.get("reason", ""), "hint": REPLACE_HINT}
+        elif state == "pending" and "saved_response" not in entry and not replace:
             return _needs_human(vault, host, "signup was interrupted; the account may already exist")
-        if state == "pending":
+        elif state == "pending" and not replace:
             # A retry with a corrected secret path: read the saved response,
             # never contact the site again.
             entry["recipe"] = recipe
@@ -366,8 +405,9 @@ def _finish(host: str, entry: dict, vault: Vault, log) -> dict:
     value = extract(saved, entry["recipe"]["secret"])
     if looks_like_key(value):
         # The saved response stays in the vault: if the agent named a wrong
-        # field that merely looks like a key, the real key is still here for a
-        # human to recover. It is never returned or sent anywhere.
+        # field that merely looks like a key, the site will reject it and the
+        # agent can swap in the real key from here. It is never returned or
+        # sent anywhere.
         vault.hosts[host] = {
             "state": "active",
             "key": value,
@@ -421,6 +461,16 @@ def request(payload: dict, vault: Vault, fetch, log) -> dict:
     log(f"[broker] request {method} {host} {path.split('?')[0]} -> {status}")
     out = {"status": "ok", "http_status": status,
            "body": redact(_decode(data), [key], shape=False)}
+    if status in (401, 403):
+        # The site rejected the key: allow register again for this host
+        # (a corrected secret path, or replace: true).
+        if not entry.get("key_rejected"):
+            entry["key_rejected"] = True
+            vault.save()
+        out["note"] = ("the site rejected the key; you can call register again for "
+                       "this host with a corrected secret path, or with replace: true")
+    elif 200 <= status < 300 and entry.pop("key_rejected", None):
+        vault.save()
     if 300 <= status < 400:
         out["note"] = "redirect not followed"
         if "location" in rheaders:
@@ -434,7 +484,8 @@ def handle(payload: Any, vault: Vault, fetch=pinned_fetch, log=print) -> dict:
     try:
         op = payload.get("op")
         if op == "register":
-            return register(payload.get("recipe"), vault, fetch, log)
+            return register(payload.get("recipe"), vault, fetch, log,
+                            replace=payload.get("replace") is True)
         if op == "request":
             return request(payload, vault, fetch, log)
         raise Refused("op must be register or request")
