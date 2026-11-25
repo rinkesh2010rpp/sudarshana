@@ -2245,7 +2245,8 @@ class Sudarshana:
             return f"ok: {res['initiative']}/{t['id']} [{t['status']}]"
 
         roadmap_tools = [roadmap_view, create_initiative, update_initiative, add_task, update_task]
-        search_tools = [*search_tools, *inbox_tools, *ask_tools, *roadmap_tools]
+        broker_tools = [tool(broker_register), tool(broker_request)]
+        search_tools = [*search_tools, *inbox_tools, *ask_tools, *roadmap_tools, *broker_tools]
 
         # Production runs on OpenRouter (USE_OPENROUTER=1, OPENROUTER_MODEL /
         # OPENROUTER_API_KEY). The else branch targets the self-hosted Qwen
@@ -2362,20 +2363,11 @@ class Sudarshana:
             store=_a2a_store(), screen=_a2a_screen, notify=_send_telegram, log=_a2a_log
         )
 
-        from langchain.agents.middleware import AgentMiddleware
-
-        class BrokerTools(AgentMiddleware):
-            # Middleware tools go to the main agent only, not the `task`
-            # subagent, so signing up and acting on outside accounts stays
-            # with the main agent (the same reason A2A is middleware).
-            tools = [tool(broker_register), tool(broker_request)]
-
         main_middleware = [
             memory_middleware,
             *([skills_middleware] if skills_middleware else []),
             TodoListMiddleware(),
             self.a2a,
-            BrokerTools(),
             summarization(),
         ]
         # deepagents doesn't hand custom middleware to its auto-added
