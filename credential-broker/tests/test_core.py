@@ -393,9 +393,11 @@ class FakeConn:
     fail_connect = None
     fail_response = None
     requests = []
+    timeouts = []
 
     def __init__(self, host, **kw):
         self.sock = None
+        self.timeout = kw.get("timeout")
 
     def connect(self):
         if FakeConn.fail_connect:
@@ -403,6 +405,7 @@ class FakeConn:
 
     def request(self, method, path, body=None, headers=None, preload_content=True):
         FakeConn.requests.append((method, path))
+        FakeConn.timeouts.append(self.timeout)
 
     def getresponse(self):
         if FakeConn.fail_response:
@@ -423,6 +426,7 @@ def fake_conn(monkeypatch):
     import urllib3.connection
     FakeConn.fail_connect = FakeConn.fail_response = None
     FakeConn.requests = []
+    FakeConn.timeouts = []
     monkeypatch.setattr(urllib3.connection, "HTTPSConnection", FakeConn)
     return FakeConn
 
@@ -443,6 +447,50 @@ def test_failure_after_sending_is_uncertain(fake_conn):
     with pytest.raises(TimeoutError):
         core.pinned_fetch("POST", "www.moltbook.com", 443, "/r", {}, b"{}", resolver=PUBLIC)
     assert fake_conn.requests == [("POST", "/r")]
+
+
+def test_read_timeout_is_20s_and_paths_are_encoded(fake_conn):
+    core.pinned_fetch("GET", "www.moltbook.com", 443, "/s?q=a b&u=café&x=%41", {}, None,
+                      resolver=PUBLIC)
+    assert fake_conn.requests[-1] == ("GET", "/s?q=a%20b&u=caf%C3%A9&x=%41")
+    assert fake_conn.timeouts[-1] == core.READ_TIMEOUT_S
+
+
+URL = "https://www.moltbook.com/api/v1/x"
+
+
+def test_403_does_not_mark_the_key_rejected(active):
+    req(active, FakeSite((403, {"e": "not your post"})), url=URL, method="DELETE")
+    assert "key_rejected" not in active.hosts["www.moltbook.com"]
+    assert reg(active, FakeSite())["status"] == "refused"
+
+
+@pytest.mark.parametrize("failure", [
+    (409, {"e": "name taken"}),
+    (429, {"e": "slow down"}),
+    (500, {"e": "boom"}),
+    NotSent("host did not resolve"),
+    TimeoutError("result lost"),
+])
+def test_failed_replace_keeps_the_old_key(vault, failure):
+    site = AuthSite()
+    reg(vault, site)
+    site.valid_key = None
+    req(vault, site, url=URL)  # 401: key rejected
+    out = handle({"op": "register", "recipe": RECIPE, "replace": True}, vault,
+                 fetch=FakeSite(failure), log=lambda *_: None)
+    assert out["status"] == "error"
+    entry = vault.hosts["www.moltbook.com"]
+    assert entry["state"] == "active" and entry["key"] == KEY
+    assert entry.get("key_rejected") is True  # can still replace again
+
+
+def test_header_only_fix_swaps_without_signing_up(vault):
+    site = AuthSite()
+    reg(vault, site, {**RECIPE, "attach": {"header": "X-API-Key", "scheme": ""}})
+    assert req(vault, site, url=URL)["http_status"] == 401
+    assert reg(vault, site, RECIPE)["status"] == "ok" and site.signups == 1
+    assert req(vault, site, url=URL)["http_status"] == 200
 
 
 def test_signup_with_failed_handshake_leaves_the_host_free(vault, fake_conn):

@@ -17,7 +17,7 @@ import os
 import re
 import socket
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_BODY_BYTES = 64_000
@@ -108,6 +108,12 @@ def parse_target(url: Any) -> tuple[str, int, str]:
     return host, 443, path
 
 
+def _encode_path(path: str) -> str:
+    """Percent-encode spaces and non-ASCII characters; leave existing %XX and
+    URL punctuation alone (what urllib3's pool used to do for us)."""
+    return quote(path, safe="!#$%&'()*+,/:;=?@[]~")
+
+
 def resolve_public(host: str, port: int, resolver=socket.getaddrinfo) -> str:
     """Resolve and require every address to be public. Returns the one to
     connect to (IPv4 first). The caller connects to exactly this address."""
@@ -157,10 +163,11 @@ def pinned_fetch(method: str, host: str, port: int, path: str,
             conn.connect()
         except Exception as e:
             raise NotSent(f"could not connect ({type(e).__name__}); nothing was sent")
-        if conn.sock is not None:
-            conn.sock.settimeout(READ_TIMEOUT_S)
-        conn.request(method, path, body=body, headers={**headers, "Host": host},
-                     preload_content=False)
+        # urllib3 re-applies conn.timeout to the socket on every call, so the
+        # read timeout has to be set here, not on the socket.
+        conn.timeout = READ_TIMEOUT_S
+        conn.request(method, _encode_path(path), body=body,
+                     headers={**headers, "Host": host}, preload_content=False)
         r = conn.getresponse()
         data = r.read(MAX_RESPONSE_BYTES + 1)
         status = r.status
@@ -316,17 +323,42 @@ def _needs_human(vault: Vault, host: str, reason: str) -> dict:
     return {"status": "needs_human", "reason": reason, "hint": REPLACE_HINT}
 
 
+def _abandon(vault: Vault, host: str, previous: dict | None) -> None:
+    """Undo a pending signup: put back the entry it was replacing, if any."""
+    if previous is not None:
+        vault.hosts[host] = previous
+    else:
+        vault.hosts.pop(host, None)
+    vault.save()
+
+
+def _uncertain(vault: Vault, host: str, previous: dict | None, reason: str) -> dict:
+    """The signup may have arrived. A first signup becomes needs_human; a
+    replacement keeps the old key."""
+    if previous is None:
+        return _needs_human(vault, host, reason)
+    _abandon(vault, host, previous)
+    return {"status": "error", "reason": reason + "; your existing key was kept",
+            "hint": REPLACE_HINT}
+
+
 def _swap_key(host: str, entry: dict, recipe: dict, vault: Vault, log) -> dict:
     """The site rejected the stored key: take the key at the newly named path
     in the saved signup response. The site is not contacted."""
     saved = entry.get("saved_response")
     value = extract(saved, recipe["secret"]) if saved is not None else None
-    if not looks_like_key(value) or value == entry.get("key"):
+    if not looks_like_key(value):
         return {
             "status": "error",
-            "reason": "no different key at that path in the saved signup response; "
+            "reason": "no key at that path in the saved signup response; "
                       "try another path, or register with replace: true to sign up again",
             "fields": field_paths(saved) if saved is not None else [],
+        }
+    if value == entry.get("key") and recipe["attach"] == entry["recipe"]["attach"]:
+        return {
+            "status": "error",
+            "reason": "this changes nothing (same key, same header); correct the "
+                      "path or the header, or register with replace: true",
         }
     entry["key"] = value
     entry["recipe"] = recipe
@@ -366,32 +398,39 @@ def register(recipe: Any, vault: Vault, fetch, log, replace: bool = False) -> di
     # can never lock the host.
     body = _body_bytes(recipe["signup"]["body"])
 
-    vault.hosts[host] = {"state": "pending", "recipe": recipe}
+    # A replacement keeps the old entry until the new signup returns a usable
+    # key; every failure below puts it back untouched.
+    previous = entry if entry and entry.get("state") == "active" else None
+    pending = {"state": "pending", "recipe": recipe}
+    if previous is not None:
+        pending["previous"] = previous
+    vault.hosts[host] = pending
     vault.save()  # pending is on disk before anything is sent
 
     try:
         status, _h, data = fetch(recipe["signup"]["method"], host, port, path,
                                  _headers(json_body=True), body)
     except NotSent as e:
-        del vault.hosts[host]
-        vault.save()
+        _abandon(vault, host, previous)
         return {"status": "error", "reason": str(e)}
     except Exception as e:  # timeout, reset, too large: it may have arrived
         log(f"[broker] register {host} failed: {type(e).__name__}")
-        return _needs_human(vault, host, f"signup failed mid-request ({type(e).__name__}); the account may already exist")
+        return _uncertain(vault, host, previous,
+                          f"signup failed mid-request ({type(e).__name__}); the account may already exist")
 
     log(f"[broker] register {host} {path.split('?')[0]} -> {status}")
     if 400 <= status < 500:
-        del vault.hosts[host]
-        vault.save()
+        _abandon(vault, host, previous)
         return {"status": "error", "http_status": status,
                 "body": redact(_decode(data), [], shape=True)}
     if not 200 <= status < 300:
-        return _needs_human(vault, host, f"signup returned HTTP {status}; the account may already exist")
+        return _uncertain(vault, host, previous,
+                          f"signup returned HTTP {status}; the account may already exist")
     try:
         parsed = json.loads(data)
     except (ValueError, UnicodeDecodeError):
-        return _needs_human(vault, host, "signup response was not JSON; the account may already exist")
+        return _uncertain(vault, host, previous,
+                          "signup response was not JSON; the account may already exist")
 
     entry = vault.hosts[host]
     entry["saved_response"] = parsed
@@ -461,9 +500,10 @@ def request(payload: dict, vault: Vault, fetch, log) -> dict:
     log(f"[broker] request {method} {host} {path.split('?')[0]} -> {status}")
     out = {"status": "ok", "http_status": status,
            "body": redact(_decode(data), [key], shape=False)}
-    if status in (401, 403):
+    if status == 401:
         # The site rejected the key: allow register again for this host
-        # (a corrected secret path, or replace: true).
+        # (a corrected secret path or header, or replace: true). A 403 only
+        # means "not allowed to do this" and says nothing about the key.
         if not entry.get("key_rejected"):
             entry["key_rejected"] = True
             vault.save()

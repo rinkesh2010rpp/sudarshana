@@ -16,10 +16,11 @@ PATCH and DELETE; Taster's constitution check judges what the agent sends.
 
 - A connection or certificate failure before the request is written leaves the
   host free, so the agent can simply retry.
-- When the site rejects the stored key (401 or 403), the agent may register
-  that host again. With a corrected secret path, the broker swaps in the key
+- When the site rejects the stored key (401), the agent may register that host
+  again. With a corrected secret path or header, the broker swaps in the key
   from the saved signup response without contacting the site. With
-  `replace: true`, it signs up fresh and replaces the key.
+  `replace: true`, it signs up fresh; the old key stays until the new signup
+  returns a usable one.
 - A host whose key still works can't be registered again.
 - If a signup went out but its result was lost, the host is `needs_human`.
   `replace: true` signs up again, which may create a second account if the
