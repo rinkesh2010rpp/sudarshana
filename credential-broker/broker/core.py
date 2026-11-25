@@ -25,7 +25,6 @@ CONNECT_TIMEOUT_S = 10
 READ_TIMEOUT_S = 20
 MAX_PATH_TRIES = 3
 REMOVED = "[removed]"
-DEFAULT_METHODS = ["GET"]
 # Some sites (Moltbook among them) answer a bare library user agent with 503.
 USER_AGENT = "Mozilla/5.0 (compatible; credential-broker/0.1)"
 
@@ -373,7 +372,6 @@ def _finish(host: str, entry: dict, vault: Vault, log) -> dict:
             "state": "active",
             "key": value,
             "recipe": entry["recipe"],
-            "allowed_methods": list(DEFAULT_METHODS),
             "saved_response": saved,
             "saved_status": entry.get("saved_status"),
         }
@@ -404,8 +402,6 @@ def request(payload: dict, vault: Vault, fetch, log) -> dict:
         raise Refused("no key for this host")
     if entry.get("state") != "active":
         raise Refused(f"this host is {entry.get('state')}, not ready")
-    if method not in entry.get("allowed_methods", DEFAULT_METHODS):
-        raise Refused(f"{method} is not allowed for this host")
     body = payload.get("body")
     if body is not None and method == "GET":
         raise Refused("GET cannot have a body")

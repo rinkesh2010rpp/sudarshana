@@ -76,7 +76,6 @@ def test_register_stores_key_and_returns_only_safe_fields(vault):
     assert out["body"]["agent"]["verification_code"] == "reef-X4B2"
     entry = vault.hosts["www.moltbook.com"]
     assert entry["state"] == "active" and entry["key"] == KEY
-    assert entry["allowed_methods"] == ["GET"]
     assert json.loads(site.calls[0]["body"]) == {"name": "sud", "description": "d"}
 
 
@@ -217,12 +216,20 @@ def test_request_removes_the_key_if_the_site_echoes_it(active):
     assert out["body"]["me"]["token"] == "[removed]"
 
 
-def test_post_refused_until_allowed_in_vault(active):
-    site = FakeSite((200, {"ok": True}))
+def test_post_to_a_registered_host_attaches_the_key(active):
+    site = FakeSite((201, {"post": {"id": "p1"}}))
     url = "https://www.moltbook.com/api/v1/posts"
-    assert req(active, site, url=url, method="POST", body={"t": 1})["status"] == "refused"
-    active.hosts["www.moltbook.com"]["allowed_methods"] = ["GET", "POST"]
-    assert req(active, site, url=url, method="POST", body={"t": 1})["status"] == "ok"
+    out = req(active, site, url=url, method="POST", body={"title": "hi"})
+    assert out["status"] == "ok" and out["http_status"] == 201
+    assert site.calls[0]["method"] == "POST"
+    assert site.calls[0]["headers"]["Authorization"] == f"Bearer {KEY}"
+    assert json.loads(site.calls[0]["body"]) == {"title": "hi"}
+
+
+def test_unsupported_method_refused(active):
+    site = FakeSite()
+    assert req(active, site, url="https://www.moltbook.com/x", method="TRACE")["status"] == "refused"
+    assert site.calls == []
 
 
 @pytest.mark.parametrize("url", [
