@@ -28,8 +28,17 @@ The agent calls it with a Modal proxy token (`modal workspace proxy-tokens creat
 
 ## Allowing more than GET for a host
 
-The vault is `/vault.json` on the `credential-broker-vault` Volume. Download it,
-add the method to that host's `allowed_methods`, and upload it:
+The vault is `/vault.json` on the `credential-broker-vault` Volume. It holds
+**plaintext keys**, so download it outside the repo, edit it, upload it, and
+delete the local copy:
 
-    modal volume get credential-broker-vault vault.json .
-    modal volume put credential-broker-vault vault.json /vault.json --force
+    modal volume get credential-broker-vault /vault.json $env:TEMP
+    # edit $env:TEMP\vault.json: add the method to that host's allowed_methods
+    modal volume put credential-broker-vault $env:TEMP\vault.json /vault.json --force
+    Remove-Item $env:TEMP\vault.json
+
+`vault.json` is in `.gitignore` as a backstop, but don't rely on it.
+
+The same steps fix a wrong key: each host keeps the full signup response under
+`saved_response`, so if the agent named the wrong field, copy the real key from
+there into `key`.

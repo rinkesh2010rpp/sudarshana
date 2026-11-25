@@ -115,12 +115,24 @@ def test_three_bad_paths_needs_human(vault):
     assert reg(vault, site)["status"] == "needs_human" and len(site.calls) == 1
 
 
-def test_mislabelled_field_cannot_leak_the_real_key(vault):
-    # The agent names some other key-like field; the real api_key must still be hidden.
-    weird = {"agent": {"api_key": KEY, "id": "agent_id_0123456789abcdefghij"}}
+def test_mislabelled_field_cannot_leak_or_lose_the_real_key(vault):
+    # The agent names a key-like field that isn't the key (a UUID id). The real
+    # api_key must stay hidden from the agent AND survive in the vault.
+    weird = {"agent": {"api_key": KEY, "id": "3f2a9c4e-1b7d-4e8a-9f6b-2c5d8e1a7b30"}}
     out = reg(vault, FakeSite((201, weird)), {**RECIPE, "secret": "agent.id"})
     assert out["status"] == "ok"
     no_key_anywhere(out)
+    entry = vault.hosts["www.moltbook.com"]
+    assert entry["saved_response"]["agent"]["api_key"] == KEY
+
+
+def test_oversized_body_is_refused_without_locking_the_host(vault):
+    big = {**RECIPE, "signup": {**RECIPE["signup"],
+                                "body": {"x": "a" * (core.MAX_BODY_BYTES + 10)}}}
+    site = FakeSite((201, REGISTERED))
+    assert reg(vault, site, big)["status"] == "refused"
+    assert "www.moltbook.com" not in vault.hosts and site.calls == []
+    assert reg(vault, site)["status"] == "ok"
 
 
 def test_signup_4xx_clears_and_allows_a_new_attempt(vault):

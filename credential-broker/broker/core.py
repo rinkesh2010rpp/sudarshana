@@ -324,10 +324,13 @@ def register(recipe: Any, vault: Vault, fetch, log) -> dict:
             entry["recipe"] = recipe
             return _finish(host, entry, vault, log)
 
+    # Every refusal happens before `pending` is written, so a refused request
+    # can never lock the host.
+    body = _body_bytes(recipe["signup"]["body"])
+
     vault.hosts[host] = {"state": "pending", "recipe": recipe}
     vault.save()  # pending is on disk before anything is sent
 
-    body = _body_bytes(recipe["signup"]["body"])
     try:
         status, _h, data = fetch(recipe["signup"]["method"], host, port, path,
                                  _headers(json_body=True), body)
@@ -363,11 +366,16 @@ def _finish(host: str, entry: dict, vault: Vault, log) -> dict:
     saved = entry["saved_response"]
     value = extract(saved, entry["recipe"]["secret"])
     if looks_like_key(value):
+        # The saved response stays in the vault: if the agent named a wrong
+        # field that merely looks like a key, the real key is still here for a
+        # human to recover. It is never returned or sent anywhere.
         vault.hosts[host] = {
             "state": "active",
             "key": value,
             "recipe": entry["recipe"],
             "allowed_methods": list(DEFAULT_METHODS),
+            "saved_response": saved,
+            "saved_status": entry.get("saved_status"),
         }
         vault.save()
         log(f"[broker] register {host} stored a key")
