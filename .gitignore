@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Credential broker vault: plaintext keys. Never commit.
+vault.json
