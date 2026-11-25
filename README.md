@@ -64,7 +64,7 @@ Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ─
 | Summarization | Compacts the thread at ~70K tokens and keeps the last ~8K. The model profile is capped at 128K input. |
 | Checkpointer | `SqliteSaver` at `/data/checkpoints.db`, one thread (`sudarshana`). It checkpoints once per turn. |
 | Subagent | The general-purpose `task` subagent, declared with its own summarization, todos and tool screen. |
-| Tools | File tools plus `execute`, `search_web` (DuckDuckGo via `ddgs`), `inbox_review` / `inbox_set_status`, and the A2A tools. |
+| Tools | File tools plus `execute`, `search_web` (DuckDuckGo via `ddgs`), `inbox_review` / `inbox_set_status`, the A2A tools, and `broker_register` / `broker_request` (main agent only) for outside accounts through `credential-broker/`. |
 | A2A | [a2a-hotplug](https://github.com/rinkesh2010rpp/a2a-hotplug) adds `add_agent` / `send_agent_task` / `check_agent_task`. Its store is the `sudarshana-a2a-agents` `modal.Dict`, kept alive by the hourly turn. |
 | Tool screen | [Taster](https://github.com/rinkesh2010rpp/taster-ai) checks tool results for prompt injection (Jev with a pattern-matching fallback) when `JEV_TOOL_SCREEN=1`. It enforces on `search_web`, network-touching `execute`, and A2A replies (fail-closed: `on_error: block`), and runs a free pattern scan on every other result in shadow. Scope: `TOOL_SCREEN_DEFAULT_SCOPE`, or override it with `JEV_TOOL_SCREEN_RULES` (JSON, same shape). The same switch checks every tool call against `TOOL_CONSTITUTION` (`CONSTITUTION_SCOPE`): enforced on calls to external agents, shadow on everything else — logged, flip `execute` to enforce after reviewing the logs. |
 
@@ -110,6 +110,7 @@ code reads these names:
 | `USE_OPENROUTER`, `OPENROUTER_MODEL`, `OPENROUTER_API_KEY` | The production model. The key is also used by Jev. |
 | `LLM_MODEL`, `LLM_BASE_URL`, `LLM_API_KEY` | The fallback OpenAI-compatible endpoint |
 | `GITHUB_TOKEN` | Git push and `gh` from the agent's shell |
+| `BROKER_URL`, `BROKER_TOKEN_ID`, `BROKER_TOKEN_SECRET` | The credential broker's endpoint and proxy token, used by the broker tools; withheld from the shell |
 | `JEV_TOOL_SCREEN`, `JEV_TOOL_SCREEN_TIMEOUT_S`, `JEV_TOOL_SCREEN_RULES` | The tool-result screen (off unless set to `1`) |
 | `JEV_INBOX_TRIAGE`, `JEV_CONFIDENCE`, `JEV_TIMEOUT_S` | Jev triage of inbox submissions (off unless set to `1`) |
 
