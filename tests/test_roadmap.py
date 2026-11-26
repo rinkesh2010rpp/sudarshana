@@ -1,6 +1,6 @@
 """The roadmap store: initiatives -> tasks, written only by the roadmap tools.
 
-Runs the real `agent/main.py` helpers against a temp Volume directory. No
+Runs the real `sudarshana.memory.roadmap` helpers against a temp Volume directory. No
 network, no Modal.
 
 Why: ROADMAP.md had grown to ~1,100 lines where an initiative's status was a
@@ -22,6 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
 import modal  # noqa: E402
 
+from sudarshana.memory import asks, roadmap  # noqa: E402
+
+COMMITS = []
+
 T0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
 
 
@@ -37,27 +41,24 @@ class _FakeDict:
 
 
 @pytest.fixture()
-def mod(monkeypatch, tmp_path):
+def mod(monkeypatch, patch_all, tmp_path):
     monkeypatch.setattr(
         modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _FakeDict(name))
     )
-    sys.modules.pop("main", None)
-    import main
-
     root = tmp_path.as_posix()
-    monkeypatch.setattr(main, "VOLUME_PATH", root)
-    monkeypatch.setattr(main, "ROADMAP_PATH", f"{root}/memory/roadmap.json")
-    monkeypatch.setattr(main, "ASKS_PATH", f"{root}/memory/asks.json")
-    monkeypatch.setattr(main, "ACTIONS_DIR", f"{root}/actions")
-    monkeypatch.setattr(main, "ACTIONS_ARCHIVE_DIR", f"{root}/actions/archive")
-    main.COMMITS = 0
+    patch_all("VOLUME_PATH", root)
+    patch_all("ROADMAP_PATH", f"{root}/memory/roadmap.json")
+    patch_all("ASKS_PATH", f"{root}/memory/asks.json")
+    patch_all("ACTIONS_DIR", f"{root}/actions")
+    patch_all("ACTIONS_ARCHIVE_DIR", f"{root}/actions/archive")
+    COMMITS.clear()
 
     class _Volume:
         def commit(self):
-            main.COMMITS += 1
+            COMMITS.append(1)
 
-    monkeypatch.setattr(main, "volume", _Volume())
-    return main
+    patch_all("volume", _Volume())
+    return roadmap
 
 
 def _store(mod):
@@ -85,7 +86,7 @@ def _deliverable(mod, name="run.txt"):
 
 
 def _ask(mod, q="Adopt gate-axe?"):
-    res = mod._ask_create(q, "needs his yes", now=T0, send=lambda text: None)
+    res = asks._ask_create(q, "needs his yes", now=T0, send=lambda text: None)
     assert res["ok"], res
     return res["id"]
 
@@ -101,7 +102,7 @@ def test_create_starts_proposed_and_writes_its_doc(mod):
     doc = Path(it["doc"]).read_text(encoding="utf-8")
     assert "Swap stages axe can do" in doc and "## Notes" in doc
     assert _store(mod)[0]["id"] == "gate-axe"
-    assert mod.COMMITS == 1  # committed at once, not left to turn end
+    assert len(COMMITS) == 1  # committed at once, not left to turn end
 
 
 def test_existing_doc_is_kept_as_it_is(mod):
@@ -233,7 +234,7 @@ def test_closing_an_ask_changes_nothing_on_the_roadmap(mod):
     ask_id = _ask(mod)
     mod._task_update("gate-axe", "t1", status="waiting", blocked_on=f"ask {ask_id}", now=T0)
     before = _store(mod)
-    res = mod._ask_resolve(ask_id, "use 4.12", now=T0)
+    res = asks._ask_resolve(ask_id, "use 4.12", now=T0)
     assert res == {"ok": True, "id": ask_id, "status": "answered"}
     assert _store(mod) == before
     # The agent moves it on itself.
