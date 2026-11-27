@@ -121,8 +121,16 @@ code reads these names:
 
 ```bash
 pip install -r requirements.txt
-PYTHONUTF8=1 PYTHONIOENCODING=utf-8 modal deploy src/sudarshana/infra/runtime/modal/app.py
+cd src
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 modal deploy -m sudarshana.infra.runtime.modal.app
 ```
+
+Run it from `src/`, with `-m`. In module mode Modal puts the current folder on
+Python's path, so `sudarshana` imports without installing anything, and it
+uploads the whole package. Deploying by file path
+(`modal deploy src/sudarshana/infra/runtime/modal/app.py`) fails with
+`No module named 'sudarshana'`. The `.env` in the repo root is still found:
+Modal looks for it from the current folder upward.
 
 The UTF-8 variables are needed on Windows. Without them, `modal deploy` crashes
 while printing its success checkmark.
@@ -146,7 +154,7 @@ wrong token and genuine updates are dropped silently (`200`) rather than queued.
 So after changing the secret in `.env`, re-run `set_webhook.py` first, then
 redeploy, and send yourself a message to confirm delivery.
 
-`modal serve src/sudarshana/infra/runtime/modal/app.py` runs a temporary copy with its own URL.
+`modal serve -m sudarshana.infra.runtime.modal.app` (from `src/`) runs a temporary copy with its own URL.
 
 ### Run locally
 

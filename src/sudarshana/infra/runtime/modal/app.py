@@ -34,8 +34,9 @@ hourly_checkin run turns on it with run_turn. hourly_trigger is a bare wrapper b
 accepts schedule= on @app.function(), not @modal.method(). Change the
 hourly behaviour via HOURLY_TASK / the prompt, not code.
 
-    modal serve src/sudarshana/infra/runtime/modal/app.py     # temporary URL
-    modal deploy src/sudarshana/infra/runtime/modal/app.py    # stable URL
+    cd src
+    modal serve -m sudarshana.infra.runtime.modal.app     # temporary URL
+    modal deploy -m sudarshana.infra.runtime.modal.app    # stable URL
     python scripts/set_webhook.py <printed-url>
 """
 
