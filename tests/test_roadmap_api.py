@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
 import modal  # noqa: E402
 
+from sudarshana.memory import roadmap  # noqa: E402
+
 T0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
 AUTH = {"Authorization": "Bearer t"}
 
@@ -45,7 +47,7 @@ class _Resp:
 
 
 @pytest.fixture()
-def env(monkeypatch, tmp_path):
+def env(monkeypatch, patch_all, tmp_path):
     from fastapi.testclient import TestClient
     import requests
 
@@ -65,7 +67,7 @@ def env(monkeypatch, tmp_path):
         "ACTIONS_DIR": f"{root}/actions",
         "ACTIONS_ARCHIVE_DIR": f"{root}/actions/archive",
     }.items():
-        monkeypatch.setattr(main, name, val)
+        patch_all(name, val)
 
     class _Volume:
         def commit(self):
@@ -74,7 +76,7 @@ def env(monkeypatch, tmp_path):
         def reload(self):
             pass
 
-    monkeypatch.setattr(main, "volume", _Volume())
+    patch_all("volume", _Volume())
     # .local() runs the undecorated function; get_raw_f() is gone in modal 1.6.
     app = main.control_api.local()
     return main, TestClient(app)
@@ -116,16 +118,16 @@ def test_a_deleted_doc_shows_as_missing(env):
 def test_a_doc_path_outside_actions_is_refused(env):
     main, client = env
     main._initiative_create("gate-axe", "T", "o", "d", now=T0)
-    p = Path(main.ROADMAP_PATH)
+    p = Path(roadmap.ROADMAP_PATH)
     data = json.loads(p.read_text(encoding="utf-8"))
-    data["initiatives"][0]["doc"] = main.ROADMAP_PATH  # hand-edited to point elsewhere
+    data["initiatives"][0]["doc"] = roadmap.ROADMAP_PATH  # hand-edited to point elsewhere
     p.write_text(json.dumps(data), encoding="utf-8")
     assert client.get("/api/control/roadmap/gate-axe/doc", headers=AUTH).status_code == 400
 
 
 def test_a_broken_store_is_an_error_not_an_empty_roadmap(env):
     main, client = env
-    p = Path(main.ROADMAP_PATH)
+    p = Path(roadmap.ROADMAP_PATH)
     p.parent.mkdir(parents=True)
     p.write_text("{bad", encoding="utf-8")
     body = client.get("/api/control/roadmap", headers=AUTH).json()

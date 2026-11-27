@@ -1,6 +1,6 @@
 """The ask list: ask_rinkesh / resolve_ask and the per-turn note.
 
-Runs the real `agent/main.py` helpers against a temp asks.json and a
+Runs the real `sudarshana.memory.asks` helpers against a temp asks.json and a
 recording stand-in for the Telegram send. No network, no Modal.
 
 Why: what the agent needed from Rinkesh lived in hand-kept lists and went
@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 import modal  # noqa: E402
 
 STORE = {}
+COMMITS = []
 T0 = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
 
 
@@ -37,24 +38,23 @@ class _FakeDict:
 
 
 @pytest.fixture()
-def mod(monkeypatch, tmp_path):
+def mod(monkeypatch, patch_all, tmp_path):
     STORE.clear()
     monkeypatch.setattr(
         modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _FakeDict(name))
     )
-    sys.modules.pop("main", None)
-    import main
+    from sudarshana.memory import asks
 
-    monkeypatch.setattr(main, "ASKS_PATH", str(tmp_path / "memory" / "asks.json"))
-    main.COMMITS = []
+    patch_all("ASKS_PATH", str(tmp_path / "memory" / "asks.json"))
+    COMMITS.clear()
 
     class _Volume:
         def commit(self):
             # Record what a commit would persist: the file as it is right now.
-            main.COMMITS.append(Path(main.ASKS_PATH).read_text(encoding="utf-8"))
+            COMMITS.append(Path(asks.ASKS_PATH).read_text(encoding="utf-8"))
 
-    monkeypatch.setattr(main, "volume", _Volume())
-    return main
+    patch_all("volume", _Volume())
+    return asks
 
 
 def _file(mod):
@@ -232,9 +232,9 @@ def test_hand_written_asks_are_adopted_and_lapse(mod, sent):
 def test_every_write_is_committed_at_once(mod, sent):
     """A turn that dies after ask_rinkesh never reaches its turn-end commit."""
     ask_id = _ask(mod, sent)["id"]
-    assert len(mod.COMMITS) == 1 and ask_id in mod.COMMITS[0]
+    assert len(COMMITS) == 1 and ask_id in COMMITS[0]
     mod._ask_resolve(ask_id, "yes", now=T0)
-    assert len(mod.COMMITS) == 2 and '"answered"' in mod.COMMITS[1]
+    assert len(COMMITS) == 2 and '"answered"' in COMMITS[1]
 
 
 def test_refused_or_failed_asks_commit_nothing(mod, sent):
@@ -243,18 +243,18 @@ def test_refused_or_failed_asks_commit_nothing(mod, sent):
 
     mod._ask_create("Q?", "why", now=T0, send=boom)
     mod._ask_create("", "why", now=T0, send=sent.append)
-    assert mod.COMMITS == []
+    assert COMMITS == []
 
 
 def test_quiet_turns_do_not_commit(mod, sent):
     assert mod._asks_context(now=T0) == ""
     _ask(mod, sent)
-    n = len(mod.COMMITS)
+    n = len(COMMITS)
     mod._asks_context(now=T0 + timedelta(hours=1))  # open ask, nothing changed
-    assert len(mod.COMMITS) == n
+    assert len(COMMITS) == n
     mod._asks_context(now=T0 + timedelta(days=4))  # lapses: one write
     mod._asks_context(now=T0 + timedelta(days=4, hours=1))  # already reported
-    assert len(mod.COMMITS) == n + 1
+    assert len(COMMITS) == n + 1
 
 
 def test_commit_failure_keeps_the_ask(mod, sent, monkeypatch):
