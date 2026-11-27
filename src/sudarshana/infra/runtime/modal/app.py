@@ -30,8 +30,9 @@ control-api (`/control`). See README.md.
 This file is wiring only: Modal decorators, the image, and make_deps().
 The agent is built once per container in Sudarshana.setup() (build_agent
 in core/agent.py); process_message (spawned by telegram_webhook) and
-hourly_checkin run turns on it with run_turn. hourly_trigger is a bare wrapper because Modal only
-accepts schedule= on @app.function(), not @modal.method(). Change the
+hourly_checkin hand each turn to telegram_turn / hourly_turn
+(interfaces/telegram/turn.py, core/turns.py), which any runtime can call.
+hourly_trigger is a bare wrapper because Modal only accepts schedule= on @app.function(), not @modal.method(). Change the
 hourly behaviour via HOURLY_TASK / the prompt, not code.
 
     cd src
@@ -44,25 +45,21 @@ from pathlib import Path
 
 import modal
 
-from sudarshana.core.agent import CHECKPOINT_DB_PATH, build_agent, run_turn
+from sudarshana.core.agent import CHECKPOINT_DB_PATH, build_agent
 from sudarshana.core.config import VOLUME_PATH
 from sudarshana.core.deps import Deps
-from sudarshana.core.prompt import HOURLY_TASK
+from sudarshana.core.turns import hourly_turn
 from sudarshana.infra.storage.modal.kv import modal_kv
 from sudarshana.infra.storage.modal.volume import ModalStorage, volume
 from sudarshana.infra.storage.sqlite.checkpoints import SqliteCheckpoints
-from sudarshana.integrations.a2a import A2A_DICT_NAME, _a2a_keep_alive, _agents_command
+from sudarshana.integrations.a2a import A2A_DICT_NAME
 from sudarshana.interfaces.http.control import create_control_app
 from sudarshana.interfaces.http.inbox import create_inbox_app
 from sudarshana.interfaces.http.status import create_status_app
 from sudarshana.interfaces.telegram.send import TelegramNotifier
-from sudarshana.interfaces.telegram.webhook import (
-    TELEGRAM_CLAIM_DICT_NAME,
-    _telegram_record,
-    _telegram_seen,
-    handle_update,
-)
-from sudarshana.memory.status import STATUS_DICT_NAME, _status_turn_end, _status_turn_start
+from sudarshana.interfaces.telegram.turn import telegram_turn
+from sudarshana.interfaces.telegram.webhook import TELEGRAM_CLAIM_DICT_NAME, handle_update
+from sudarshana.memory.status import STATUS_DICT_NAME
 
 app = modal.App("sudarshana")
 
@@ -123,70 +120,11 @@ class Sudarshana:
 
     @modal.method()
     def process_message(self, text: str, update_id: int | None = None):
-        import time
-
-        # Second dedup gate (the webhook holds the first). Method calls are
-        # serialised by this class's single container, so two copies of one
-        # update cannot both pass here — not even the pair that races past the
-        # webhook's claim. That serialisation is why this gate is the real
-        # guarantee: read-then-write here cannot interleave with another copy.
-        if update_id is not None:
-            if _telegram_seen(self.deps.claims_kv, update_id, "run"):
-                print(f"[telegram] duplicate update_id {update_id} — no turn started")
-                return
-            # Recorded before the turn so a crash mid-turn can't re-run it.
-            # Both helpers swallow Dict errors: this turn was already acked to
-            # Telegram, so raising here would discard the message silently.
-            _telegram_record(self.deps.claims_kv, update_id, "run")
-
-        # Rinkesh's external-agent controls run here, never through the model.
-        if text.strip().lower().split()[:1] == ["/agents"]:
-            TelegramNotifier().send(_agents_command(self.agent.a2a, text))
-            return
-
-        started = time.monotonic()
-        print(f"[timing] process_message started: {text[:200]!r}")
-
-        # Before any model work, so a turn that dies mid-run leaves a trace.
-        _turn_key = _status_turn_start(self.deps, "running-telegram")
-
-        result = run_turn(self.agent, text, "telegram", _turn_key)
-        # The message came in on Telegram, so the reply goes back there.
-        TelegramNotifier().send(result.reply)
-
-        print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
-        _status_turn_end(
-            self.deps,
-            _turn_key,
-            result.outcome,
-            "telegram turn finished",
-        )
-
-        # Commit explicitly — the container may be torn down before the
-        # background commit timer catches these writes.
-        self.deps.storage.commit()
+        telegram_turn(self.agent, self.deps, text, update_id)
 
     @modal.method()
     def hourly_checkin(self):
-        import time
-
-        started = time.monotonic()
-        print("[timing] hourly_checkin started")
-
-        _turn_key = _status_turn_start(self.deps, "running-hourly")
-        _a2a_keep_alive(self.deps.a2a_kv)
-        result = run_turn(self.agent, HOURLY_TASK, "hourly", _turn_key)
-        # Nobody sent this turn a message; its report goes to the owner.
-        self.deps.owner_notifier.send(result.reply)
-
-        print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
-        _status_turn_end(
-            self.deps,
-            _turn_key,
-            result.outcome,
-            "hourly turn finished",
-        )
-        self.deps.storage.commit()
+        hourly_turn(self.agent, self.deps)
 
 
 # --- Telegram intake ---------------------------------------------------------
