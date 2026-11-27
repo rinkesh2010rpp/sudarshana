@@ -1,7 +1,7 @@
 """/api/control/roadmap: the panel's view of the roadmap store.
 
-Builds the real control_api FastAPI app with forward-auth stubbed to the
-owner, against a temp Volume directory. No network, no Modal.
+Builds the real control app (interfaces/http/control.py) with fake deps and
+forward-auth stubbed to the owner, against a temp directory. No network, no Modal.
 
 Why: /control could only serve ROADMAP.md raw, so the panel had to parse
 prose to show status. These pin that it now gets records in roadmap order,
@@ -9,20 +9,14 @@ the same focus the agent's note picks, a doc link that is flagged when the
 file is gone, and that a doc path can't be pointed outside the actions dir.
 """
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-
-import importlib  # noqa: E402
-
-import modal  # noqa: E402
-
-APP = "sudarshana.infra.runtime.modal.app"
-
-from sudarshana.memory import roadmap  # noqa: E402
+from conftest import fake_deps
+from sudarshana.interfaces.http import control
+from sudarshana.memory import roadmap
 
 T0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
 AUTH = {"Authorization": "Bearer t"}
@@ -49,10 +43,12 @@ class _Resp:
         return {"email": "owner@example.com"}
 
 
+DEPS = [None]  # this test's fake Deps, set by the fixture
 
-def _deps(main):
-    """The deps control_api builds, so writes land where it reads."""
-    return main.make_deps()
+
+def _deps(_mod):
+    """The deps the control app was built with, so writes land where it reads."""
+    return DEPS[0]
 
 
 @pytest.fixture()
@@ -60,14 +56,8 @@ def env(monkeypatch, patch_all, tmp_path):
     from fastapi.testclient import TestClient
     import requests
 
-    monkeypatch.setattr(
-        modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _FakeDict(name))
-    )
     monkeypatch.setenv("CONTROL_OWNER_EMAIL", "owner@example.com")
     monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp())
-    sys.modules.pop(APP, None)
-    main = importlib.import_module(APP)
-
     root = tmp_path.as_posix()
     for name, val in {
         "VOLUME_PATH": root,
@@ -78,17 +68,8 @@ def env(monkeypatch, patch_all, tmp_path):
     }.items():
         patch_all(name, val)
 
-    class _Volume:
-        def commit(self):
-            pass
-
-        def reload(self):
-            pass
-
-    patch_all("volume", _Volume())
-    # .local() runs the undecorated function; get_raw_f() is gone in modal 1.6.
-    app = main.control_api.local()
-    return main, TestClient(app)
+    DEPS[0] = fake_deps(_FakeDict)
+    return control, TestClient(control.create_control_app(DEPS[0]))
 
 
 def test_roadmap_comes_as_records_in_order_with_the_focus(env):
