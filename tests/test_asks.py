@@ -10,14 +10,12 @@ recorded only once he has been sent it, and committed to the Volume at once
 (not at turn end, which a dying turn never reaches); it closes by an explicit
 outcome or by lapsing; and a lapse is reported once rather than every hour.
 """
-import sys
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
 from conftest import FakeStorage, fake_deps  # noqa: E402
 
@@ -71,7 +69,7 @@ def sent():
 
 def _create(mod, *a, send, **kw):
     """_ask_create with `send` as the notifier."""
-    DEPS[0].notifier.send = send
+    DEPS[0].owner_notifier.send = send
     return mod._ask_create(DEPS[0], *a, **kw)
 
 

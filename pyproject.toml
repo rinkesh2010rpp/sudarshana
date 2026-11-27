@@ -12,5 +12,5 @@ where = ["src"]
 namespaces = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "agent"]
+pythonpath = ["src"]
 testpaths = ["tests"]

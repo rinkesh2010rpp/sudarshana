@@ -2,15 +2,13 @@
 guardrail settings around them. No network: requests.post is faked."""
 
 import json
-import sys
-from pathlib import Path
 
 import pytest
 import requests
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
-import main  # noqa: E402
+from sudarshana.integrations import broker as broker_tools  # noqa: E402
+from sudarshana.safety import tool_screen  # noqa: E402
 
 TOKEN_ID, TOKEN_SECRET = "wk-test-id", "ws-test-secret"
 URL = "https://broker.example.modal.run"
@@ -52,27 +50,27 @@ RECIPE = {
 def test_register_sends_the_recipe_with_the_proxy_token(broker):
     calls, reply = broker
     reply.append({"status": "ok", "body": {"agent": {"claim_url": "https://x/claim"}}})
-    out = json.loads(main.broker_register(RECIPE))
+    out = json.loads(broker_tools.broker_register(RECIPE))
     assert out["body"]["agent"]["claim_url"] == "https://x/claim"
     call = calls[0]
     assert call["url"] == URL
     assert call["json"] == {"op": "register", "recipe": RECIPE}
     assert call["headers"] == {"Modal-Key": TOKEN_ID, "Modal-Secret": TOKEN_SECRET}
-    assert call["timeout"] == main.BROKER_TIMEOUT_S
+    assert call["timeout"] == broker_tools.BROKER_TIMEOUT_S
 
 
 def test_replace_is_sent_only_when_true(broker):
     calls, _ = broker
-    main.broker_register(RECIPE, replace=True)
-    main.broker_register(RECIPE, replace="true")
+    broker_tools.broker_register(RECIPE, replace=True)
+    broker_tools.broker_register(RECIPE, replace="true")
     assert calls[0]["json"]["replace"] is True
     assert "replace" not in calls[1]["json"]
 
 
 def test_request_sends_url_method_and_optional_body(broker):
     calls, _ = broker
-    main.broker_request("https://www.moltbook.com/api/v1/posts")
-    main.broker_request("https://www.moltbook.com/api/v1/posts", "POST", {"title": "hi"})
+    broker_tools.broker_request("https://www.moltbook.com/api/v1/posts")
+    broker_tools.broker_request("https://www.moltbook.com/api/v1/posts", "POST", {"title": "hi"})
     assert calls[0]["json"] == {"op": "request", "url": "https://www.moltbook.com/api/v1/posts",
                                 "method": "GET"}
     assert calls[1]["json"]["method"] == "POST" and calls[1]["json"]["body"] == {"title": "hi"}
@@ -82,7 +80,7 @@ def test_missing_config_does_not_call_out(monkeypatch):
     for name in ("BROKER_URL", "BROKER_TOKEN_ID", "BROKER_TOKEN_SECRET"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(requests, "post", lambda *a, **k: pytest.fail("called out"))
-    out = json.loads(main.broker_request("https://www.moltbook.com/x"))
+    out = json.loads(broker_tools.broker_request("https://www.moltbook.com/x"))
     assert out["status"] == "error" and "not configured" in out["reason"]
 
 
@@ -101,18 +99,18 @@ def test_failures_never_echo_the_token(monkeypatch, failure):
         return R()
 
     monkeypatch.setattr(requests, "post", fake_post)
-    text = main.broker_request("https://www.moltbook.com/x")
+    text = broker_tools.broker_request("https://www.moltbook.com/x")
     assert json.loads(text)["status"] == "error"
     assert TOKEN_ID not in text and TOKEN_SECRET not in text
 
 
 def test_token_is_withheld_from_the_shell():
-    assert {"BROKER_TOKEN_ID", "BROKER_TOKEN_SECRET"} <= main.SHELL_WITHHELD_SECRETS
+    assert {"BROKER_TOKEN_ID", "BROKER_TOKEN_SECRET"} <= tool_screen.SHELL_WITHHELD_SECRETS
 
 
 @pytest.mark.parametrize("scope,stage", [
-    (main.CONSTITUTION_SCOPE, "tool_call"),
-    (main.TOOL_SCREEN_DEFAULT_SCOPE, "tool_result"),
+    (tool_screen.CONSTITUTION_SCOPE, "tool_call"),
+    (tool_screen.TOOL_SCREEN_DEFAULT_SCOPE, "tool_result"),
 ])
 def test_both_tools_are_enforced_before_the_catch_all(scope, stage):
     targets = scope[stage]

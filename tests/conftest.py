@@ -1,6 +1,6 @@
 """Shared test helpers.
 
-Code moved out of agent/main.py into src/sudarshana/ imports names like
+Code in src/sudarshana/ imports names like
 VOLUME_PATH, volume and ASKS_PATH from each other, so a value lives in every
 module that imported it. `patch_all` sets one name to one value in all of
 them at once, which is what patching `main` alone used to do.
@@ -15,7 +15,7 @@ def patch_all(monkeypatch):
     def _patch(name, value):
         hit = False
         for modname, m in list(sys.modules.items()):
-            if (modname == "main" or modname.startswith("sudarshana.")) and hasattr(m, name):
+            if modname.startswith("sudarshana.") and hasattr(m, name):
                 monkeypatch.setattr(m, name, value)
                 hit = True
         assert hit, f"{name} is not defined in any loaded module"
@@ -43,6 +43,8 @@ class FakeStorage:
 class FakeNotifier:
     """Notifier port: keeps what was sent; `send` can be swapped to fail."""
 
+    channel = "test chat"
+
     def __init__(self):
         self.sent = []
 
@@ -50,7 +52,7 @@ class FakeNotifier:
         self.sent.append(text)
 
 
-def fake_deps(kv, storage=None, notifier=None):
+def fake_deps(kv, storage=None, owner_notifier=None):
     """A Deps of fakes. `kv(name)` builds each named key-value store."""
     from sudarshana.core.deps import Deps
 
@@ -60,5 +62,5 @@ def fake_deps(kv, storage=None, notifier=None):
         status_kv=kv("sudarshana-status"),
         claims_kv=kv("sudarshana-telegram-claims"),
         a2a_kv=kv("sudarshana-a2a-agents"),
-        notifier=notifier or FakeNotifier(),
+        owner_notifier=owner_notifier or FakeNotifier(),
     )

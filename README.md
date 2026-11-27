@@ -6,7 +6,8 @@ the public site ([sudarshana-gateway](https://github.com/rinkesh2010rpp/sudarsha
 and answers Rinkesh on Telegram. It has an unsandboxed shell and git access to
 its own repos, and it keeps its memory as files on a persistent Volume.
 
-All the code is in [`agent/main.py`](agent/main.py). It is a LangChain
+The code is the `sudarshana` package in [`src/sudarshana/`](src/sudarshana/); the Modal
+wiring is [`infra/runtime/modal/app.py`](src/sudarshana/infra/runtime/modal/app.py). It is a LangChain
 [deepagents](https://github.com/langchain-ai/deepagents) agent on a single
 checkpointed conversation thread.
 
@@ -14,7 +15,7 @@ checkpointed conversation thread.
 
 ```
 Telegram ──► telegram_webhook ──spawn──► process_message ─┐
-Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ──┴─► Sudarshana._invoke ─► deep agent
+Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ──┴─► run_turn ─► deep agent
                                                                                  │
                                                                   final message ──► Telegram
 ```
@@ -41,8 +42,10 @@ Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ─
 - **Triggers call `spawn()` and return right away.** A webhook that waited for
   the work got retried by Telegram, and a cron wrapper that waited got
   preempted and retried. Both started duplicate runs.
-- **Python delivers the reply, not a tool call.** `_invoke` always sends the
-  agent's final message to Telegram and prints the full trace to the Modal logs.
+- **Python delivers the reply, not a tool call.** `run_turn` returns the
+  agent's final message and the caller always sends it: a Telegram turn back to
+  Telegram, an hourly turn to the owner's notifier (also Telegram). The full
+  trace goes to the Modal logs.
 - **Only `TELEGRAM_ALLOWED_USER_ID` can talk to it.** Messages from anyone else
   are dropped without a reply. `/agents …` commands are handled inside
   `process_message` and never reach the model. The id check is defence in depth
@@ -50,7 +53,7 @@ Cron 0 * * * *  ──► hourly_trigger ──spawn──► hourly_checkin ─
   doesn't carry Telegram's secret-token header, so a forged update (the URL and
   the id are both discoverable) never reaches the id check or the model.
 - **What the cycles do is set by prompt, not code:** `SYSTEM_PROMPT`,
-  `SYSTEM_PROMPT` and `HOURLY_TASK` in `main.py`.
+  `SYSTEM_PROMPT` and `HOURLY_TASK` in `core/prompt.py`.
 
 ## The agent
 
@@ -118,7 +121,7 @@ code reads these names:
 
 ```bash
 pip install -r requirements.txt
-PYTHONUTF8=1 PYTHONIOENCODING=utf-8 modal deploy agent/main.py
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 modal deploy src/sudarshana/infra/runtime/modal/app.py
 ```
 
 The UTF-8 variables are needed on Windows. Without them, `modal deploy` crashes
@@ -126,12 +129,12 @@ while printing its success checkmark.
 
 The deployed webhook URL stays the same across deploys, so you only need to
 point Telegram at it once (or again if it changes). The label
-`TELEGRAM_WEBHOOK_LABEL` in `main.py` is pinned to the slug the endpoint had
+`TELEGRAM_WEBHOOK_LABEL` in `app.py` is pinned to the slug the endpoint had
 when it was a class method, so moving it out of the class did not change the
 URL and Telegram needed no re-registration:
 
 ```bash
-python agent/set_webhook.py https://<workspace>--sudarshana-sudarshana-telegram-webhook.modal.run
+python scripts/set_webhook.py https://<workspace>--sudarshana-sudarshana-telegram-webhook.modal.run
 ```
 
 `set_webhook.py` registers `TELEGRAM_WEBHOOK_SECRET` with Telegram as the
@@ -143,11 +146,18 @@ wrong token and genuine updates are dropped silently (`200`) rather than queued.
 So after changing the secret in `.env`, re-run `set_webhook.py` first, then
 redeploy, and send yourself a message to confirm delivery.
 
-`modal serve agent/main.py` runs a temporary copy with its own URL.
+`modal serve src/sudarshana/infra/runtime/modal/app.py` runs a temporary copy with its own URL.
+
+### Run locally
+
+`scripts/run_local.py` runs turns on this machine with no Modal: the workspace
+is the folder in `SUDARSHANA_DATA`, the status/dedup/a2a stores live in memory,
+and owner messages print to the console. The agent's shell is unsandboxed on
+your machine, so read the warning at the top of the script first.
 
 ### Dependencies
 
-The Modal image installs packages from the `pip_install(...)` list in `main.py`.
+The Modal image installs packages from the `pip_install(...)` list in `app.py`.
 **It does not read `requirements.txt`**, so update both when you add a
 dependency. Taster and a2a-hotplug are pinned to git tags so that a change in
 either can't reach the agent unannounced. Everything else is unpinned.
