@@ -1,0 +1,91 @@
+"""The web chat channel (interfaces/webchat/chat.py) on the test server.
+
+Drives the real routes and chat_turn with fake deps and run_turn stubbed.
+No model, no network, no Modal.
+
+Why: the chat page replaces Telegram for testing on one machine. These pin
+that a message is shown and queued (not run on the request), the reply and
+anything sent to the owner land on the page, the "working" flag clears even
+when a turn fails, and the turn is recorded in the status store like any other.
+"""
+import pytest
+from fastapi.testclient import TestClient
+
+from conftest import fake_deps
+from sudarshana.core.agent import TurnResult
+from sudarshana.infra.runtime.server import app as server
+from sudarshana.infra.storage.local.stores import DictKV
+from sudarshana.interfaces.webchat import chat as webchat
+
+
+class _Agent:
+    a2a = object()
+
+
+@pytest.fixture()
+def env():
+    chat = webchat.WebChat()
+    deps = fake_deps(lambda name: DictKV(), owner_notifier=webchat.WebChatNotifier(chat))
+    queued = []
+    client = TestClient(server.create_app(deps, queued.append, chat))
+    return chat, deps, queued, client
+
+
+def test_a_message_is_shown_and_queued_not_run(env):
+    chat, deps, queued, client = env
+    assert client.post("/chat/send", json={"text": "hello"}).json() == {"ok": True}
+    assert queued == [("chat", "hello")]
+    body = client.get("/chat/messages").json()
+    assert [m["text"] for m in body["messages"]] == ["hello"] and body["working"] is True
+
+
+def test_an_empty_message_is_refused(env):
+    chat, deps, queued, client = env
+    assert client.post("/chat/send", json={"text": "  "}).json()["ok"] is False
+    assert queued == []
+
+
+def test_the_page_and_the_status_api_are_both_served(env):
+    chat, deps, queued, client = env
+    assert "Sudarshana" in client.get("/chat").text
+    assert client.get("/api/status").status_code == 200
+
+
+def test_a_turn_puts_its_reply_on_the_page_and_is_recorded(env, monkeypatch):
+    chat, deps, queued, client = env
+    seen = {}
+
+    def fake_run_turn(agent, message, trigger, turn_key=None):
+        seen["key"] = turn_key
+        return TurnResult(reply=f"reply to {message}", outcome="done")
+
+    monkeypatch.setattr(webchat, "run_turn", fake_run_turn)
+    client.post("/chat/send", json={"text": "hello"})
+    webchat.chat_turn(_Agent(), deps, chat, "hello")
+    body = client.get("/chat/messages?after=1").json()
+    assert [m["text"] for m in body["messages"]] == ["reply to hello"] and body["working"] is False
+    rec = deps.status_kv.get(seen["key"])
+    assert rec["state"] == "running-chat" and rec["outcome"] == "done"
+    assert deps.storage.commits == 1
+
+
+def test_a_failed_turn_still_clears_working(env, monkeypatch):
+    chat, deps, queued, client = env
+
+    def boom(*a, **k):
+        raise RuntimeError("model down")
+
+    monkeypatch.setattr(webchat, "run_turn", boom)
+    client.post("/chat/send", json={"text": "hello"})
+    with pytest.raises(RuntimeError):
+        webchat.chat_turn(_Agent(), deps, chat, "hello")
+    body = client.get("/chat/messages").json()
+    assert body["working"] is False
+    assert "turn failed: RuntimeError: model down" in body["messages"][-1]["text"]
+
+
+def test_owner_messages_land_on_the_page(env):
+    chat, deps, queued, client = env
+    deps.owner_notifier.send("an ask for you")
+    assert [m["from"] for m in chat.after(0)] == ["sudarshana"]
+    assert deps.owner_notifier.channel == "web chat"
