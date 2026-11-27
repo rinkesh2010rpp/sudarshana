@@ -36,6 +36,20 @@ class _FakeDict:
         STORE[(self.name, key)] = value
 
 
+class _DownDict:
+    """A Dict whose service is down: the handle is lazy, so the error comes
+    on first use, not when it is looked up by name."""
+
+    def get(self, key, default=None):
+        raise RuntimeError("dict unavailable")
+
+    def put(self, key, value):
+        raise RuntimeError("dict unavailable")
+
+
+CLAIMS = _FakeDict("sudarshana-telegram-claims")
+
+
 @pytest.fixture()
 def mod(monkeypatch):
     """The module, with modal.Dict and the spawned method faked out."""
@@ -161,11 +175,11 @@ def test_claim_window_is_bounded(mod):
 
 def test_the_two_gates_do_not_consume_each_others_claim(mod):
     """The webhook records "webhook"; the turn records "run" for the same id."""
-    mod._telegram_record(5555, "webhook")
-    assert mod._telegram_seen(5555, "webhook") is True
-    assert mod._telegram_seen(5555, "run") is False
-    mod._telegram_record(5555, "run")
-    assert mod._telegram_seen(5555, "run") is True
+    mod._telegram_record(CLAIMS, 5555, "webhook")
+    assert mod._telegram_seen(CLAIMS, 5555, "webhook") is True
+    assert mod._telegram_seen(CLAIMS, 5555, "run") is False
+    mod._telegram_record(CLAIMS, 5555, "run")
+    assert mod._telegram_seen(CLAIMS, 5555, "run") is True
 
 
 def test_a_failed_spawn_loses_nothing(mod):
@@ -185,7 +199,7 @@ def test_a_failed_spawn_loses_nothing(mod):
         mod.webhook(_update(32, "important"))
 
     # Nothing was recorded, so Telegram's retry is not treated as a duplicate.
-    assert mod._telegram_seen(32, "webhook") is False
+    assert mod._telegram_seen(CLAIMS, 32, "webhook") is False
     assert STORE[("sudarshana-telegram-claims", "seen:webhook")] == [31]
 
     del mod.spawner.spawn
@@ -195,10 +209,7 @@ def test_a_failed_spawn_loses_nothing(mod):
 
 def test_a_dict_outage_does_not_break_the_webhook(mod, monkeypatch):
     """A Dict error must not become a 500, and must not drop the message."""
-    def _down(cls, name, create_if_missing=False):
-        raise RuntimeError("dict unavailable")
-
-    monkeypatch.setattr(modal.Dict, "from_name", classmethod(_down))
+    monkeypatch.setattr(modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _DownDict()))
     assert mod.webhook(_update(40, "still arrives")) == {"ok": True}
     assert mod.spawned == [("still arrives", 40)]
 
@@ -206,12 +217,8 @@ def test_a_dict_outage_does_not_break_the_webhook(mod, monkeypatch):
 def test_a_dict_outage_cannot_kill_a_turn_that_was_already_acked(mod, monkeypatch):
     """Same outage, from inside process_message: the webhook already said ok,
     so raising here would discard the message with nothing left to retry."""
-    def _down(cls, name, create_if_missing=False):
-        raise RuntimeError("dict unavailable")
-
-    monkeypatch.setattr(modal.Dict, "from_name", classmethod(_down))
-    assert mod._telegram_seen(41, "run") is False
-    mod._telegram_record(41, "run")  # must not raise
+    assert mod._telegram_seen(_DownDict(), 41, "run") is False
+    mod._telegram_record(_DownDict(), 41, "run")  # must not raise
 
 
 def test_unset_allowed_user_is_a_5xx_not_a_silent_drop(mod, monkeypatch):

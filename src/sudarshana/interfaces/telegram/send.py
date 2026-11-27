@@ -15,3 +15,10 @@ def _send_telegram(text: str) -> None:
             json={"chat_id": chat_id, "text": chunk},
             timeout=10,
         )
+
+
+class TelegramNotifier:
+    """Notifier port: a message to the owner's Telegram chat."""
+
+    def send(self, text: str) -> None:
+        _send_telegram(text)

@@ -21,3 +21,44 @@ def patch_all(monkeypatch):
         assert hit, f"{name} is not defined in any loaded module"
 
     return _patch
+
+
+class FakeStorage:
+    """Storage port: counts commits; `on_commit` sees each one."""
+
+    def __init__(self, root="", on_commit=None):
+        self.root = root
+        self.commits = 0
+        self.on_commit = on_commit
+
+    def commit(self):
+        self.commits += 1
+        if self.on_commit:
+            self.on_commit()
+
+    def reload(self):
+        pass
+
+
+class FakeNotifier:
+    """Notifier port: keeps what was sent; `send` can be swapped to fail."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, text):
+        self.sent.append(text)
+
+
+def fake_deps(kv, storage=None, notifier=None):
+    """A Deps of fakes. `kv(name)` builds each named key-value store."""
+    from sudarshana.core.deps import Deps
+
+    return Deps(
+        storage=storage or FakeStorage(),
+        checkpoints=None,
+        status_kv=kv("sudarshana-status"),
+        claims_kv=kv("sudarshana-telegram-claims"),
+        a2a_kv=kv("sudarshana-a2a-agents"),
+        notifier=notifier or FakeNotifier(),
+    )

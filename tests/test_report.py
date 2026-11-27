@@ -19,12 +19,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
-import modal  # noqa: E402
+from conftest import fake_deps  # noqa: E402
 
 from sudarshana.core import config  # noqa: E402
 from sudarshana.memory import report, roadmap, status  # noqa: E402
 
 STORE = {}
+DEPS = [None]  # this test's fake Deps, set by the fixture
 
 
 class _FakeDict:
@@ -55,33 +56,26 @@ class _FakeDict:
 @pytest.fixture()
 def mod(monkeypatch, patch_all, tmp_path):
     STORE.clear()
-    monkeypatch.setattr(
-        modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _FakeDict(name))
-    )
     root = tmp_path.as_posix()
     patch_all("VOLUME_PATH", root)
     patch_all("ROADMAP_PATH", f"{root}/memory/roadmap.json")
     patch_all("ACTIONS_DIR", f"{root}/actions")
     patch_all("ACTIONS_ARCHIVE_DIR", f"{root}/actions/archive")
 
-    class _Volume:
-        def commit(self):
-            pass
-
-    patch_all("volume", _Volume())
+    DEPS[0] = fake_deps(_FakeDict)
     return report
 
 
 def _roadmap(mod):
     """gate-axe with t1 done and t2 open; post-meta with no tasks."""
-    roadmap._initiative_create("gate-axe", "Replace what axe covers", "o", "full green run on axe", status="active")
-    roadmap._task_add("gate-axe", "Prove axe works", "planted defects named")
-    roadmap._task_add("gate-axe", "Build axe_stage.py", "fails on planted defect")
+    roadmap._initiative_create(DEPS[0], "gate-axe", "Replace what axe covers", "o", "full green run on axe", status="active")
+    roadmap._task_add(DEPS[0], "gate-axe", "Prove axe works", "planted defects named")
+    roadmap._task_add(DEPS[0], "gate-axe", "Build axe_stage.py", "fails on planted defect")
     run = f"{config.VOLUME_PATH}/run.txt"
     open(run, "w").close()
-    roadmap._task_update("gate-axe", "t1", status="doing")
-    roadmap._task_update("gate-axe", "t1", status="done", deliverables=[run], handoff="t2 next")
-    roadmap._initiative_create("post-meta", "Posts share as themselves", "o", "each post previews itself")
+    roadmap._task_update(DEPS[0], "gate-axe", "t1", status="doing")
+    roadmap._task_update(DEPS[0], "gate-axe", "t1", status="done", deliverables=[run], handoff="t2 next")
+    roadmap._initiative_create(DEPS[0], "post-meta", "Posts share as themselves", "o", "each post previews itself")
 
 
 def _report(mod, key=None, **kw):
@@ -89,20 +83,20 @@ def _report(mod, key=None, **kw):
         key = (STORE.get("current") or {}).get("_turn_key")
     args = {"doing": "Fixing line_measure", "why": 'He said "close it, one bug first"'}
     args.update(kw)
-    return mod._report_save(key, **args)
+    return mod._report_save(DEPS[0], key, **args)
 
 
 def test_report_requires_doing_and_why(mod):
-    key = status._status_turn_start("running-hourly")
-    assert not mod._report_save(key, "", "because")["ok"]
-    assert not mod._report_save(key, "fixing", "  ")["ok"]
+    key = status._status_turn_start(DEPS[0], "running-hourly")
+    assert not mod._report_save(DEPS[0], key, "", "because")["ok"]
+    assert not mod._report_save(DEPS[0], key, "fixing", "  ")["ok"]
     assert "report" not in STORE[key]
 
 
 def test_worked_on_is_checked_against_the_roadmap(mod):
     # A free-text project could silently name nothing; now an unknown id is
     # refused with the valid ones, so the agent corrects it in the same turn.
-    status._status_turn_start("running-hourly")
+    status._status_turn_start(DEPS[0], "running-hourly")
     _roadmap(mod)
     res = _report(mod, worked_on=["gate_axe"])
     assert not res["ok"] and "no initiative 'gate_axe'" in res["error"] and "gate-axe" in res["error"]
@@ -114,7 +108,7 @@ def test_worked_on_is_checked_against_the_roadmap(mod):
 
 
 def test_a_turn_that_wasnt_roadmap_work_reports_with_no_ids(mod):
-    key = status._status_turn_start("running-hourly")
+    key = status._status_turn_start(DEPS[0], "running-hourly")
     assert _report(mod, doing="wrote the daily post")["ok"]
     assert STORE[key]["report"]["worked_on"] == []
 
@@ -162,26 +156,26 @@ def test_overlapping_turns_each_keep_their_own_report(mod, patch_all):
     stamps = [(base + timedelta(seconds=s)).isoformat() for s in (0, 30, 300)]
     times = iter(stamps[:2])
     patch_all("_status_ts", lambda: next(times, stamps[2]))
-    early = status._status_turn_start("running-hourly")
-    late = status._status_turn_start("running-telegram")
+    early = status._status_turn_start(DEPS[0], "running-hourly")
+    late = status._status_turn_start(DEPS[0], "running-telegram")
     assert STORE["current"]["_turn_key"] == late
     assert _report(mod, key=early, doing="hourly work")["ok"]
     assert _report(mod, key=late, doing="answering his message")["ok"]
     assert STORE[early]["report"]["doing"] == "hourly work"
     assert STORE[late]["report"]["doing"] == "answering his message"
-    status._status_turn_end(early, "done")
-    status._status_turn_end(late, "done")
+    status._status_turn_end(DEPS[0], early, "done")
+    status._status_turn_end(DEPS[0], late, "done")
     turns = sorted((v for k, v in STORE.items() if k.startswith("turn:")), key=lambda r: r["started"])
     out = mod._report_latest(turns)
     assert out["fresh"] and out["missed_runs"] == 0 and out["doing"] == "answering his message"
 
 
 def test_report_lands_on_the_running_turn_and_survives_turn_end(mod):
-    key = status._status_turn_start("running-hourly")
+    key = status._status_turn_start(DEPS[0], "running-hourly")
     _roadmap(mod)
     res = _report(mod, worked_on=["gate-axe/t2"], next_step="  swap   structure-control ")
     assert res["ok"]
-    status._status_turn_end(key, "done", "hourly turn finished")
+    status._status_turn_end(DEPS[0], key, "done", "hourly turn finished")
     rep = STORE[key]["report"]
     assert STORE[key]["ended"] is not None
     assert rep["worked_on"] == ["gate-axe/t2"] and rep["next"] == "swap structure-control"
@@ -193,7 +187,7 @@ def test_report_lands_on_the_running_turn_and_survives_turn_end(mod):
 
 
 def test_report_caps_long_fields(mod):
-    status._status_turn_start("running-hourly")
+    status._status_turn_start(DEPS[0], "running-hourly")
     rep = _report(mod, doing="d" * 5000, next_step="n" * 5000)["report"]
     assert len(rep["doing"]) == mod.REPORT_TEXT_MAX and len(rep["next"]) == mod.REPORT_TEXT_MAX
 
