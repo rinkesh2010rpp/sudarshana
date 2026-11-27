@@ -2,7 +2,7 @@
 Point Telegram at your deployed (or `modal serve`-d) webhook URL.
 
 Usage:
-    python agent/set_webhook.py https://your-modal-url
+    python scripts/set_webhook.py https://your-modal-url
 """
 
 import sys
@@ -14,7 +14,7 @@ import os
 load_dotenv()
 
 if len(sys.argv) != 2:
-    print("Usage: python agent/set_webhook.py <webhook-url>")
+    print("Usage: python scripts/set_webhook.py <webhook-url>")
     sys.exit(1)
 
 url = sys.argv[1]

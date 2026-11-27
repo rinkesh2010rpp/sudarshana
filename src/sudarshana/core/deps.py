@@ -15,4 +15,6 @@ class Deps:
     status_kv: KVStore
     claims_kv: KVStore
     a2a_kv: KVStore
-    notifier: Notifier
+    # Messages for the owner that no incoming message asked for: asks,
+    # hourly reports, a2a alerts. A reply goes back where its message came in.
+    owner_notifier: Notifier

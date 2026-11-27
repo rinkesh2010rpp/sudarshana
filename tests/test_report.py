@@ -11,13 +11,10 @@ turn's own record (so it always knows which run it came from), survives the
 turn-end write, and is flagged as out of date when later runs finish
 without one.
 """
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
 from conftest import fake_deps  # noqa: E402
 

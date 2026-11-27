@@ -1,6 +1,6 @@
 """The Telegram webhook: sender gate, update_id dedup, and spawning the turn.
 
-Runs the real `agent/main.py` against an in-memory stand-in for `modal.Dict`
+Runs the real Modal app module against an in-memory stand-in for `modal.Dict`
 and a recording stand-in for the spawned `process_message`, so what is tested
 is the code that ships. No network, no Modal, no model.
 
@@ -9,13 +9,17 @@ webhook sat in the same single container as a long turn, Telegram timed out
 waiting for its ack and resent the update, and each resend started a turn.
 """
 import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
+
+import importlib  # noqa: E402
 
 import modal  # noqa: E402
+
+APP = "sudarshana.infra.runtime.modal.app"
+
+from sudarshana.interfaces.telegram import webhook as tg  # noqa: E402
 
 STORE = {}
 
@@ -57,9 +61,8 @@ def mod(monkeypatch):
     monkeypatch.setattr(
         modal.Dict, "from_name", classmethod(lambda cls, name, create_if_missing=False: _FakeDict(name))
     )
-    for name in [m for m in sys.modules if m in ("main",)]:
-        del sys.modules[name]
-    import main
+    sys.modules.pop(APP, None)
+    main = importlib.import_module(APP)
 
     spawned = []
 
@@ -167,19 +170,19 @@ def test_missing_update_id_still_spawns(mod):
 
 
 def test_claim_window_is_bounded(mod):
-    for uid in range(1000, 1000 + mod.TELEGRAM_CLAIM_WINDOW + 50):
+    for uid in range(1000, 1000 + tg.TELEGRAM_CLAIM_WINDOW + 50):
         mod.webhook(_update(uid, "bulk"))
     seen = STORE[("sudarshana-telegram-claims", "seen:webhook")]
-    assert len(seen) == mod.TELEGRAM_CLAIM_WINDOW
+    assert len(seen) == tg.TELEGRAM_CLAIM_WINDOW
 
 
 def test_the_two_gates_do_not_consume_each_others_claim(mod):
     """The webhook records "webhook"; the turn records "run" for the same id."""
-    mod._telegram_record(CLAIMS, 5555, "webhook")
-    assert mod._telegram_seen(CLAIMS, 5555, "webhook") is True
-    assert mod._telegram_seen(CLAIMS, 5555, "run") is False
-    mod._telegram_record(CLAIMS, 5555, "run")
-    assert mod._telegram_seen(CLAIMS, 5555, "run") is True
+    tg._telegram_record(CLAIMS, 5555, "webhook")
+    assert tg._telegram_seen(CLAIMS, 5555, "webhook") is True
+    assert tg._telegram_seen(CLAIMS, 5555, "run") is False
+    tg._telegram_record(CLAIMS, 5555, "run")
+    assert tg._telegram_seen(CLAIMS, 5555, "run") is True
 
 
 def test_a_failed_spawn_loses_nothing(mod):
@@ -199,7 +202,7 @@ def test_a_failed_spawn_loses_nothing(mod):
         mod.webhook(_update(32, "important"))
 
     # Nothing was recorded, so Telegram's retry is not treated as a duplicate.
-    assert mod._telegram_seen(CLAIMS, 32, "webhook") is False
+    assert tg._telegram_seen(CLAIMS, 32, "webhook") is False
     assert STORE[("sudarshana-telegram-claims", "seen:webhook")] == [31]
 
     del mod.spawner.spawn
@@ -217,8 +220,8 @@ def test_a_dict_outage_does_not_break_the_webhook(mod, monkeypatch):
 def test_a_dict_outage_cannot_kill_a_turn_that_was_already_acked(mod, monkeypatch):
     """Same outage, from inside process_message: the webhook already said ok,
     so raising here would discard the message with nothing left to retry."""
-    assert mod._telegram_seen(_DownDict(), 41, "run") is False
-    mod._telegram_record(_DownDict(), 41, "run")  # must not raise
+    assert tg._telegram_seen(_DownDict(), 41, "run") is False
+    tg._telegram_record(_DownDict(), 41, "run")  # must not raise
 
 
 def test_unset_allowed_user_is_a_5xx_not_a_silent_drop(mod, monkeypatch):

@@ -12,13 +12,11 @@ progress at a time with a handoff the next cycle reads. Statuses are the
 agent's own to manage: closing an ask changes nothing on the roadmap.
 """
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
 from conftest import FakeStorage, fake_deps  # noqa: E402
 

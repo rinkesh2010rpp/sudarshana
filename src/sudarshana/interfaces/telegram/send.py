@@ -20,5 +20,7 @@ def _send_telegram(text: str) -> None:
 class TelegramNotifier:
     """Notifier port: a message to the owner's Telegram chat."""
 
+    channel = "Telegram"
+
     def send(self, text: str) -> None:
         _send_telegram(text)

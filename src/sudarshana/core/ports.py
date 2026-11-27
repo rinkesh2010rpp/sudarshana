@@ -45,4 +45,6 @@ class CheckpointStore(Protocol):
 class Notifier(Protocol):
     """A way to send the owner a message."""
 
+    channel: str  # the chat's name as the prompt says it, e.g. "Telegram"
+
     def send(self, text: str) -> None: ...

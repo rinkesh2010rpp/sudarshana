@@ -189,7 +189,7 @@ def _ask_create(deps, question: str, why: str, options: str = "", expires_days: 
         text += f"\nOptions: {options}"
     text += f"\n\nReply here. If it's still unanswered in {days} day(s), it lapses unless I re-ask."
     try:
-        deps.notifier.send(text)
+        deps.owner_notifier.send(text)
     except Exception as e:  # noqa: BLE001 — report, don't crash the turn
         return {"ok": False, "error": f"Telegram send failed, ask not recorded: {e}"}
 
