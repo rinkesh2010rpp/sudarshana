@@ -1,6 +1,6 @@
 """The per-turn report and its roadmap progress."""
 from sudarshana.memory.roadmap import INITIATIVE_OPEN, TASK_OPEN, _rm_find, _rm_sorted, _rm_task, _roadmap_load
-from sudarshana.memory.status import _status_dict, _status_ts
+from sudarshana.memory.status import _status_ts
 
 # --- report: what I'm doing, why, and where things stand ----------------------
 # Rinkesh reads this on /control to see what the agent is doing, why, and how
@@ -16,7 +16,7 @@ REPORT_TEXT_MAX = 400
 REPORT_LIST_MAX = 8
 
 
-def _report_save(turn_key: str, doing: str, why: str, worked_on=None, next_step: str = "") -> dict:
+def _report_save(deps, turn_key: str, doing: str, why: str, worked_on=None, next_step: str = "") -> dict:
     """Validate the report and write it onto `turn_key`'s record — the turn
     making the call, handed in by the caller. Not current._turn_key: that is
     whichever turn started last, so when two turns overlap (a redeploy, where
@@ -54,7 +54,7 @@ def _report_save(turn_key: str, doing: str, why: str, worked_on=None, next_step:
         "next": " ".join(str(next_step or "").split())[:REPORT_TEXT_MAX],
     }
     try:
-        d = _status_dict()
+        d = deps.status_kv
         rec = d.get(turn_key) if turn_key else None
         if not rec:
             return {"ok": False, "error": "no running turn to attach the report to"}

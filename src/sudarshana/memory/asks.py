@@ -2,8 +2,6 @@
 import os
 
 from sudarshana.core.config import VOLUME_PATH
-from sudarshana.infra.storage.modal.volume import volume
-from sudarshana.interfaces.telegram.send import _send_telegram
 
 # --- asks: what the agent needs from Rinkesh ----------------------------------
 # Code owns this list so it can't go stale the way hand-kept lists did (PR #64
@@ -90,7 +88,7 @@ def _asks_load() -> list:
     return out
 
 
-def _asks_save(asks: list) -> None:
+def _asks_save(deps, asks: list) -> None:
     """Write atomically, so a crash mid-write can't leave /control a torn file,
     then commit the Volume at once. Waiting for the turn-end commit loses the
     record if the turn dies after the Telegram message went out (timeout,
@@ -106,7 +104,7 @@ def _asks_save(asks: list) -> None:
         json.dump({"_what": ASKS_WHAT, "asks": open_, "closed": closed}, f, indent=1, ensure_ascii=False)
     os.replace(tmp, ASKS_PATH)
     try:
-        volume.commit()
+        deps.storage.commit()
     except Exception as e:  # noqa: BLE001 — the turn-end commit still carries it
         print(f"[asks] volume commit failed, relying on the turn-end commit: {e!r}")
 
@@ -145,8 +143,8 @@ def _asks_expire(asks: list, now) -> list:
     return expired
 
 
-def _ask_create(question: str, why: str, options: str = "", expires_days: int = ASK_DEFAULT_DAYS,
-                now=None, send=None) -> dict:
+def _ask_create(deps, question: str, why: str, options: str = "", expires_days: int = ASK_DEFAULT_DAYS,
+                now=None) -> dict:
     """Record a new ask and send it to Rinkesh. Nothing is stored unless the
     message actually went out, so the list never shows an ask he never saw."""
     import secrets
@@ -191,7 +189,7 @@ def _ask_create(question: str, why: str, options: str = "", expires_days: int = 
         text += f"\nOptions: {options}"
     text += f"\n\nReply here. If it's still unanswered in {days} day(s), it lapses unless I re-ask."
     try:
-        (send or _send_telegram)(text)
+        deps.notifier.send(text)
     except Exception as e:  # noqa: BLE001 — report, don't crash the turn
         return {"ok": False, "error": f"Telegram send failed, ask not recorded: {e}"}
 
@@ -207,11 +205,11 @@ def _ask_create(question: str, why: str, options: str = "", expires_days: int = 
         "expires": (now + timedelta(days=days)).isoformat(),
     }
     asks.append(record)
-    _asks_save(asks)
+    _asks_save(deps, asks)
     return {"ok": True, "id": ask_id, "expires": record["expires"]}
 
 
-def _ask_resolve(ask_id: str, outcome: str, status: str = "answered", now=None) -> dict:
+def _ask_resolve(deps, ask_id: str, outcome: str, status: str = "answered", now=None) -> dict:
     """Close one open ask with what came of it."""
     ask_id = (ask_id or "").strip().strip("[]").removeprefix("ask ").strip()
     outcome = (outcome or "").strip()
@@ -233,23 +231,23 @@ def _ask_resolve(ask_id: str, outcome: str, status: str = "answered", now=None) 
         a["status"] = status
         a["outcome"] = outcome
         a["closed"] = now.isoformat()
-        _asks_save(asks)
+        _asks_save(deps, asks)
         return {"ok": True, "id": ask_id, "status": status}
     return {"ok": False, "error": f"no ask with id [{ask_id}]"}
 
 
-def _asks_context(now=None) -> str:
+def _asks_context(deps, now=None) -> str:
     """Per-call note listing open asks and any that just lapsed. Empty when
     there are none, so a quiet cycle costs nothing. Each lapsed ask is
     reported once. Fails open: a store error must not cost the turn."""
     try:
-        return _asks_context_unsafe(now)
+        return _asks_context_unsafe(deps, now)
     except Exception as e:  # noqa: BLE001
         print(f"[asks] context unavailable: {e!r}")
         return "(Open asks to Rinkesh: the list could not be read this turn.)"
 
 
-def _asks_context_unsafe(now=None) -> str:
+def _asks_context_unsafe(deps, now=None) -> str:
     now = now or _utcnow()
     asks = _asks_load()
     _asks_expire(asks, now)
@@ -283,5 +281,5 @@ def _asks_context_unsafe(now=None) -> str:
             "If one is still truly blocking, ask_rinkesh again and say what changed; "
             "otherwise let it go."
         )
-        _asks_save(asks)  # the expiry and its reported-once mark
+        _asks_save(deps, asks)  # the expiry and its reported-once mark
     return "\n".join(lines)

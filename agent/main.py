@@ -44,9 +44,12 @@ from pathlib import Path
 import modal
 
 from sudarshana.core.config import VOLUME_PATH
+from sudarshana.core.deps import Deps
 from sudarshana.core.prompt import HOURLY_TASK, SYSTEM_PROMPT
-from sudarshana.infra.storage.modal.volume import volume
-from sudarshana.interfaces.telegram.send import _send_telegram
+from sudarshana.infra.storage.modal.kv import modal_kv
+from sudarshana.infra.storage.modal.volume import ModalStorage, volume
+from sudarshana.infra.storage.sqlite.checkpoints import SqliteCheckpoints
+from sudarshana.interfaces.telegram.send import TelegramNotifier
 from sudarshana.memory.asks import ASK_DEFAULT_DAYS, ASKS_PATH, _ask_create, _ask_resolve, _asks_context
 from sudarshana.memory.knowledge import _maintain_knowledge
 from sudarshana.memory.report import _report_latest, _report_save, _report_with_progress
@@ -66,8 +69,8 @@ from sudarshana.memory.roadmap import (
     _task_update,
 )
 from sudarshana.memory.status import (
+    STATUS_DICT_NAME,
     STATUS_HISTORY_LIMIT,
-    _status_dict,
     _status_is_zombie,
     _status_parse_ts,
     _status_ts,
@@ -324,6 +327,20 @@ def _timestamp() -> str:
 # the other turn's exchange drops out of the thread. Acceptable for one user.
 CHECKPOINT_DB_PATH = os.path.join(VOLUME_PATH, "checkpoints.db")
 CONVERSATION_THREAD = {"configurable": {"thread_id": "sudarshana"}}
+
+
+def make_deps() -> Deps:
+    """The real ports, built once per container and passed explicitly.
+    Every handle is lazy, so building them costs no round trip."""
+    return Deps(
+        storage=ModalStorage(volume, VOLUME_PATH),
+        checkpoints=SqliteCheckpoints(CHECKPOINT_DB_PATH),
+        status_kv=modal_kv(STATUS_DICT_NAME),
+        claims_kv=modal_kv(TELEGRAM_CLAIM_DICT_NAME),
+        a2a_kv=modal_kv(A2A_DICT_NAME),
+        notifier=TelegramNotifier(),
+    )
+
 # Max graph steps per turn; also quoted in the Telegram message when hit.
 # ~4 steps per model call. 200 (~50 calls) was hit by ~1 in 3 turns on
 # 11-13..11-14, mostly while writing notes after the work landed; those turns
@@ -350,6 +367,7 @@ class Sudarshana:
     def setup(self):
         # Runs once per container start; self.agent is reused by every
         # webhook/checkin call that container handles afterward.
+        self.deps = make_deps()
         from deepagents import create_deep_agent
         from deepagents.backends import CompositeBackend, LocalShellBackend
         from deepagents.backends.filesystem import FilesystemBackend
@@ -478,7 +496,7 @@ class Sudarshana:
             and only for an external artifact. note is the private audit trail
             only.
             Returns a short result string."""
-            res = _inbox_set_status(item_id, status, note=note, artifact_link=artifact_link, answer=answer)
+            res = _inbox_set_status(self.deps, item_id, status, note=note, artifact_link=artifact_link, answer=answer)
             if res.get("ok"):
                 vis = "PUBLIC (on the site board)" if res.get("public") else "private"
                 return f"ok: {item_id} -> {status} ({vis})"
@@ -496,7 +514,7 @@ class Sudarshana:
             the one-line reason it's blocked on him; options= lists the choices
             if there are any (put your recommendation first). At most 3 asks
             can be open at once. Returns the ask id, or why it wasn't sent."""
-            res = _ask_create(question, why, options=options, expires_days=expires_days)
+            res = _ask_create(self.deps, question, why, options=options, expires_days=expires_days)
             if res.get("ok"):
                 return f"sent: [{res['id']}], open until {res['expires']}"
             return f"not sent: {res['error']}"
@@ -507,7 +525,7 @@ class Sudarshana:
             it; status='dropped' when you no longer need it (it got done
             another way, the work moved on, it was wrong to ask). outcome= is
             one line: what he said, or why it's no longer needed."""
-            res = _ask_resolve(ask_id, outcome, status=status)
+            res = _ask_resolve(self.deps, ask_id, outcome, status=status)
             if res.get("ok"):
                 return f"closed: [{res['id']}] {res['status']}"
             return f"failed: {res['error']}"
@@ -530,7 +548,7 @@ class Sudarshana:
             what the next turn will do, or "waiting on Rinkesh" when it is
             blocked on an open ask. Plain words; no file paths or commit
             hashes unless he needs them to act."""
-            res = _report_save(getattr(self, "_turn_key", None), doing, why,
+            res = _report_save(self.deps, getattr(self, "_turn_key", None), doing, why,
                                worked_on=worked_on, next_step=next_step)
             if res.get("ok"):
                 return f"reported at {res['report']['reported_at']}"
@@ -565,7 +583,7 @@ class Sudarshana:
             says yes. priority= lower runs first (0 default). links= extra
             /data paths or URLs. Creates the doc /data/actions/<id>.md if it
             doesn't exist; write your notes there. Add its tasks with add_task."""
-            res = _initiative_create(id, title, objective, done_when, asked_by=asked_by,
+            res = _initiative_create(self.deps, id, title, objective, done_when, asked_by=asked_by,
                                      status=status, priority=priority, links=links)
             if not res.get("ok"):
                 return _rm_fail(res)
@@ -584,7 +602,7 @@ class Sudarshana:
             declined; blocked -> active | declined. done/declined need
             outcome= and are final; the doc moves to /data/actions/archive/.
             links= replaces the list."""
-            res = _initiative_update(id, status=status, title=title, objective=objective,
+            res = _initiative_update(self.deps, id, status=status, title=title, objective=objective,
                                      done_when=done_when, priority=priority,
                                      blocked_on=blocked_on, reason=reason,
                                      outcome=outcome, links=links)
@@ -599,7 +617,7 @@ class Sudarshana:
             1-3 cycles (bigger than that, split it). done_when= what proves it
             finished. position= 1-based place in the queue (default: last).
             Tasks run in queue order, one 'doing' at a time."""
-            res = _task_add(initiative_id, title, done_when, position=position)
+            res = _task_add(self.deps, initiative_id, title, done_when, position=position)
             if not res.get("ok"):
                 return _rm_fail(res)
             return f"added {res['initiative']}/{res['task']['id']}"
@@ -619,7 +637,7 @@ class Sudarshana:
             two lines the NEXT cycle reads first — set it every cycle you work
             the task, even if it's not done. deliverables= are added to the
             list."""
-            res = _task_update(initiative_id, task_id, status=status, title=title,
+            res = _task_update(self.deps, initiative_id, task_id, status=status, title=title,
                                done_when=done_when, handoff=handoff, deliverables=deliverables,
                                blocked_on=blocked_on, reason=reason)
             if not res.get("ok"):
@@ -723,14 +741,7 @@ class Sudarshana:
                 },
             )
 
-        import sqlite3
-
-        from langgraph.checkpoint.sqlite import SqliteSaver
-
-        conn = sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False)
-        checkpointer = SqliteSaver(conn)
-        checkpointer.setup()
-        conn.execute("PRAGMA journal_mode=DELETE")
+        checkpointer = self.deps.checkpoints.open()
 
         # deepagents no longer adds write_todos by default; the prompt relies on it.
         from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
@@ -743,7 +754,7 @@ class Sudarshana:
         # the `task` subagent, which keeps outward A2A calls in the main agent.
         # Also the handle for the /agents controls in telegram_webhook.
         self.a2a = A2AMiddleware(
-            store=_a2a_store(), screen=_a2a_screen, notify=_send_telegram, log=_a2a_log
+            store=self.deps.a2a_kv, screen=_a2a_screen, notify=self.deps.notifier.send, log=_a2a_log
         )
 
         main_middleware = [
@@ -796,7 +807,7 @@ class Sudarshana:
                     {"role": "system", "content": f"Visitor inbox intake:\n{_icc}"}
                 ]),
                 # Open asks to Rinkesh, every turn; adds nothing when none.
-                *([] if not (_acx := _asks_context()) else [
+                *([] if not (_acx := _asks_context(self.deps)) else [
                     {"role": "system", "content": _acx}
                 ]),
                 # The roadmap's focus initiative, current task and handoff.
@@ -813,7 +824,7 @@ class Sudarshana:
         except GraphRecursionError:
             # Don't let this crash the invocation — that sends nothing to
             # Telegram. Report and move on.
-            _send_telegram(
+            self.deps.notifier.send(
                 f"[hit the {RECURSION_LIMIT}-step safety limit this cycle without finishing — "
                 "stopping. Likely looping or over-scoped. No trace for this run.]"
             )
@@ -834,7 +845,7 @@ class Sudarshana:
             default=0,
         )
         print(_format_blurb(msgs[start:]))
-        _send_telegram(_final_message(msgs))
+        self.deps.notifier.send(_final_message(msgs))
         return result
 
     @modal.method()
@@ -847,29 +858,30 @@ class Sudarshana:
         # webhook's claim. That serialisation is why this gate is the real
         # guarantee: read-then-write here cannot interleave with another copy.
         if update_id is not None:
-            if _telegram_seen(update_id, "run"):
+            if _telegram_seen(self.deps.claims_kv, update_id, "run"):
                 print(f"[telegram] duplicate update_id {update_id} — no turn started")
                 return
             # Recorded before the turn so a crash mid-turn can't re-run it.
             # Both helpers swallow Dict errors: this turn was already acked to
             # Telegram, so raising here would discard the message silently.
-            _telegram_record(update_id, "run")
+            _telegram_record(self.deps.claims_kv, update_id, "run")
 
         # Rinkesh's external-agent controls run here, never through the model.
         if text.strip().lower().split()[:1] == ["/agents"]:
-            _send_telegram(_agents_command(self.a2a, text))
+            self.deps.notifier.send(_agents_command(self.a2a, text))
             return
 
         started = time.monotonic()
         print(f"[timing] process_message started: {text[:200]!r}")
 
         # Before any model work, so a turn that dies mid-run leaves a trace.
-        _turn_key = _status_turn_start("running-telegram")
+        _turn_key = _status_turn_start(self.deps, "running-telegram")
 
         result = self._invoke(text, "telegram", _turn_key)
 
         print(f"[timing] process_message finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(
+            self.deps,
             _turn_key,
             STEP_LIMIT if result == STEP_LIMIT else "done",
             "telegram turn finished",
@@ -877,7 +889,7 @@ class Sudarshana:
 
         # Commit explicitly — the container may be torn down before the
         # background commit timer catches these writes.
-        volume.commit()
+        self.deps.storage.commit()
 
     @modal.method()
     def hourly_checkin(self):
@@ -886,17 +898,18 @@ class Sudarshana:
         started = time.monotonic()
         print("[timing] hourly_checkin started")
 
-        _turn_key = _status_turn_start("running-hourly")
-        _a2a_keep_alive()
+        _turn_key = _status_turn_start(self.deps, "running-hourly")
+        _a2a_keep_alive(self.deps.a2a_kv)
         result = self._invoke(HOURLY_TASK, "hourly", _turn_key)
 
         print(f"[timing] hourly_checkin finished in {time.monotonic() - started:.1f}s")
         _status_turn_end(
+            self.deps,
             _turn_key,
             STEP_LIMIT if result == STEP_LIMIT else "done",
             "hourly turn finished",
         )
-        volume.commit()
+        self.deps.storage.commit()
 
 
 # --- Telegram intake ---------------------------------------------------------
@@ -922,7 +935,7 @@ TELEGRAM_CLAIM_DICT_NAME = "sudarshana-telegram-claims"
 TELEGRAM_CLAIM_WINDOW = 200
 
 
-def _telegram_seen(update_id: int, role: str) -> bool:
+def _telegram_seen(claims, update_id: int, role: str) -> bool:
     """True if `update_id` is already recorded for `role`. Advisory only.
 
     If the Dict can't be read this answers False — treat the update as new and
@@ -938,7 +951,7 @@ def _telegram_seen(update_id: int, role: str) -> bool:
     itself. This gate only saves a spawn.
     """
     try:
-        d = modal.Dict.from_name(TELEGRAM_CLAIM_DICT_NAME, create_if_missing=True)
+        d = claims
         seen = list(d.get(f"seen:{role}") or [])
     except Exception as e:  # noqa: BLE001 — a Dict outage must not 500 the webhook
         print(f"[telegram] claim read failed (role={role}): {e!r} — treating as new")
@@ -946,7 +959,7 @@ def _telegram_seen(update_id: int, role: str) -> bool:
     return update_id in seen
 
 
-def _telegram_record(update_id: int, role: str) -> None:
+def _telegram_record(claims, update_id: int, role: str) -> None:
     """Best-effort: remember `update_id` for `role` in one bounded list.
 
     Never raises — a Dict outage means a resend may re-run the update, which
@@ -955,7 +968,7 @@ def _telegram_record(update_id: int, role: str) -> None:
     worse.
     """
     try:
-        d = modal.Dict.from_name(TELEGRAM_CLAIM_DICT_NAME, create_if_missing=True)
+        d = claims
         key = f"seen:{role}"
         seen = [i for i in (d.get(key) or []) if i != update_id]
         seen.append(update_id)
@@ -1044,7 +1057,8 @@ def telegram_webhook(
 
     update_id = (payload or {}).get("update_id")
     update_id = update_id if isinstance(update_id, int) else None
-    if update_id is not None and _telegram_seen(update_id, "webhook"):
+    deps = make_deps()
+    if update_id is not None and _telegram_seen(deps.claims_kv, update_id, "webhook"):
         print(f"[telegram] duplicate update_id {update_id} — acked, not spawned")
         return {"ok": True, "duplicate": True}
 
@@ -1055,7 +1069,7 @@ def telegram_webhook(
     # was seen. The reverse order has no such recovery.
     Sudarshana().process_message.spawn(text, update_id)
     if update_id is not None:
-        _telegram_record(update_id, "webhook")
+        _telegram_record(deps.claims_kv, update_id, "webhook")
     return {"ok": True}
 
 
@@ -1073,6 +1087,7 @@ def status_api():
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
 
+    deps = make_deps()
     web_app = FastAPI(title="sudarshana-status")
     web_app.add_middleware(
         CORSMiddleware,
@@ -1083,7 +1098,7 @@ def status_api():
     )
 
     def _snapshot():
-        d = _status_dict()
+        d = deps.status_kv
         current = d.get("current", {}) or {}
         history = d.get("history", []) or []
         last = history[0] if history else None
@@ -1102,7 +1117,7 @@ def status_api():
 
     @web_app.get("/api/events")
     def api_events(limit: int = 50):
-        d = _status_dict()
+        d = deps.status_kv
         history = d.get("history", []) or []
         limit = max(1, min(int(limit), STATUS_HISTORY_LIMIT))
         return {
@@ -1506,18 +1521,13 @@ A2A_LOG_DIR = os.path.join(VOLUME_PATH, "a2a-calls")
 A2A_CARD_SCREEN_THRESHOLD = 0.85
 
 
-def _a2a_store():
-    return modal.Dict.from_name(A2A_DICT_NAME, create_if_missing=True)
-
-
-def _a2a_keep_alive() -> None:
+def _a2a_keep_alive(store) -> None:
     """Read every agent record and the kill switch once, from the hourly
     check-in: modal.Dict drops entries after 7 days without a read or write,
     which would bring back removed agents and switch /agents off back on.
     Reads only, so it can't overwrite a concurrent change. The daily counters
     are left to expire."""
     try:
-        store = _a2a_store()
         for key in [k for k, _ in store.items() if not str(k).startswith("count:")]:
             store.get(key)
     except Exception as e:
@@ -1604,7 +1614,7 @@ class _InboxDB:
     """SQLite store for the visitor inbox at /data/visitor-inbox.db. Each call
     reconnects so the latest data is always read.
 
-    Callers must volume.commit() after writes: web-endpoint containers are torn
+    Callers must commit storage after writes: web-endpoint containers are torn
     down before the Volume's auto-flush, so uncommitted writes are lost."""
 
     SCHEMA = """
@@ -1860,7 +1870,7 @@ def _inbox_intake_context() -> str:
     return "\n".join(lines)
 
 
-def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_link: str = "", answer: str = "") -> dict:
+def _inbox_set_status(deps, item_id: str, new_status: str, note: str = "", artifact_link: str = "", answer: str = "") -> dict:
     """Apply one forward-only status transition to an inbox item. This is the
     ONLY way an item leaves the private 'received' set or is taken off the
     public board (submitted -> rejected is a retraction) — call it only after
@@ -1892,7 +1902,7 @@ def _inbox_set_status(item_id: str, new_status: str, note: str = "", artifact_li
     )
     # Without an explicit commit the transition (and answer) never reach the
     # shared Volume, so the public GET and next-cycle intake never see them.
-    volume.commit()
+    deps.storage.commit()
     return {
         "ok": True,
         "id": item_id,
@@ -1915,6 +1925,7 @@ def inbox_api():
     from pydantic import BaseModel, Field
     import uuid as _uuid
 
+    deps = make_deps()
     web_app = FastAPI(title="sudarshana-inbox")
     web_app.add_middleware(
         CORSMiddleware,
@@ -1955,7 +1966,7 @@ def inbox_api():
             artifact_link="",
         )
         # Explicit commit: the container is torn down before auto-flush.
-        volume.commit()
+        deps.storage.commit()
 
         # Apply a confident Jev verdict now via _inbox_set_status; anything
         # else leaves the item 'received' for the agent's next-cycle review.
@@ -1967,6 +1978,7 @@ def inbox_api():
             if triage.get("ran") and verdict and confidence >= JEV_CONFIDENCE and verdict in JEV_VERDICTS:
                 target = JEV_VERDICTS[verdict]
                 applied = _inbox_set_status(
+                    deps,
                     item_id,
                     target,
                     note=(
@@ -1989,7 +2001,7 @@ def inbox_api():
                         ),
                         artifact_link="",
                     )
-                    volume.commit()
+                    deps.storage.commit()
                 else:
                     outcome = target
             else:
@@ -2008,7 +2020,7 @@ def inbox_api():
                     note=f"Jev triager: no auto-action ({reason}) input_hash={_jev_input_hash(text)}",
                     artifact_link="",
                 )
-                volume.commit()
+                deps.storage.commit()
 
         if outcome == "submitted":
             return {
@@ -2130,6 +2142,7 @@ def control_api():
     IDENTITY_BASE = "https://sudarshanaai.netlify.app"
     OWNER_EMAIL = _os.environ.get("CONTROL_OWNER_EMAIL", "").strip().lower()
 
+    deps = make_deps()
     web_app = FastAPI(title="sudarshana-control")
     web_app.add_middleware(
         CORSMiddleware,
@@ -2281,7 +2294,7 @@ def control_api():
                         break
                     _VOL_COND.wait(timeout=_left)
             try:
-                volume.reload()
+                deps.storage.reload()
                 _RELOAD_STATE["at"] = _time.time()
             except Exception:  # noqa: BLE001
                 # No stamp on failure, so the next request retries: a stale
@@ -2616,7 +2629,7 @@ def control_api():
             # One fetch for the whole Dict. A get() per turn key meant ~100
             # sequential round-trips per panel load; items() is one call, and
             # it fails as a unit rather than half-reading.
-            items = list(_status_dict().items() or [])
+            items = list(deps.status_kv.items() or [])
         except Exception:  # noqa: BLE001
             return None, {}, "the status store didn't answer"
         recs = []

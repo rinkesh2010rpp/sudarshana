@@ -2,7 +2,6 @@
 import os
 
 from sudarshana.core.config import VOLUME_PATH
-from sudarshana.infra.storage.modal.volume import volume
 from sudarshana.memory.asks import _utcnow
 
 # --- roadmap: initiatives and their tasks, owned by code ----------------------
@@ -75,7 +74,7 @@ def _roadmap_load() -> list:
     return [it for it in data["initiatives"] if isinstance(it, dict) and it.get("id")]
 
 
-def _roadmap_save(items: list) -> None:
+def _roadmap_save(deps, items: list) -> None:
     """Atomic write, then commit the Volume at once (a turn that dies later
     must not lose a status change it already reported)."""
     import json
@@ -86,7 +85,7 @@ def _roadmap_save(items: list) -> None:
         json.dump({"_what": ROADMAP_WHAT, "initiatives": items}, f, indent=1, ensure_ascii=False)
     os.replace(tmp, ROADMAP_PATH)
     try:
-        volume.commit()
+        deps.storage.commit()
     except Exception as e:  # noqa: BLE001 — the turn-end commit still carries it
         print(f"[roadmap] volume commit failed, relying on the turn-end commit: {e!r}")
 
@@ -186,7 +185,7 @@ def _rm_archive_doc(it: dict, now) -> None:
     it["doc"] = dst
 
 
-def _initiative_create(initiative_id: str, title: str, objective: str, done_when: str,
+def _initiative_create(deps, initiative_id: str, title: str, objective: str, done_when: str,
                        asked_by: str = "", status: str = "proposed", priority: int = 0,
                        links=None, now=None) -> dict:
     import re
@@ -235,11 +234,11 @@ def _initiative_create(initiative_id: str, title: str, objective: str, done_when
     }
     _rm_ensure_doc(it)
     items.append(it)
-    _roadmap_save(items)
+    _roadmap_save(deps, items)
     return {"ok": True, "initiative": it}
 
 
-def _initiative_update(initiative_id: str, status: str = "", title: str = "", objective: str = "",
+def _initiative_update(deps, initiative_id: str, status: str = "", title: str = "", objective: str = "",
                        done_when: str = "", priority=None, blocked_on: str = "", reason: str = "",
                        outcome: str = "", links=None, now=None) -> dict:
     now = now or _utcnow()
@@ -297,11 +296,11 @@ def _initiative_update(initiative_id: str, status: str = "", title: str = "", ob
             it["outcome"] = outcome
             _rm_archive_doc(it, now)
     it["updated"] = now.isoformat()
-    _roadmap_save(items)
+    _roadmap_save(deps, items)
     return {"ok": True, "initiative": it}
 
 
-def _task_add(initiative_id: str, title: str, done_when: str, position=None, now=None) -> dict:
+def _task_add(deps, initiative_id: str, title: str, done_when: str, position=None, now=None) -> dict:
     now = now or _utcnow()
     title, done_when = _rm_text(title), _rm_text(done_when)
     if not title or not done_when:
@@ -342,11 +341,11 @@ def _task_add(initiative_id: str, title: str, done_when: str, position=None, now
     else:
         tasks.insert(max(pos - 1, 0), task)
     it["updated"] = ts
-    _roadmap_save(items)
+    _roadmap_save(deps, items)
     return {"ok": True, "task": task, "initiative": it["id"]}
 
 
-def _task_update(initiative_id: str, task_id: str, status: str = "", title: str = "",
+def _task_update(deps, initiative_id: str, task_id: str, status: str = "", title: str = "",
                  done_when: str = "", handoff: str = "", deliverables=None,
                  blocked_on: str = "", reason: str = "", now=None) -> dict:
     now = now or _utcnow()
@@ -407,7 +406,7 @@ def _task_update(initiative_id: str, task_id: str, status: str = "", title: str 
         if status in ("done", "dropped"):
             task["closed"] = now.isoformat()
     task["updated"] = it["updated"] = now.isoformat()
-    _roadmap_save(items)
+    _roadmap_save(deps, items)
     return {"ok": True, "task": task, "initiative": it["id"]}
 
 

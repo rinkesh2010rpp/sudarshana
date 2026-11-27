@@ -1,8 +1,6 @@
 """Status center: deterministic turn-event writer on the shared status Dict."""
 import time
 
-import modal
-
 # --- status-center: deterministic event writer + read-only API ---------------
 # A named modal.Dict shared by the writer (agent containers) and the public,
 # read-only API (mounts no volume). State:
@@ -31,11 +29,6 @@ STATUS_RECORDS_KEEP = 60
 STATUS_ZOMBIE_TTL_SECONDS = 1500
 
 
-def _status_dict():
-    """Handle to the shared status Dict (writer + API read the same one)."""
-    return modal.Dict.from_name(STATUS_DICT_NAME, create_if_missing=True)
-
-
 def _status_ts() -> str:
     from datetime import datetime, timezone
 
@@ -56,7 +49,7 @@ def _status_guard(fn):
 
 
 @_status_guard
-def _status_turn_start(state: str) -> str:
+def _status_turn_start(deps, state: str) -> str:
     """Record that a turn of `state` (running-telegram/hourly/self-task) began.
 
     Writes a fresh immutable per-turn record (unique key -> safe under
@@ -71,7 +64,7 @@ def _status_turn_start(state: str) -> str:
     ts = _status_ts()
     key = f"turn:{ts}"
     turn_id = f"{state}-{ts}-{uuid.uuid4().hex[:4]}"
-    d = _status_dict()
+    d = deps.status_kv
     d.put(
         key,
         {
@@ -213,12 +206,12 @@ def _status_other_running(d, exclude_key: str):
 
 
 @_status_guard
-def _status_turn_end(turn_key: str, outcome: str, summary: str = ""):
+def _status_turn_end(deps, turn_key: str, outcome: str, summary: str = ""):
     """Close the turn identified by `turn_key`: stamp ended/outcome on its
     record, prepend a compact summary to the rolling `history` (bounded to
     50), then — only if this turn still owns `current` — go idle, or hand
     `current` to another still-running turn if one exists (overlap case)."""
-    d = _status_dict()
+    d = deps.status_kv
     ts = _status_ts()
     if not turn_key:
         return
