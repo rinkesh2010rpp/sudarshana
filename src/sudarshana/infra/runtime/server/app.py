@@ -54,14 +54,16 @@ def make_deps(owner_notifier) -> Deps:
     )
 
 
-def create_app(deps, enqueue, chat: WebChat | None = None) -> FastAPI:
+def create_app(deps, enqueue, chat: WebChat | None = None, password: str = "") -> FastAPI:
     """The HTTP side. `enqueue(job)` hands a turn to the worker; nothing
     here runs the model, so a request is answered in milliseconds. With a
     `chat`, the web chat is served; without one, the Telegram webhook."""
     web = FastAPI(title="sudarshana-server")
 
     if chat is not None:
-        web.include_router(chat_routes(chat, enqueue))
+        if not password:
+            raise ValueError("the web chat needs a password")
+        web.include_router(chat_routes(chat, enqueue, password))
         web.mount("/", create_status_app(deps))
         return web
 
@@ -112,6 +114,9 @@ def main() -> None:
     if channel not in ("webchat", "telegram"):
         raise SystemExit(f"CHANNEL must be webchat or telegram, not {channel!r}")
     chat = WebChat() if channel == "webchat" else None
+    password = os.environ.get("WEBCHAT_PASSWORD", "")
+    if chat and not password:
+        raise SystemExit("[server] no WEBCHAT_PASSWORD configured: set it in .env to use the web chat")
     deps = make_deps(WebChatNotifier(chat) if chat else TelegramNotifier())
     print(f"[server] workspace {VOLUME_PATH}; building the agent...")
     agent = build_agent(deps)
@@ -124,7 +129,8 @@ def main() -> None:
         print("[server] hourly turn: off (set HOURLY=1 to turn it on)")
     port = int(os.environ.get("PORT", "8000"))
     if chat:
-        print(f"[server] chat: open http://127.0.0.1:{port}/chat in this machine's browser")
+        print(f"[server] chat: open http://127.0.0.1:{port}/chat in this machine's browser"
+              " (password: WEBCHAT_PASSWORD)")
     else:
         print(f"[server] telegram: point the bot's webhook at <tunnel>/telegram (local port {port})")
-    uvicorn.run(create_app(deps, jobs.put, chat), host="127.0.0.1", port=port)
+    uvicorn.run(create_app(deps, jobs.put, chat, password), host="127.0.0.1", port=port)

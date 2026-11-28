@@ -18,6 +18,15 @@ from sudarshana.infra.storage.local.stores import DictKV
 from sudarshana.interfaces.webchat import chat as webchat
 
 
+PASSWORD = "correct horse battery"
+
+
+def _client(app, auth=None):
+    c = TestClient(app)
+    c.auth = auth
+    return c
+
+
 class _Agent:
     a2a = object()
 
@@ -27,7 +36,7 @@ def env():
     chat = webchat.WebChat()
     deps = fake_deps(lambda name: DictKV(), owner_notifier=webchat.WebChatNotifier(chat))
     queued = []
-    client = TestClient(server.create_app(deps, queued.append, chat))
+    client = _client(server.create_app(deps, queued.append, chat, PASSWORD), ("me", PASSWORD))
     return chat, deps, queued, client
 
 
@@ -43,6 +52,24 @@ def test_an_empty_message_is_refused(env):
     chat, deps, queued, client = env
     assert client.post("/chat/send", json={"text": "  "}).json()["ok"] is False
     assert queued == []
+
+
+def test_the_chat_needs_the_password(env):
+    chat, deps, queued, client = env
+    anon = TestClient(client.app)
+    for method, path in [("get", "/chat"), ("get", "/chat/messages"), ("post", "/chat/send")]:
+        assert getattr(anon, method)(path).status_code == 401
+    wrong = _client(client.app, ("me", "guess"))
+    assert wrong.post("/chat/send", json={"text": "hi"}).status_code == 401
+    assert queued == []
+    # the status API is not behind it
+    assert anon.get("/api/status").status_code == 200
+
+
+def test_no_password_means_no_chat():
+    deps = fake_deps(lambda name: DictKV())
+    with pytest.raises(ValueError):
+        server.create_app(deps, lambda job: None, webchat.WebChat(), "")
 
 
 def test_the_page_and_the_status_api_are_both_served(env):

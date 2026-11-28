@@ -4,16 +4,20 @@ The page lives at /chat on the server. You type; the turn runs on the worker;
 the reply appears. Anything Sudarshana sends the owner unprompted (asks, the
 hourly report) appears there too, through WebChatNotifier.
 
-There is NO login. Serve it only on 127.0.0.1 and open it in that machine's
-own browser. Anyone who can reach /chat can drive an agent with a shell.
+Every /chat route asks for a password (HTTP Basic auth: the browser's own
+prompt; any username, only the password is checked). Still serve it on
+127.0.0.1 and reach it through an SSH tunnel: anyone who gets past the
+password can drive an agent with a shell.
 
 The chat history is kept in memory (a restart clears the page); the
 conversation itself is in the checkpoint store, as with Telegram.
 """
+import secrets
 import threading
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse
 
 from sudarshana.core.agent import run_turn
@@ -79,10 +83,18 @@ def chat_turn(agent, deps, chat: WebChat, text: str) -> None:
         chat.pending = max(0, chat.pending - 1)
 
 
-def chat_routes(chat: WebChat, enqueue) -> APIRouter:
-    """GET /chat (the page), POST /chat/send, GET /chat/messages?after=N.
-    `enqueue(("chat", text))` hands the turn to the runtime's worker."""
-    web = APIRouter()
+def chat_routes(chat: WebChat, enqueue, password: str) -> APIRouter:
+    """GET /chat (the page), POST /chat/send, GET /chat/messages?after=N, all
+    behind `password`. `enqueue(("chat", text))` hands the turn to the
+    runtime's worker."""
+    basic = HTTPBasic()
+
+    def require_password(creds: HTTPBasicCredentials = Depends(basic)) -> None:
+        if not secrets.compare_digest(creds.password.encode(), password.encode()):
+            raise HTTPException(status_code=401, detail="wrong password",
+                                headers={"WWW-Authenticate": "Basic"})
+
+    web = APIRouter(dependencies=[Depends(require_password)])
 
     @web.get("/chat", response_class=HTMLResponse)
     def page():
