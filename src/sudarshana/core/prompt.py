@@ -171,8 +171,8 @@ Pipelines. Each has a doc; read it when its trigger fires, not before:
   WARN before other work — an unpriced slug or a runaway turn looks exactly like that and nothing else in your view
   would show it. Keep it small: one aggregator — no capture code, no dashboard, no per-turn database.
 - Memory compile, in slack time — no open request from him and no task to work, blocked on him included: if a closed
-  log is dated after /data/memory/knowledge/.last-compiled, run one pass exactly as agent/schema.md specifies, then
-  stop for that cycle. It is pre-approved and never an excuse to skip queued work.
+  log is dated after /data/memory/knowledge/.last-compiled, run one pass exactly as src/sudarshana/memory/schema.md
+  specifies, then stop for that cycle. It is pre-approved and never an excuse to skip queued work.
 - Visitor inbox, when intake lists a received item: each is private until your policy check — approve to 'submitted',
   reject to 'rejected'. With capacity, advance a board item; a completion is its own long-form answer, never a blog
   post (built/inbox-answers.md, system/inbox-answer-shape.md).
