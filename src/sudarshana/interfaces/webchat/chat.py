@@ -148,7 +148,7 @@ PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sudarshana chat (test)</title>
+<title>Sudarshana chat</title>
 <style>
   :root { --bg:#fafafa; --fg:#1a1a1a; --muted:#666; --you:#dbeafe; --her:#fff; --line:#ddd; }
   @media (prefers-color-scheme: dark) {
@@ -173,7 +173,7 @@ PAGE = """<!doctype html>
 </style>
 </head>
 <body>
-<header>Sudarshana <small>test chat, this machine only</small></header>
+<header>Sudarshana <small>private chat</small></header>
 <div id="log"></div>
 <div id="working"></div>
 <form id="f">
