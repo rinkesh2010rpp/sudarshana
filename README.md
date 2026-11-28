@@ -93,7 +93,7 @@ Both are on the same Modal app, with CORS open so the gateway site can call them
 |---|---|
 | `VISION.md`, `ROADMAP.md`, `actions/`, `logs/<date>.md` | The agent's own canonical record. It maintains these, and they win over everything derived. |
 | `memory/state.md`, `memory/decisions.md` | Where things stand right now, and the decisions log. |
-| `memory/knowledge/` | Compiled knowledge pages. The rules are in [`agent/schema.md`](agent/schema.md). Code regenerates `index.md` and `lint.md`. |
+| `memory/knowledge/` | Compiled knowledge pages. The rules are in [`src/sudarshana/memory/schema.md`](src/sudarshana/memory/schema.md). Code regenerates `index.md` and `lint.md`. |
 | `skills/` | The skills library. |
 | `checkpoints.db` | The conversation thread. |
 | `llm-calls/` | One log entry for every model call. |
