@@ -156,12 +156,42 @@ redeploy, and send yourself a message to confirm delivery.
 
 `modal serve -m sudarshana.infra.runtime.modal.app` (from `src/`) runs a temporary copy with its own URL.
 
-### Run locally
+### Run a copy on your own machine (server runtime)
 
-`scripts/run_local.py` runs turns on this machine with no Modal: the workspace
-is the folder in `SUDARSHANA_DATA`, the status/dedup/a2a stores live in memory,
-and owner messages print to the console. The agent's shell is unsandboxed on
-your machine, so read the warning at the top of the script first.
+`src/sudarshana/infra/runtime/server/` runs the same agent on one ordinary Linux
+machine, with no Modal: one process, turns one at a time, the workspace in a
+local folder (`/data`, or `SUDARSHANA_DATA`), and the status/dedup/a2a stores in
+memory. You talk to it through a password-protected chat page at `/chat`, or a
+test Telegram bot with `CHANNEL=telegram`. It was first used for a port test on
+2026-11-26. Read [what a copy can reach](#what-the-copy-can-and-cannot-reach) before you run one.
+
+```bash
+git clone https://github.com/rinkesh2010rpp/sudarshana.git && cd sudarshana
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env    # set OPENROUTER_*, USE_OPENROUTER=1, WEBCHAT_PASSWORD
+mkdir -p /data
+bash src/sudarshana/infra/runtime/server/start.sh        # stop | status
+```
+
+It listens on `127.0.0.1` only. From your own computer, tunnel to it and open
+`http://127.0.0.1:8000/chat`:
+
+```powershell
+ssh -N -L 8000:127.0.0.1:8000 <the machine>
+```
+
+#### What the copy can and cannot reach
+
+- **Its own shell, unsandboxed, as whatever user runs it.** Use a machine with
+  nothing on it you'd mind it touching. `WEBCHAT_PASSWORD` and the model keys
+  are withheld from that shell, like every key in `SHELL_WITHHELD_SECRETS`.
+- **No pushes, unless you give it `GITHUB_TOKEN`.** Don't: every push to the
+  gateway's `main` deploys the live site, and production pushes there too.
+- **Production's public inbox.** Anyone can post to it, so a copy can too (the
+  2026-11-26 copy found it in the gateway's code and used it). The original
+  reviews such items like any visitor's.
+- **Your OpenRouter credits.** A separate key with a small monthly limit is safer.
+- **Hourly turns only with `HOURLY=1`**; otherwise it spends only when you chat.
 
 ### Dependencies
 

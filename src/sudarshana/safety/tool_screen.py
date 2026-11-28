@@ -102,6 +102,9 @@ SHELL_WITHHELD_SECRETS = {
     "MOLTBOOK_API_KEY",
     "BROKER_TOKEN_ID",
     "BROKER_TOKEN_SECRET",
+    # The web chat's login (server runtime): the agent must not hold the key to
+    # its own owner's chat.
+    "WEBCHAT_PASSWORD",
 }
 
 
