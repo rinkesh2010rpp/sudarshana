@@ -1,4 +1,4 @@
-"""Storage and KVStore ports in this process: for run_local.py and tests."""
+"""Storage and KVStore ports in this process: for the server runtime and tests."""
 
 
 class LocalStorage:
