@@ -191,7 +191,8 @@ ssh -N -L 8000:127.0.0.1:8000 <the machine>
   2026-11-26 copy found it in the gateway's code and used it). The original
   reviews such items like any visitor's.
 - **Your OpenRouter credits.** A separate key with a small monthly limit is safer.
-- **Hourly turns only with `HOURLY=1`**; otherwise it spends only when you chat.
+- **Scheduled turns only with `HOURLY=1`**, every `WAKE_EVERY_MIN` minutes (60 by
+  default); otherwise it spends only when you chat.
 
 ### Dependencies
 

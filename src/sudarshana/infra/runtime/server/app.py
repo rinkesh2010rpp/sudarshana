@@ -13,7 +13,9 @@ What replaces Modal:
 - The status, dedup and a2a stores live in memory: a restart forgets them.
 - Turns run one at a time on one worker thread, the guarantee the Modal app
   gets from max_containers=1. The Telegram "run" dedup gate relies on it.
-- The hourly turn runs only with HOURLY=1 (off by default).
+- The scheduled turn runs only with HOURLY=1 (off by default), every
+  WAKE_EVERY_MIN minutes (60 by default, at least 5), on the clock: 30 means
+  :00 and :30.
 - One HTTP server (127.0.0.1:PORT, default 8000) serves the owner's chat and
   the status API (/api/status, /api/events).
 - The owner's chat is CHANNEL: "webchat" (default) is a page at /chat in this
@@ -106,11 +108,31 @@ def run_worker(agent, deps, jobs: queue.Queue, chat: WebChat | None = None) -> N
             jobs.task_done()
 
 
-def run_hourly(jobs: queue.Queue) -> None:
-    """Queue an hourly turn at the top of every hour, like the Modal cron."""
+def wake_every_min() -> int:
+    """WAKE_EVERY_MIN, the minutes between scheduled turns: 60 unless set,
+    never under 5, so a typo can't turn the agent into a busy loop."""
+    raw = os.environ.get("WAKE_EVERY_MIN", "60")
+    try:
+        minutes = int(raw)
+    except ValueError:
+        raise SystemExit(f"WAKE_EVERY_MIN must be a whole number of minutes, not {raw!r}")
+    if minutes < 5:
+        raise SystemExit(f"WAKE_EVERY_MIN must be at least 5, not {minutes}")
+    return minutes
+
+
+def seconds_to_next_wake(now: float, every_min: int) -> float:
+    """Seconds until the next multiple of `every_min` minutes on the clock,
+    so 60 wakes on the hour and 30 on the hour and the half hour."""
+    period = every_min * 60
+    return period - now % period
+
+
+def run_hourly(jobs: queue.Queue, every_min: int = 60) -> None:
+    """Queue the scheduled turn every `every_min` minutes, on the clock, like
+    the Modal cron (which is hourly)."""
     while True:
-        now = time.time()
-        time.sleep(3600 - now % 3600)
+        time.sleep(seconds_to_next_wake(time.time(), every_min))
         jobs.put(("hourly",))
 
 
@@ -130,10 +152,11 @@ def main() -> None:
     jobs: queue.Queue = queue.Queue()
     threading.Thread(target=run_worker, args=(agent, deps, jobs, chat), daemon=True, name="turns").start()
     if os.environ.get("HOURLY") == "1":
-        threading.Thread(target=run_hourly, args=(jobs,), daemon=True, name="hourly").start()
-        print("[server] hourly turn: on")
+        every = wake_every_min()
+        threading.Thread(target=run_hourly, args=(jobs, every), daemon=True, name="hourly").start()
+        print(f"[server] scheduled turn: on, every {every} min")
     else:
-        print("[server] hourly turn: off (set HOURLY=1 to turn it on)")
+        print("[server] scheduled turn: off (set HOURLY=1 to turn it on)")
     port = int(os.environ.get("PORT", "8000"))
     if chat:
         print(f"[server] chat: open http://127.0.0.1:{port}/chat in this machine's browser"

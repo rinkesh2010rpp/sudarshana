@@ -67,3 +67,25 @@ def test_the_worker_runs_turns_in_order_and_survives_a_failure(monkeypatch):
     threading.Thread(target=server.run_worker, args=(object(), None, jobs), daemon=True).start()
     jobs.join()
     assert ran == ["a", "hourly", "b"]
+
+
+def test_scheduled_turns_land_on_the_clock():
+    # 10:07:30 -> next half-hour mark is 10:30:00, 22.5 minutes away
+    now = 10 * 3600 + 7 * 60 + 30
+    assert server.seconds_to_next_wake(now, 30) == 22 * 60 + 30
+    assert server.seconds_to_next_wake(now, 60) == 52 * 60 + 30
+    # exactly on a mark waits a full period, never zero (no double turn)
+    assert server.seconds_to_next_wake(10 * 3600, 30) == 30 * 60
+
+
+def test_wake_interval_is_checked(monkeypatch):
+    import pytest
+
+    monkeypatch.delenv("WAKE_EVERY_MIN", raising=False)
+    assert server.wake_every_min() == 60
+    monkeypatch.setenv("WAKE_EVERY_MIN", "30")
+    assert server.wake_every_min() == 30
+    for bad in ("2", "half an hour", ""):
+        monkeypatch.setenv("WAKE_EVERY_MIN", bad)
+        with pytest.raises(SystemExit):
+            server.wake_every_min()
